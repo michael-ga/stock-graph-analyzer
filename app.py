@@ -1537,5 +1537,16 @@ def _render_image_mode(uploaded) -> None:
             st.write(f"- {hl}")
 
 
-if __name__ == "__main__":
+def _running_in_streamlit() -> bool:
+    """True when executed by the Streamlit runner (local, cloud, or AppTest)."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+# Render whenever Streamlit runs this file — regardless of how it sets __name__.
+# (A plain `python -c "import app"` has no Streamlit context, so it stays a no-op.)
+if __name__ == "__main__" or _running_in_streamlit():
     main()
