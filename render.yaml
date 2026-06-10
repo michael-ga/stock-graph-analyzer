@@ -1,0 +1,15 @@
+# Render Blueprint — deploy the Streamlit app on Render's free tier.
+# On render.com: New + → Blueprint → connect this repo → it reads this file.
+# Then set the FINNHUB_KEY env var (marked sync:false) in the dashboard.
+services:
+  - type: web
+    name: stock-technical-analyzer
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true --server.enableCORS false"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.6"
+      - key: FINNHUB_KEY
+        sync: false          # set this secret in the Render dashboard
