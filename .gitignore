@@ -1,0 +1,17 @@
+.venv/
+.cache/
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+st_out.log
+st_err.log
+# Local runtime state (per-user; ephemeral on cloud anyway)
+.watchlist.json
+.swingwatch.json
+.papertrade.json
+.virtualbook.json
+.ratelimit.json
+# Editor/agent config and the copyrighted source PDF (rules are encoded in code)
+.claude/
+*.pdf

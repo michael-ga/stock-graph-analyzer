@@ -1,0 +1,24 @@
+# Core (Phases 1-2) — API data, analysis engine, dashboard, fundamentals/news
+pandas>=2.0
+numpy>=1.26
+scipy>=1.11
+plotly>=5.20
+mplfinance>=0.12.10b0
+streamlit>=1.33
+requests>=2.31
+yfinance>=0.2.40
+python-dotenv>=1.0
+websocket-client>=1.7        # real-time Finnhub trade WebSocket (live watch mode)
+# (Finnhub is accessed via `requests`, so no extra SDK is required.)
+
+# Phase 4 — news sentiment
+vaderSentiment>=3.3
+
+# Phase 3 — image fallback (chart reading via OpenCV).
+# Headless build: no system GUI libs (libGL) needed — required for Linux/cloud hosts.
+opencv-python-headless>=4.9
+
+# Phase 3 — info-panel OCR (heavy; install if you want to OCR stat panels).
+# PaddleOCR is the recommended backend; EasyOCR or Tesseract also work.
+# paddleocr>=2.7
+# paddlepaddle>=2.6
