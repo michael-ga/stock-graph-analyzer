@@ -33,7 +33,8 @@ from stockanalyzer.live_events import LiveState, diff_states
 from stockanalyzer.pipeline import analyze_ticker
 from stockanalyzer.strategy import Strategy, SwingPace
 from stockanalyzer.verdict.aggregate import build_verdict
-from stockanalyzer.vision import ImageKind, classify_image, read_candles, read_info
+# NOTE: stockanalyzer.vision imports OpenCV (cv2). It is imported lazily inside
+# _render_image_mode so a cv2 load failure on a server can never blank the app.
 
 load_dotenv()
 
@@ -1492,8 +1493,15 @@ def _render_tabs(ticker, result) -> None:
 
 
 def _render_image_mode(uploaded) -> None:
-    import cv2
     import numpy as np
+
+    try:
+        import cv2  # noqa: F401
+        from stockanalyzer.vision import (ImageKind, classify_image,
+                                          read_candles, read_info)
+    except Exception as exc:                       # pragma: no cover
+        st.error(f"Image mode needs OpenCV, which isn't available here: {exc}")
+        return
 
     data = np.frombuffer(uploaded.getvalue(), np.uint8)
     bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
