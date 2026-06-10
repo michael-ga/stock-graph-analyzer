@@ -245,10 +245,14 @@ def _short_geometry(price, walls, supports, atr_abs, tuning: PaceTuning,
 # --------------------------------------------------------------------------- #
 # Calibrated score.
 # --------------------------------------------------------------------------- #
+# Backtest-calibrated (120 points / 12 tickers): pure trend-alignment weighting
+# was ANTI-predictive (low-score oversold points won 64% vs 43% for high scores),
+# so alignment carries less weight and "rebound value" (buying low in the range
+# with a soft RSI) earns points of its own.
 _TF_CHECKS = (   # (timeframe, label, MA column, MA weight, MACD weight)
-    (Timeframe.D5, "5D", "sma20", 6, 5),
-    (Timeframe.M6, "6M", "sma50", 6, 5),
-    (Timeframe.Y1, "1Y", "sma200", 5, 3),
+    (Timeframe.D5, "5D", "sma20", 4, 3),
+    (Timeframe.M6, "6M", "sma50", 5, 4),
+    (Timeframe.Y1, "1Y", "sma200", 4, 2),
 )
 _BIAS_FRAMES = (Timeframe.D1, Timeframe.D5, Timeframe.M1)
 
@@ -275,7 +279,26 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
                              not between,
                              ("clear air" if not between else
                               ", ".join(f"${w:.2f}" for w in between[:3]) + " in the way"),
-                             10))
+                             8))
+
+    # Rebound value — the backtest's winning cluster: entries taken low, not chased.
+    rsi_now = _last(df, "rsi")
+    if rsi_now is not None:
+        ok = rsi_now <= 45 if bull else rsi_now >= 55
+        checks.append(SwingCheck(
+            "Buying low — soft RSI" if bull else "Selling high — firm RSI", ok,
+            f"RSI {rsi_now:.0f} ({'≤45 earns it' if bull else '≥55 earns it'})", 9))
+    win = df.tail(60)
+    if len(win) >= 20:
+        lo60 = float(win["low"].min())
+        hi60 = float(win["high"].max())
+        if hi60 > lo60:
+            pos = (geom.entry - lo60) / (hi60 - lo60)
+            ok = pos <= 0.5 if bull else pos >= 0.5
+            checks.append(SwingCheck(
+                "Room to recover — lower half of the 60-bar range" if bull else
+                "Room to fall — upper half of the 60-bar range", ok,
+                f"price sits at {pos*100:.0f}% of the range", 9))
 
     # Multi-frame MA + MACD (6M carries the daily-bar history; n/a rows stay visible).
     def _frame_rows(rep_df, label: str, ma_col: str, w_ma: int, w_macd: int):
@@ -306,7 +329,7 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
             if rep is not None:
                 _frame_rows(rep.df, label, ma_col, w_ma, w_macd)
     else:
-        _frame_rows(df, "chart", "sma20", 17, 13)
+        _frame_rows(df, "chart", "sma20", 12, 10)
 
     # Engine bias agreement — brings RSI/candles/volume in via the engine's own read.
     if all_reports:
@@ -320,7 +343,7 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
             need = 2 if len(vals) >= 2 else 1
             checks.append(SwingCheck(
                 "Engine bias agrees (1D/5D/1M)", aligned >= need,
-                " · ".join(f"{t} {b:+.2f}" for t, b in vals), 8))
+                " · ".join(f"{t} {b:+.2f}" for t, b in vals), 6))
 
     # RSI sanity — don't buy overbought / short oversold.
     rsi_dec = _last(df, "rsi")
@@ -331,7 +354,7 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
         ok = (rsi_dec <= 70 and (rsi_m1 is None or rsi_m1 <= 75)) if bull else \
              (rsi_dec >= 30 and (rsi_m1 is None or rsi_m1 >= 25))
         detail = f"decision RSI {rsi_dec:.0f}" + (f" · 1M RSI {rsi_m1:.0f}" if rsi_m1 else "")
-        checks.append(SwingCheck("RSI not at an extreme", ok, detail, 5))
+        checks.append(SwingCheck("RSI not at an extreme", ok, detail, 4))
 
     # No chase: a ≥5% daily move in the last 3 daily bars = post-news spike risk.
     daily_rep = None
@@ -349,7 +372,7 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
         checks.append(SwingCheck(
             "No chase — no ≥5% daily move in the last 3 days", not chase,
             ("calm tape" if not chase else
-             f"a {rets.abs().max():.1f}% day just happened — retest risk"), 8))
+             f"a {rets.abs().max():.1f}% day just happened — retest risk"), 6))
 
         # Overextension vs the 6M 20-day average.
         sma20_d = _last(daily_rep.df, "sma20")
@@ -359,7 +382,7 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
             ok = ext <= _EXTENSION_PCT if bull else ext >= -_EXTENSION_PCT
             checks.append(SwingCheck(
                 "Not overextended vs 20-day average", ok,
-                f"{ext:+.1f}% from the daily 20-MA", 7))
+                f"{ext:+.1f}% from the daily 20-MA", 5))
 
     # Strategy conflict — swinging against the app's own long-term read.
     inv_pct = context.get("investor_pct")
@@ -367,7 +390,7 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
         ok = inv_pct >= 45 if bull else inv_pct <= 55
         checks.append(SwingCheck(
             "No conflict with the long-term read", ok,
-            f"investor conviction {inv_pct}% bullish", 5))
+            f"investor conviction {inv_pct}% bullish", 4))
 
     # --- informational rows (weight 0 — shown, never scored) -----------------
     edays = context.get("earnings_days")

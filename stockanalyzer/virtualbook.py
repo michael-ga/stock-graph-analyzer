@@ -125,11 +125,14 @@ def mark(ticker: str, price: float, now: float | None = None,
             continue
         expiry_s = p["horizon_days"] * _EXPIRY_FACTOR * 86400
         if p["status"] == "pending":
-            if price >= p["trigger"]:
+            # Fill only beyond the buffered entry (entry = wall + buffer), not on
+            # a bare wall touch — wick-fills lost 48% vs 70% in backtesting.
+            fill_level = max(p["entry"], p["trigger"])
+            if price >= fill_level:
                 p["status"] = "open"
                 p["activated_ts"] = now
-                p["entry"] = p["trigger"]            # filled at the trigger
-                p["shares"] = round(STAKE_USD / p["entry"], 4)
+                p["entry"] = fill_level
+                p["shares"] = round(p.get("stake", STAKE_USD) / p["entry"], 4)
                 changed.append(p)
             elif now - p["opened_ts"] > expiry_s:
                 p["status"] = "closed"

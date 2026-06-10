@@ -64,8 +64,9 @@ def judge_outcome(bars: list[tuple[float, float, float]], entry: float,
                   horizon_days: int = 3) -> tuple[str, float]:
     """Judge a LONG proposition against daily (high, low, close) bars after the alert.
 
-    breakout_wait records carry `trigger`: the trade only activates once a bar's
-    high crosses it; until then up to `horizon_days` of waiting is allowed.
+    breakout_wait records carry `trigger`: the trade activates only on a bar
+    whose CLOSE clears it (the rule the guidance states — a 120-point backtest
+    showed touch-fills win 48% vs 70% for close-fills), filling at that close.
     Active trades: stop first (conservative), then target, expiring after
     `horizon_days` active days at mark-to-market. Returns (status, result_pct).
     """
@@ -74,16 +75,17 @@ def judge_outcome(bars: list[tuple[float, float, float]], entry: float,
     active = trigger is None
     waited = 0
     active_days = 0
-    last_close = bars[-1][2]
     for high, low, close in bars:
         if not active:
-            if high >= trigger:
-                active = True              # filled this bar; judge the same bar below
-            else:
-                waited += 1
-                if waited >= horizon_days:
-                    return "not_triggered", 0.0
+            if close >= trigger:
+                active = True
+                entry = close              # filled at the confirming close
+                active_days += 1           # fill bar consumed; judge from next bar
                 continue
+            waited += 1
+            if waited >= horizon_days:
+                return "not_triggered", 0.0
+            continue
         if low <= stop:
             return "stop_hit", round((stop / entry - 1) * 100, 1)
         if high >= target:
@@ -93,7 +95,7 @@ def judge_outcome(bars: list[tuple[float, float, float]], entry: float,
             return "expired", round((close / entry - 1) * 100, 1)
     if not active:
         return "open", 0.0
-    return "open", round((last_close / entry - 1) * 100, 1)
+    return "open", round((bars[-1][2] / entry - 1) * 100, 1)
 
 
 def _bars_after(df, alert_ts: float) -> list[tuple[float, float, float]]:

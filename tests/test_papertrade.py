@@ -53,12 +53,22 @@ def test_breakout_not_triggered():
 
 def test_breakout_triggered_then_target():
     bars = [(101.0, 99.0, 100.0),       # waiting
-            (102.5, 100.5, 102.2),      # trigger crossed (102), no stop/target yet
+            (102.5, 100.5, 102.2),      # CLOSE clears the 102 trigger → fill at 102.2
             (106.5, 102.0, 106.0)]      # target 106 tagged
     status, res = judge_outcome(bars, entry=102.1, stop=100.0, target=106.0,
                                 trigger=102.0, horizon_days=3)
     assert status == "target_hit"
-    assert res == round((106.0 / 102.1 - 1) * 100, 1)
+    assert res == round((106.0 / 102.2 - 1) * 100, 1)   # measured from the fill close
+
+
+def test_breakout_wick_through_trigger_does_not_fill():
+    # Highs pierce the trigger but no CLOSE confirms → never filled.
+    bars = [(102.6, 99.0, 100.0),
+            (102.8, 100.0, 101.0),
+            (102.5, 99.5, 100.2)]
+    status, res = judge_outcome(bars, entry=102.1, stop=100.0, target=106.0,
+                                trigger=102.0, horizon_days=3)
+    assert status == "not_triggered" and res == 0.0
 
 
 # --- record / dedup ----------------------------------------------------------

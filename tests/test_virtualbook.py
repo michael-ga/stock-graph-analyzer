@@ -55,9 +55,11 @@ def test_pending_breakout_activates_then_wins(tmp_path):
     assert pos["status"] == "pending"
     # Below the trigger: nothing happens.
     assert vb.mark("NOK", 14.1, now=1_000_050.0, path=p) == []
-    # Cross the trigger → fills at the trigger price.
+    # Touching the bare wall (14.2) is NOT enough — needs the buffered entry.
+    assert vb.mark("NOK", 14.205, now=1_000_060.0, path=p) == []
+    # Beyond the buffered entry → fills there.
     changed = vb.mark("NOK", 14.3, now=1_000_100.0, path=p)
-    assert changed[0]["status"] == "open" and changed[0]["entry"] == 14.2
+    assert changed[0]["status"] == "open" and changed[0]["entry"] == 14.21
     # Then the target.
     changed = vb.mark("NOK", 15.1, now=1_000_200.0, path=p)
     assert changed[0]["close_reason"] == "target_hit"
