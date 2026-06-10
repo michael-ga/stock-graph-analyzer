@@ -413,6 +413,26 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
     denom = sum((c.weight / 2 if c.na else c.weight) for c in checks if c.weight)
     earned = sum(c.weight for c in checks if c.weight and c.ok and not c.na)
     pct = round(earned / denom * 100) if denom else 0
+
+    # ⭐ Confluence bonus — the backtest's elite cluster: a with-trend setup,
+    # honest R:R, clear path AND rebound value all at once. These conditions are
+    # near-contradictory in normal tape, so when they coincide the case is
+    # genuinely top-shelf and the score should reach the 85–95 zone.
+    def _ok(name_part: str) -> bool:
+        return any(c.ok and not c.na and name_part in c.name for c in checks)
+
+    core = (setup_present and not countertrend and rr >= _MIN_RR
+            and _ok("Clear path"))
+    rebound_hits = sum(1 for p in ("Buying low", "Selling high",
+                                   "Room to recover", "Room to fall") if _ok(p))
+    bonus = 0
+    if core and rebound_hits >= 1:
+        bonus = 8 if rebound_hits == 1 else 12
+        checks.append(SwingCheck(
+            "⭐ A-grade confluence", True,
+            f"with-trend setup + R:R + clear path + rebound value (+{bonus})", 0))
+    pct = min(100, pct + bonus)
+
     aim_pct = abs(geom.target / geom.entry - 1) * 100
     if aim_pct < 3.0:
         pct = min(pct, 40)
