@@ -65,12 +65,15 @@ def pick_points(df) -> list[tuple[int, str]]:
     return sorted(chosen)
 
 
-def judge_close_fill(bars, entry_plan, stop, target, trigger, horizon_days):
+def judge_close_fill(bars, entry_plan, stop, target, trigger, horizon_days,
+                     wait_days=None):
     """Counterfactual: breakout fills only on a CLOSE beyond the trigger (the
     rule the guidance actually states), at that close. Stop/target keep the
-    plan's absolute levels; result % measured from the actual fill."""
+    plan's absolute levels; result % measured from the actual fill.
+    wait_days controls how long the armed order stays valid (default horizon)."""
     if trigger is None:
         return judge_outcome(bars, entry_plan, stop, target, None, horizon_days)
+    wait_days = wait_days or horizon_days
     waited = 0
     entry = None
     active_days = 0
@@ -80,7 +83,7 @@ def judge_close_fill(bars, entry_plan, stop, target, trigger, horizon_days):
                 entry = close                      # filled at the trigger close
             else:
                 waited += 1
-                if waited >= horizon_days:
+                if waited >= wait_days:
                     return "not_triggered", 0.0
                 continue
             active_days += 1                       # fill bar counts; judge next bars
@@ -125,14 +128,17 @@ def evaluate_point(df, t: int, label: str) -> dict | None:
     net = float(df["close"].iloc[t + HORIZON]) / c - 1
 
     # Judge the plan as a real trade (breakout plans need their trigger first).
-    bars = list(zip(df["high"].iloc[t + 1:t + 1 + 2 * HORIZON].astype(float),
-                    df["low"].iloc[t + 1:t + 1 + 2 * HORIZON].astype(float),
-                    df["close"].iloc[t + 1:t + 1 + 2 * HORIZON].astype(float)))
+    bars = list(zip(df["high"].iloc[t + 1:t + 1 + 3 * HORIZON].astype(float),
+                    df["low"].iloc[t + 1:t + 1 + 3 * HORIZON].astype(float),
+                    df["close"].iloc[t + 1:t + 1 + 3 * HORIZON].astype(float)))
     status, result = judge_outcome(bars, plan.entry, plan.stop, plan.target1,
                                    trigger=plan.trigger, horizon_days=HORIZON)
     # Counterfactuals measured on the SAME data:
     c_status, c_result = judge_close_fill(bars, plan.entry, plan.stop, plan.target1,
                                           plan.trigger, HORIZON)
+    w_status, w_result = judge_close_fill(bars, plan.entry, plan.stop, plan.target1,
+                                          plan.trigger, HORIZON,
+                                          wait_days=int(1.5 * HORIZON))
     relaxed_go = (plan.kind == "immediate" and plan.setup != "No setup"
                   and plan.rr >= 1.5)
 
@@ -160,6 +166,7 @@ def evaluate_point(df, t: int, label: str) -> dict | None:
         kind=plan.kind, go=plan.go, score=plan.score, rr=plan.rr,
         setup=plan.setup[:26], status=status, result=result,
         c_status=c_status, c_result=c_result, relaxed_go=relaxed_go,
+        w_status=w_status, w_result=w_result,
         fwd_up=round(fwd_up * 100, 1), fwd_dn=round(fwd_dn * 100, 1),
         net=round(net * 100, 1), verdict=verdict, acted=acted,
         guidance=plan.guidance[:90],
@@ -242,6 +249,39 @@ def run(tickers: list[str]) -> None:
               f"{len(w)/len(rel)*100:.0f}% | avg {np.mean([r['result'] for r in rel]):+.1f}%")
     else:
         print("  relaxed (rr>=1.5):     would fire 0 times")
+
+    # --- counterfactual C: GO-gate R:R threshold sweep (immediate plans) -------
+    print("\nCOUNTERFACTUAL C — GO gate sweep (immediate plans with a real setup)")
+    imm = [r for r in all_rows if r["kind"] == "immediate" and r["setup"] != "No setup"
+           and r["status"] in ("target_hit", "stop_hit", "expired")]
+    print(f"  pool: {len(imm)} judged immediate plans")
+    hdr = f"  {'rule':<28}{'n':>4}{'WR':>6}{'avg':>8}{'sum':>8}  drop-traps"
+    print(hdr)
+    for rr_min in (1.2, 1.4, 1.6, 1.8, 2.0):
+        for extra, name in ((None, f"rr>={rr_min}"),
+                            (55, f"rr>={rr_min} & score>=55")):
+            sel = [r for r in imm if r["rr"] >= rr_min
+                   and (extra is None or r["score"] >= extra)]
+            if not sel:
+                print(f"  {name:<28}{0:>4}")
+                continue
+            w = [r for r in sel if r["result"] > 0]
+            traps = len([r for r in sel if r["label"] == "DOWN" and r["result"] < 0])
+            print(f"  {name:<28}{len(sel):>4}{len(w)/len(sel)*100:>5.0f}%"
+                  f"{np.mean([r['result'] for r in sel]):>+7.1f}%"
+                  f"{sum(r['result'] for r in sel):>+7.1f}%  {traps}")
+
+    # --- counterfactual D: longer armed-window for breakout triggers -----------
+    print("\nCOUNTERFACTUAL D — armed breakout window (10d wait vs 15d wait)")
+    brk_all = [r for r in all_rows if r["kind"] == "breakout_wait"]
+    for key_s, key_r, name in (("c_status", "c_result", "10-day wait"),
+                               ("w_status", "w_result", "15-day wait")):
+        done = [r for r in brk_all if r.get(key_s) in ("target_hit", "stop_hit", "expired")]
+        if done:
+            w = [r for r in done if r[key_r] > 0]
+            print(f"  {name}: filled {len(done)} | WR {len(w)/len(done)*100:.0f}% | "
+                  f"avg {np.mean([r[key_r] for r in done]):+.1f}% | "
+                  f"not-triggered {len([r for r in brk_all if r.get(key_s)=='not_triggered'])}")
 
     # --- counterfactual B: breakout fill rule (touch vs close) -----------------
     brk = [r for r in all_rows if r["kind"] == "breakout_wait"]

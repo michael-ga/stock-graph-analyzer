@@ -48,12 +48,13 @@ def test_long_plan_enters_near_price_not_far_resistance():
     assert plan.target1_pct <= 16.0
 
 
-def test_go_implies_rr_at_least_two():
+def test_go_implies_rr_meets_gate():
+    # Gate calibrated to 1.5 by the 120-point backtest (engine win rate ~60-68%).
     for rep in (_uptrend(), _downtrend()):
         for uc in (UseCase.BUY, UseCase.SELL):
             plan = build_swing_plan(rep, uc)
             if plan.go:
-                assert plan.rr >= 2.0
+                assert plan.rr >= 1.5
 
 
 def test_downtrend_has_no_long_setup():
@@ -96,7 +97,7 @@ def test_plan_has_score_and_checks():
     assert plan.score_label in ("Strong", "Good", "Weak — wait", "Avoid")
     assert plan.checks, "score must come with a plain-English checklist"
     names = " ".join(c.name for c in plan.checks)
-    assert "setup" in names.lower() and "2× risk" in names
+    assert "setup" in names.lower() and "× risk" in names
 
 
 def test_score_uses_5d_1m_1y_ma_and_macd():

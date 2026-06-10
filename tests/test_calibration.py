@@ -193,7 +193,10 @@ def _nok_reports():
                 _lv(13.61, "support"), _lv(13.29, "support")],
         bias=-1.0, trend_dir=Direction.BEAR,
     )
-    m6 = _report(_ind(_frame(p, 8.3), atr_pct=8.3, rsi=47, sma20=p * 0.99), bias=0.15)
+    # 6M context is explicitly NOT an uptrend (price under its 50-MA, EMA above
+    # price) so the fixed indicator-frame setup detection still finds no setup.
+    m6 = _report(_ind(_frame(p, 8.3), atr_pct=8.3, rsi=47, sma20=p * 0.99,
+                      sma50=p * 1.05, ema20=p * 1.06), bias=0.15)
     return dec, {Timeframe.D5: dec, Timeframe.M6: m6, Timeframe.M1: m6,
                  Timeframe.Y1: m6, Timeframe.D1: _report(_ind(_frame(p, 0.8)), bias=0.0)}
 

@@ -30,7 +30,10 @@ from ..data.schema import Timeframe
 from ..strategy import SWING_PACE, PaceTuning, SwingPace
 from .usecase import UseCase
 
-_MIN_RR = 2.0
+# GO threshold. Classic books say 2:1 assuming ~45% win rate; this engine's
+# judged plans win ~60-68% (120-point backtest), where 1.5:1 already carries
+# +0.5R expectancy. The sweep (rr 1.4-1.8 all positive) brackets this choice.
+_MIN_RR = 1.5
 _BREAKOUT_ROOM_FACTOR = 0.75   # breakout leg may be slightly under min_move (trigger-confirmed)
 _CHASE_PCT = 5.0               # a ≥5% daily move in the last 3 daily bars = chase risk
 _EXTENSION_PCT = 10.0          # price >10% from the 6M sma20 = rubber band stretched
@@ -269,7 +272,7 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
     setup_detail = (f"{setup} — countertrend, scalp tier" if (setup_present and countertrend)
                     else (setup or "no clean entry pattern right now"))
     checks.append(SwingCheck("Valid setup found", setup_present, setup_detail, setup_w))
-    checks.append(SwingCheck("Reward ≥ 2× risk (honest target, vol-aware stop)",
+    checks.append(SwingCheck(f"Reward ≥ {_MIN_RR:g}× risk (honest target, vol-aware stop)",
                              rr >= _MIN_RR, f"R:R {rr:.1f}:1", 12))
 
     # Clear path: no mapped level strictly between entry and target.
@@ -454,11 +457,28 @@ def build_swing_plan(report: TimeframeReport, usecase: UseCase,
                        own=(usecase == UseCase.OWN))
 
 
-def _detect_long_setup(report, price, df, names, atr_abs) -> str | None:
-    sma50 = _last(df, "sma50")
-    sma200 = _last(df, "sma200")
-    ema20 = _last(df, "ema20")
-    rsi = _last(df, "rsi") or 50.0
+def _ind_frame(all_reports, df):
+    """The frame whose INDICATORS drive setup detection.
+
+    Short decision frames (1M = 22 daily bars) cannot compute sma50/sma200/MACD
+    — which silently made the with-trend setups undetectable (backtest: only
+    2 of 120 points had a setup). Trend context comes from a frame with real
+    history (6M daily preferred); levels/geometry stay on the decision frame.
+    """
+    if all_reports:
+        for tf in (Timeframe.M6, Timeframe.YTD, Timeframe.Y1):
+            rep = all_reports.get(tf)
+            if rep is not None and _last(rep.df, "sma50") is not None:
+                return rep.df
+    return df
+
+
+def _detect_long_setup(report, price, df, names, atr_abs, ind_df=None) -> str | None:
+    ind = ind_df if ind_df is not None else df
+    sma50 = _last(ind, "sma50")
+    sma200 = _last(ind, "sma200")
+    ema20 = _last(ind, "ema20")
+    rsi = _last(df, "rsi") or _last(ind, "rsi") or 50.0
     supports = sorted((lv.price for lv in report.levels if lv.price < price), reverse=True)
     resistances = sorted(lv.price for lv in report.levels if lv.price > price)
     s1 = supports[0] if supports else None
@@ -476,16 +496,18 @@ def _detect_long_setup(report, price, df, names, atr_abs) -> str | None:
         return "Breakout (volume)"
     if rsi <= 40 and bull_conf and above_200:
         return "Oversold reversal at support"
-    if uptrend and ema20 is not None and abs(price - ema20) <= atr_abs and _rising(df, "ema20"):
+    if uptrend and ema20 is not None and abs(price - ema20) <= max(atr_abs, 0.02 * price) \
+            and _rising(ind, "ema20"):
         return "Pullback to 20-EMA"
     if uptrend and s1 is not None and (price - s1) <= atr_abs:
         return "Support test (uptrend)"
     return None
 
 
-def _detect_short_setup(report, price, df, names, atr_abs) -> str | None:
-    sma50 = _last(df, "sma50")
-    rsi = _last(df, "rsi") or 50.0
+def _detect_short_setup(report, price, df, names, atr_abs, ind_df=None) -> str | None:
+    ind = ind_df if ind_df is not None else df
+    sma50 = _last(ind, "sma50")
+    rsi = _last(df, "rsi") or _last(ind, "rsi") or 50.0
     resistances = sorted(lv.price for lv in report.levels if lv.price > price)
     r1 = resistances[0] if resistances else None
     downtrend = sma50 is not None and price <= sma50
@@ -508,11 +530,12 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
     walls = sorted(lv.price for lv in report.levels if lv.price > price)
     supports = sorted((lv.price for lv in report.levels if lv.price < price), reverse=True)
 
-    setup = (_detect_short_setup(report, price, df, names, atr_abs) if short
-             else _detect_long_setup(report, price, df, names, atr_abs))
+    ind_df = _ind_frame(all_reports, df)
+    setup = (_detect_short_setup(report, price, df, names, atr_abs, ind_df) if short
+             else _detect_long_setup(report, price, df, names, atr_abs, ind_df))
     countertrend = setup in _COUNTERTREND_SETUPS
-    sma50 = _last(df, "sma50")
-    sma200 = _last(df, "sma200")
+    sma50 = _last(ind_df, "sma50")
+    sma200 = _last(ind_df, "sma200")
     strong_downtrend = (not short and sma50 is not None and price < sma50
                         and sma200 is not None and price < sma200)
     setup_present = setup is not None and not strong_downtrend
@@ -566,7 +589,7 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
     elif not setup_present:
         guidance = "No valid setup — wait for a pullback, an oversold bounce, or a breakout to line up."
     elif rr < _MIN_RR:
-        guidance = (f"Setup present but honest R:R is only {rr:.1f}:1 (need ≥2) — "
+        guidance = (f"Setup present but honest R:R is only {rr:.1f}:1 (need ≥{_MIN_RR:g}) — "
                     f"wait for a better entry or more room.")
     else:
         guidance = f"Aim {aim*100:.1f}% is below the {tuning.min_move*100:.0f}% minimum — not worth the risk."
