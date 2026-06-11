@@ -12,6 +12,9 @@ st_err.log
 .papertrade.json
 .virtualbook.json
 .ratelimit.json
+trades.db
+trades.db-wal
+trades.db-shm
 # Editor/agent config and the copyrighted source PDF (rules are encoded in code)
 .claude/
 *.pdf

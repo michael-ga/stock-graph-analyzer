@@ -161,11 +161,19 @@ class FinnhubClient:
         if cached is not None:
             return cached
 
-        prof = self.profile(ticker)
-        met = self.metrics(ticker)
-        recs = self.recommendations(ticker)
-        pt = self.price_target(ticker)
-        raw_news = self.news(ticker, news_from, news_to)
+        # Five independent endpoints — fetch concurrently (each _get already
+        # degrades to None/{}/[] on failure, so a slow/failed one can't poison
+        # the batch).
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            f_prof = pool.submit(self.profile, ticker)
+            f_met = pool.submit(self.metrics, ticker)
+            f_recs = pool.submit(self.recommendations, ticker)
+            f_pt = pool.submit(self.price_target, ticker)
+            f_news = pool.submit(self.news, ticker, news_from, news_to)
+        prof, met, recs = f_prof.result(), f_met.result(), f_recs.result()
+        pt, raw_news = f_pt.result(), f_news.result()
 
         fundamentals = Fundamentals(
             name=prof.get("name", ""),

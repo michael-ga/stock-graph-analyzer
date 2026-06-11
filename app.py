@@ -11,7 +11,9 @@ Run:  streamlit run app.py
 """
 from __future__ import annotations
 
+import locale
 import os
+import threading
 import time
 
 import plotly.graph_objects as go
@@ -20,7 +22,7 @@ from dotenv import load_dotenv
 import streamlit as st
 
 from stockanalyzer import papertrade, swingwatch, virtualbook, watchlist
-from stockanalyzer.analysis.engine import analyze_timeframe
+from stockanalyzer.analysis.engine import CATEGORY_WEIGHTS, analyze_timeframe
 from stockanalyzer.explain.swing import build_swing_plan
 from stockanalyzer.analysis.signals import Direction
 from stockanalyzer.charting import candlestick_figure
@@ -37,6 +39,23 @@ from stockanalyzer.verdict.aggregate import build_verdict
 # _render_image_mode so a cv2 load failure on a server can never blank the app.
 
 load_dotenv()
+
+try:
+    locale.setlocale(locale.LC_TIME, "")
+except locale.Error:
+    pass
+
+
+def _fmt_ts(ts) -> str:
+    """Format a Unix timestamp (or formatted string) to the user's locale."""
+    if ts is None:
+        return ""
+    if isinstance(ts, str):
+        return ts
+    try:
+        return time.strftime("%x %X", time.localtime(float(ts)))
+    except (TypeError, ValueError, OSError):
+        return str(ts)
 
 
 def _bridge_cloud_secrets() -> None:
@@ -138,7 +157,8 @@ def main() -> None:
                                context=_reco_context(result))
     _recommendation_section(result, rec, usecase)
     current_price = result.quote.price if result.quote else None
-    _next_steps(rec, buy_price=buy_price, current_price=current_price, usecase=usecase)
+    _next_steps(rec, buy_price=buy_price, current_price=current_price, usecase=usecase,
+                reports=result.reports, verdict=verdict)
 
     for n in result.notices:
         st.caption(f"ℹ️ {n}")
@@ -256,15 +276,54 @@ def _sidebar():
 # --------------------------------------------------------------------------- #
 # Virtual paper-trading book.
 # --------------------------------------------------------------------------- #
-def _plan_snapshot(plan) -> dict:
-    """The prediction context stored with every virtual trade — the evidence
-    used later to judge and improve the algorithm."""
-    return dict(
+def _plan_snapshot(plan, reports=None, verdict=None, rec=None) -> dict:
+    """Full decision context stored with every virtual trade — signals,
+    indicators, verdict, swing checks, recommendation — for post-hoc analysis."""
+    snap = dict(
         score=plan.score, label=plan.score_label, setup=plan.setup,
         kind=plan.kind, rr=plan.rr, daily_atr_pct=plan.daily_atr_pct,
         guidance=plan.guidance,
         failed_checks=[c.name for c in plan.checks if c.weight and not c.ok and not c.na],
+        checks=[dict(name=c.name, ok=c.ok, na=c.na, detail=c.detail, weight=c.weight)
+                for c in plan.checks],
+        reasons=list(plan.reasons),
+        bias=plan.bias.value,
+        confidence=getattr(plan, "confidence", None),
+        entry_note=plan.entry_note,
+        atr_source=plan.atr_source,
+        fast_mover=plan.fast_mover,
     )
+    if reports:
+        tf_data = {}
+        for tf, rep in reports.items():
+            tf_key = tf.value if hasattr(tf, "value") else str(tf)
+            sigs = [dict(name=s.name, direction=s.direction.value,
+                         strength=round(s.strength, 3), category=s.category,
+                         evidence=s.evidence)
+                    for s in rep.signals]
+            indicators = {}
+            for col in ("close", "sma20", "sma50", "sma200", "ema20",
+                        "rsi", "macd", "macd_signal", "macd_hist",
+                        "stoch_k", "stoch_d", "atr"):
+                if col in rep.df.columns:
+                    series = rep.df[col].dropna()
+                    if not series.empty:
+                        indicators[col] = round(float(series.iloc[-1]), 4)
+            tf_data[tf_key] = dict(signals=sigs, bias_score=rep.bias_score,
+                                   trend_dir=rep.trend.direction.value,
+                                   indicators=indicators)
+        snap["timeframes"] = tf_data
+    if verdict:
+        snap["verdict"] = dict(
+            label=verdict.label, direction=verdict.direction.value,
+            score=verdict.score, confidence=verdict.confidence,
+            per_timeframe=verdict.per_timeframe)
+    if rec:
+        snap["recommendation"] = dict(
+            go_score=rec.go_score, light_color=rec.light_color,
+            preset=rec.preset.label if hasattr(rec.preset, "label") else str(rec.preset),
+            bullish_pct=rec.bullish_pct)
+    return snap
 
 
 def _quiet_price(tk: str) -> float | None:
@@ -281,7 +340,8 @@ def _quiet_price(tk: str) -> float | None:
     return None
 
 
-def _virtual_buy_button(plan, ticker: str, key_suffix: str = "") -> None:
+def _virtual_buy_button(plan, ticker: str, key_suffix: str = "",
+                        reports=None, verdict=None, rec=None) -> None:
     """The 'simulate this trade' button — with optional manual stop/target override."""
     if plan.kind == "no_trade" or not ticker:
         return
@@ -324,7 +384,7 @@ def _virtual_buy_button(plan, ticker: str, key_suffix: str = "") -> None:
             return
         manual = (abs(stop - plan.stop) > 1e-6 or abs(target - plan.target1) > 1e-6
                   or abs(entry - plan.entry) > 1e-6)
-        snap = _plan_snapshot(plan)
+        snap = _plan_snapshot(plan, reports, verdict, rec)
         snap["manual_levels"] = manual
         virtualbook.open_position(
             ticker=ticker, trader="me", entry=entry, stop=stop, target=target,
@@ -335,7 +395,7 @@ def _virtual_buy_button(plan, ticker: str, key_suffix: str = "") -> None:
                     f"(stop ${stop:.2f} / target ${target:.2f})")
         st.toast(f"💼 {msg} — ${amount:,.0f} stake", icon="📒")
         st.session_state["vb_flash"] = f"💼 Virtual position opened in {ticker}."
-        st.rerun()                          # full-app rerun so the portfolio updates now
+        st.rerun()
     st.caption("Auto-closes at stop/target · tracked in the **💼 Virtual portfolio** "
                "panel at the top with your stake and P&L.")
 
@@ -349,7 +409,7 @@ _BOTS = (
 )
 
 
-def _run_bots(ticker: str, plan) -> None:
+def _run_bots(ticker: str, plan, reports=None, verdict=None, rec=None) -> None:
     """Auto virtual-traders: each bot opens (at most one) position per ticker
     when its rule matches the current plan."""
     for name, cond, _pending in _BOTS:
@@ -358,7 +418,8 @@ def _run_bots(ticker: str, plan) -> None:
                 virtualbook.open_position(
                     ticker=ticker, trader=name, entry=plan.entry, stop=plan.stop,
                     target=plan.target1, kind=plan.kind, trigger=plan.trigger,
-                    horizon_days=3, snapshot=_plan_snapshot(plan))
+                    horizon_days=3,
+                    snapshot=_plan_snapshot(plan, reports, verdict, rec))
                 st.toast(f"🤖 {name} opened a virtual position in {ticker} "
                          f"(score {plan.score}%)", icon="🤖")
         except Exception:
@@ -368,22 +429,46 @@ def _run_bots(ticker: str, plan) -> None:
 # --------------------------------------------------------------------------- #
 # Swing radar — quiet tracking with escalating notices (60 / 70 / 80%).
 # --------------------------------------------------------------------------- #
-@st.cache_data(show_spinner=False, ttl=150)
+@st.cache_data(show_spinner=False, ttl=10)
 def _run_quiet(ticker: str):
     """Lightweight scan for the radar: technicals only, served from cache."""
     return analyze_ticker(ticker, include_fundamentals=False)
 
 
-def _radar_plan(res):
+@st.cache_data(show_spinner=False, ttl=900)
+def _quiet_sentiment(ticker: str) -> float | None:
+    """Live analyst/news sentiment for the radar — cached 15 min so the 10s
+    technical scan never burns Finnhub rate limit on news fetches."""
+    try:
+        from datetime import datetime, timedelta
+
+        from stockanalyzer.data.finnhub import FinnhubClient
+        from stockanalyzer.sentiment.score import score_sentiment
+
+        client = FinnhubClient()
+        if not client.available:
+            return None
+        to = datetime.now()
+        frm = to - timedelta(days=7)
+        info = client.company_info(ticker, frm.strftime("%Y-%m-%d"),
+                                   to.strftime("%Y-%m-%d"))
+        res = score_sentiment(info)
+        return res.score if res.available else None
+    except Exception:
+        return None
+
+
+def _radar_plan(res, sentiment: float | None = None):
     for tf in (Timeframe.D5, Timeframe.D1, Timeframe.M1):
         rep = res.reports.get(tf)
         if rep is not None:
             break
     else:
         return None
-    inv = round((build_verdict(res.reports).score + 1) / 2 * 100)
+    inv = round((build_verdict(res.reports, sentiment).score + 1) / 2 * 100)
     return build_swing_plan(rep, UseCase.BUY, SwingPace.FAST,
-                            all_reports=res.reports, context={"investor_pct": inv})
+                            all_reports=res.reports,
+                            context={"investor_pct": inv, "sentiment": sentiment})
 
 
 def _radar_card(tk: str, plan) -> None:
@@ -417,7 +502,7 @@ def _radar_card(tk: str, plan) -> None:
 
 
 def _radar_panel(tracked: list[str]) -> None:
-    @st.fragment(run_every="150s")
+    @st.fragment(run_every="10s")
     def _radar():
         ss = st.session_state
         ss.setdefault("radar_levels", {})
@@ -427,7 +512,8 @@ def _radar_panel(tracked: list[str]) -> None:
             with cols[i % len(cols)]:
                 try:
                     res = _run_quiet(tk)
-                    plan = _radar_plan(res) if res.reports else None
+                    plan = (_radar_plan(res, _quiet_sentiment(tk))
+                            if res.reports else None)
                 except Exception:
                     plan = None
                 if plan is None:
@@ -437,7 +523,7 @@ def _radar_panel(tracked: list[str]) -> None:
                 ss.radar_levels[tk] = swingwatch.notice_level(plan.score)
                 if fired:
                     stored = papertrade.record(dict(
-                        ts=time.time(), date=time.strftime("%Y-%m-%d %H:%M"),
+                        ts=time.time(), date=time.strftime("%x %X"),
                         ticker=tk, level=fired[0], score=plan.score,
                         label=plan.score_label, kind=plan.kind, setup=plan.setup,
                         entry=plan.entry, stop=plan.stop, target=plan.target1,
@@ -446,7 +532,7 @@ def _radar_panel(tracked: list[str]) -> None:
                     note = " · 📒 recorded for paper trading" if stored else ""
                     st.toast(f"📡 {tk}: {fired[1]} — {plan.guidance[:80]}{note}", icon="🔔")
                 # Virtual trading: bots act on the scan; positions mark to price.
-                _run_bots(tk, plan)
+                _run_bots(tk, plan, reports=res.reports)
                 px = _quiet_price(tk)
                 if px:
                     for chg in virtualbook.mark(tk, px):
@@ -553,7 +639,8 @@ def _portfolio_panel() -> None:
                     rows.append({
                         "ticker": p["ticker"], "trader": p["trader"],
                         "status": "⏳ armed" if p["status"] == "pending" else "📈 open",
-                        "opened": p["opened"], "stake $": p.get("stake", 1000.0),
+                        "opened": _fmt_ts(p.get("opened_ts") or p["opened"]),
+                        "stake $": p.get("stake", 1000.0),
                         "entry": p["entry"], "now": cur,
                         "stop": p["stop"], "target": p["target"],
                         "trigger": p.get("trigger"),
@@ -613,7 +700,8 @@ def _portfolio_panel() -> None:
                 hist = [p for p in book if p["status"] == "closed"]
                 st.markdown(f"**Trade history ({len(hist)})**")
                 h_rows = [{
-                    "closed": p.get("closed"), "ticker": p["ticker"],
+                    "closed": _fmt_ts(p.get("closed_ts") or p.get("closed")),
+                    "ticker": p["ticker"],
                     "trader": p["trader"], "reason": p.get("close_reason"),
                     "stake $": p.get("stake", 1000.0),
                     "entry": p["entry"], "exit": p.get("exit_price"),
@@ -840,6 +928,8 @@ def _reco_context(result) -> dict:
     av = result.company.analyst if (result.company and result.company.available) else None
     if av and av.target_mean:
         ctx["analyst_target"] = float(av.target_mean)
+    if result.sentiment is not None and result.sentiment.available:
+        ctx["sentiment"] = result.sentiment.score
     return ctx
 
 
@@ -873,7 +963,8 @@ def _swing_score_block(plan) -> None:
             st.write(f"{icon} **{c.name}** — {c.detail} {w}")
 
 
-def _orders_guide(plan, usecase: UseCase, live_momentum: str | None = None) -> None:
+def _orders_guide(plan, usecase: UseCase, live_momentum: str | None = None,
+                  reports=None, verdict=None, rec=None) -> None:
     """Exact broker instructions, driven by the plan kind."""
     long_side = plan.bias == Direction.BULL
 
@@ -965,11 +1056,13 @@ def _orders_guide(plan, usecase: UseCase, live_momentum: str | None = None) -> N
     st.caption("Place stop + take-profit together with the entry (ask your broker for a "
                "bracket / OCO order) · risk ~1% of your account per trade.")
     _virtual_buy_button(plan, st.session_state.get("ticker", ""),
-                        key_suffix=("live" if live_momentum is not None else "static"))
+                        key_suffix=("live" if live_momentum is not None else "static"),
+                        reports=reports, verdict=verdict, rec=rec)
 
 
 def _swing_card(rec, buy_price: float | None = None,
-                usecase: UseCase = UseCase.BUY) -> None:
+                usecase: UseCase = UseCase.BUY,
+                reports=None, verdict=None) -> None:
     plan = rec.swing
     st.subheader("⚡ Swing trade plan")
     st.caption(f"Decision chart: {rec.decision_timeframe} · horizon {plan.horizon} · "
@@ -987,7 +1080,7 @@ def _swing_card(rec, buy_price: float | None = None,
         f"<div style='font-size:1.6em;font-weight:700;color:{rr_color}'>{plan.rr:.1f}:1</div></div>",
         unsafe_allow_html=True)
     _swing_score_block(plan)
-    _orders_guide(plan, usecase)
+    _orders_guide(plan, usecase, reports=reports, verdict=verdict, rec=rec)
     st.caption(f"Setup: **{plan.setup}** · risk per share ≈ {plan.risk_pct:.1f}% · "
                f"2nd target ${plan.target2:.2f}" if plan.target2 else
                f"Setup: **{plan.setup}** · risk per share ≈ {plan.risk_pct:.1f}%")
@@ -1004,9 +1097,10 @@ def _swing_card(rec, buy_price: float | None = None,
 
 def _next_steps(rec, buy_price: float | None = None,
                 current_price: float | None = None,
-                usecase: UseCase = UseCase.BUY) -> None:
+                usecase: UseCase = UseCase.BUY,
+                reports=None, verdict=None) -> None:
     if getattr(rec, "swing", None) is not None:
-        _swing_card(rec, buy_price, usecase)
+        _swing_card(rec, buy_price, usecase, reports=reports, verdict=verdict)
         return
     st.subheader("✅ What to watch next")
     # Own + investor mode: show cost-basis block using scenario levels as stop/target.
@@ -1137,8 +1231,9 @@ def _live_frame(ctx: dict) -> None:
 
     # --- recompute BOTH framings at the live price (cheap: cached reports) ---
     reco_ctx = _reco_context(ctx["result"])
+    swing_verdict = build_verdict(reports, ctx["sent"], Strategy.SWING, ctx["pace"])
     swing_rec = build_recommendation(
-        ticker, build_verdict(reports, ctx["sent"], Strategy.SWING, ctx["pace"]),
+        ticker, swing_verdict,
         reports, ctx["usecase"], Strategy.SWING, ctx["pace"], price_override=live_price,
         context=reco_ctx)
     inv_rec = build_recommendation(
@@ -1156,7 +1251,8 @@ def _live_frame(ctx: dict) -> None:
     _live_decision_strip(swing_rec, inv_rec, d1, ctx["pace"])
     if plan is not None:
         _swing_score_block(plan)
-        _orders_guide(plan, ctx["usecase"], live_momentum=live_momentum)
+        _orders_guide(plan, ctx["usecase"], live_momentum=live_momentum,
+                      reports=reports, verdict=swing_verdict, rec=swing_rec)
 
     # Flip detection → toast + event feed.
     cur = _build_live_state(swing_rec, inv_rec, d1, live_price, plan, key_level)
@@ -1165,7 +1261,7 @@ def _live_frame(ctx: dict) -> None:
     if events:
         feed = ss.get("live_events", [])
         for e in events:
-            feed.insert(0, (time.strftime("%H:%M:%S"), e))
+            feed.insert(0, (time.strftime("%X"), e))
         ss.live_events = feed[:20]
         top_ev = max(events, key=lambda e: _SEV_RANK.get(e.severity, 0))
         st.toast(top_ev.text, icon="⚡")
@@ -1173,7 +1269,7 @@ def _live_frame(ctx: dict) -> None:
     # Virtual book: bots act on the analyzed ticker too; mark holdings ~10s.
     if plan is not None and live_price and now - ss.get("vb_last_mark", 0) > 10:
         ss.vb_last_mark = now
-        _run_bots(ticker, plan)
+        _run_bots(ticker, plan, reports=reports, verdict=swing_verdict, rec=swing_rec)
         for chg in virtualbook.mark(ticker, live_price):
             if chg["status"] == "closed":
                 st.toast(f"💼 {chg['trader']} closed {ticker}: {chg['close_reason']} "
@@ -1181,7 +1277,7 @@ def _live_frame(ctx: dict) -> None:
             else:
                 st.toast(f"💼 {chg['trader']}'s breakout order filled in {ticker}", icon="🚀")
 
-    _live_chart(ticker, d1, plan, key_level, live_price, snap)
+    _live_chart(ticker, d1, plan, key_level, live_price, snap, reports=reports)
     _live_signal_chips(d1)
     if ctx["buy_price"] and plan is not None and live_price:
         _cost_basis_block(ctx["buy_price"], live_price, plan.stop, plan.target1)
@@ -1270,8 +1366,15 @@ def _live_decision_strip(swing_rec, inv_rec, d1, pace: SwingPace = SwingPace.STA
                 unsafe_allow_html=True)
 
 
+def _sig_weight(s) -> float:
+    """Effective engine contribution = category weight × signal strength."""
+    return CATEGORY_WEIGHTS.get(s.category, 1.0) * s.strength
+
+
 def _build_live_state(swing_rec, inv_rec, d1, live_price, plan, key_level) -> LiveState:
-    names = frozenset(s.name for s in d1.signals if s.name != "trend") if d1 else frozenset()
+    live_sigs = [s for s in d1.signals if s.name != "trend"] if d1 else []
+    names = frozenset(s.name for s in live_sigs)
+    metas = tuple((s.name, s.direction.sign, round(_sig_weight(s), 2)) for s in live_sigs)
     tc = d1.trend_change if d1 else None
     return LiveState(
         light=(plan.light if plan else ""),
@@ -1283,6 +1386,7 @@ def _build_live_state(swing_rec, inv_rec, d1, live_price, plan, key_level) -> Li
         preset_key=inv_rec.preset.key,
         preset_label=inv_rec.preset.label,
         signals=names,
+        signal_meta=metas,
         price=live_price or 0.0,
         entry=(plan.entry if plan else None),
         stop=(plan.stop if plan else None),
@@ -1294,28 +1398,76 @@ def _build_live_state(swing_rec, inv_rec, d1, live_price, plan, key_level) -> Li
     )
 
 
-def _live_chart(ticker, d1, plan, key_level, live_price, snap) -> None:
+# Order the frame picker the way a trading site does: shortest → longest.
+_CHART_FRAMES = (Timeframe.D1, Timeframe.D5, Timeframe.M1, Timeframe.M6,
+                 Timeframe.YTD, Timeframe.Y1, Timeframe.Y5)
+
+
+def _focus_right(fig, df, frac: float = 0.4) -> None:
+    """Open the view zoomed onto the most recent `frac` of bars (latest ticks),
+    so freshly-added candles land in a focused right-hand window. uirevision keeps
+    any later user pan/zoom; this only sets the *initial* range."""
+    n = len(df)
+    if n < 8:
+        return
+    start = df.index[int(n * (1 - frac))]
+    fig.update_xaxes(range=[start, df.index[-1]], row=1, col=1)
+
+
+def _live_chart(ticker, d1, plan, key_level, live_price, snap, reports=None) -> None:
     if d1 is None:
         st.info("No intraday chart available yet.")
         return
-    fig = candlestick_figure(d1, title=f"{ticker} — live (1D · 5-min)")
-    if plan is not None and plan.trigger:
-        fig.add_hline(y=plan.trigger, line=dict(color="#ff9800", width=1.6, dash="dot"),
-                      annotation_text=f"🚀 trigger {plan.trigger:.2f}",
-                      annotation_position="left", row=1, col=1)
-    if plan is not None:
-        for y, c, label in ((plan.entry, "#42a5f5", "entry"),
-                            (plan.stop, "#ef5350", "stop"),
-                            (plan.target1, "#26a69a", "target")):
-            fig.add_hline(y=y, line=dict(color=c, width=1.2, dash="dash"),
-                          annotation_text=f"{label} {y:.2f}", annotation_position="left",
+
+    reports = reports or {Timeframe.D1: d1}
+    avail = [tf for tf in _CHART_FRAMES if reports.get(tf) is not None]
+    ss = st.session_state
+    ss.setdefault("live_chart_tf", Timeframe.D1)
+    if ss.live_chart_tf not in avail:
+        ss.live_chart_tf = Timeframe.D1
+    labels = [tf.value for tf in avail]
+    picker = getattr(st, "segmented_control", None) or getattr(st, "pills", None)
+    if picker is not None and len(avail) > 1:
+        chosen = picker("Timeframe", labels,
+                        default=ss.live_chart_tf.value, key="live_chart_pick",
+                        label_visibility="collapsed")
+    elif len(avail) > 1:
+        chosen = st.radio("Timeframe", labels,
+                          index=labels.index(ss.live_chart_tf.value),
+                          horizontal=True, key="live_chart_pick",
+                          label_visibility="collapsed")
+    else:
+        chosen = Timeframe.D1.value
+    tf = next((t for t in avail if t.value == chosen), Timeframe.D1)
+    ss.live_chart_tf = tf
+
+    rep = reports.get(tf, d1)
+    is_live = tf == Timeframe.D1
+    suffix = "live (1D · 5-min)" if is_live else tf.value
+    fig = candlestick_figure(rep, title=f"{ticker} — {suffix}")
+
+    # Plan overlays + the live price line belong on the live intraday frame only;
+    # on the structural frames they'd be off-scale clutter.
+    if is_live:
+        if plan is not None and plan.trigger:
+            fig.add_hline(y=plan.trigger, line=dict(color="#ff9800", width=1.6, dash="dot"),
+                          annotation_text=f"🚀 trigger {plan.trigger:.2f}",
+                          annotation_position="left", row=1, col=1)
+        if plan is not None:
+            for y, c, label in ((plan.entry, "#42a5f5", "entry"),
+                                (plan.stop, "#ef5350", "stop"),
+                                (plan.target1, "#26a69a", "target")):
+                fig.add_hline(y=y, line=dict(color=c, width=1.2, dash="dash"),
+                              annotation_text=f"{label} {y:.2f}", annotation_position="left",
+                              row=1, col=1)
+        if live_price:
+            fig.add_hline(y=live_price, line=dict(color="#ffeb3b", width=1.4),
+                          annotation_text=f"LIVE {live_price:.2f}", annotation_position="right",
                           row=1, col=1)
-    if live_price:
-        fig.add_hline(y=live_price, line=dict(color="#ffeb3b", width=1.4),
-                      annotation_text=f"LIVE {live_price:.2f}", annotation_position="right",
-                      row=1, col=1)
+
+    _focus_right(fig, rep.df)
     st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_CFG)
-    if snap and len(snap.ticks) >= 2:
+    if is_live and snap and len(snap.ticks) >= 2:
         _live_heartbeat(snap.ticks)
 
 
@@ -1340,6 +1492,14 @@ def _live_heartbeat(ticks) -> None:
     st.caption(caption)
 
 
+# Direction → (text color, translucent fill, border) — readable on light AND dark.
+_CHIP_STYLE = {
+    Direction.BULL: ("#0f6e56", "rgba(29,158,117,0.14)", "rgba(29,158,117,0.55)"),
+    Direction.BEAR: ("#a32d2d", "rgba(226,75,74,0.14)", "rgba(226,75,74,0.55)"),
+    Direction.NEUTRAL: ("#5f5e5a", "rgba(136,135,128,0.14)", "rgba(136,135,128,0.45)"),
+}
+
+
 def _live_signal_chips(d1) -> None:
     if d1 is None:
         return
@@ -1348,13 +1508,25 @@ def _live_signal_chips(d1) -> None:
         st.caption("**Live signals (1D):** none active right now.")
         return
     chips = []
-    for s in sigs[:12]:
+    for s in sorted(sigs[:12], key=_sig_weight, reverse=True):
         term = explain_signal(s.name)
+        fg, bg, bd = _CHIP_STYLE.get(s.direction, _CHIP_STYLE[Direction.NEUTRAL])
+        layman = (term.layman or "").replace("'", "’")
+        w = _sig_weight(s)
+        wbadge = (f"<span style='background:{fg};color:#fff;border-radius:6px;"
+                  f"padding:0 5px;margin-left:3px;font-size:0.82em;font-weight:500;"
+                  f"font-variant-numeric:tabular-nums'>w&nbsp;{w:.1f}</span>")
         chips.append(
-            f"<span style='background:#2b2b3d;border-radius:12px;padding:3px 10px;margin:2px;"
-            f"display:inline-block;font-size:0.85em' title='{term.layman}'>"
-            f"{_DIR_EMOJI[s.direction]} {term.title}</span>")
-    st.markdown("**Live signals (1D):** " + " ".join(chips), unsafe_allow_html=True)
+            f"<span title='{layman} · weight {w:.2f} (category × strength)' "
+            f"style='display:inline-flex;align-items:center;gap:4px;"
+            f"background:{bg};color:{fg};border:1px solid {bd};border-radius:999px;"
+            f"padding:3px 6px 3px 11px;margin:3px 4px 0 0;font-size:0.82em;font-weight:500;"
+            f"line-height:1.6;white-space:nowrap'>"
+            f"{_DIR_EMOJI[s.direction]} {term.title}{wbadge}</span>")
+    st.markdown("**Live signals (1D):**", help="Active intraday signals from the engine.")
+    st.markdown(
+        "<div style='display:flex;flex-wrap:wrap'>" + "".join(chips) + "</div>",
+        unsafe_allow_html=True)
 
 
 def _live_event_feed() -> None:
@@ -1365,9 +1537,19 @@ def _live_event_feed() -> None:
     st.markdown("**📋 Live event feed** _(newest first)_")
     rows = []
     for ts, e in feed[:12]:
-        c = _SEV_COLOR.get(e.severity, "#90a4ae")
-        rows.append(f"<div style='border-left:3px solid {c};padding:2px 8px;margin:2px 0'>"
-                    f"<span style='color:gray;font-size:0.8em'>{ts}</span> &nbsp;{e.text}</div>")
+        sign = getattr(e, "sign", 0)
+        # Signal lines are colored by polarity (green up / red down); everything
+        # else keeps its severity color.
+        if sign > 0:
+            border, txt = "#1d9e75", "#0f6e56"
+        elif sign < 0:
+            border, txt = "#e24b4a", "#a32d2d"
+        else:
+            border, txt = _SEV_COLOR.get(e.severity, "#90a4ae"), "inherit"
+        rows.append(
+            f"<div style='border-left:3px solid {border};padding:2px 8px;margin:2px 0;"
+            f"color:{txt}'>"
+            f"<span style='color:gray;font-size:0.8em'>{ts}</span> &nbsp;{e.text}</div>")
     st.markdown("".join(rows), unsafe_allow_html=True)
 
 
@@ -1546,7 +1728,28 @@ def _running_in_streamlit() -> bool:
         return False
 
 
+def _start_keep_alive() -> None:
+    """Ping this app's health endpoint every 10 min so Render free tier never idles."""
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not url:
+        return  # not on Render, nothing to do
+
+    import urllib.request
+
+    def _ping() -> None:
+        while True:
+            time.sleep(600)  # 10 minutes
+            try:
+                urllib.request.urlopen(f"{url}/_stcore/health", timeout=10)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_ping, daemon=True, name="keep-alive")
+    t.start()
+
+
 # Render whenever Streamlit runs this file — regardless of how it sets __name__.
 # (A plain `python -c "import app"` has no Streamlit context, so it stays a no-op.)
 if __name__ == "__main__" or _running_in_streamlit():
+    _start_keep_alive()
     main()

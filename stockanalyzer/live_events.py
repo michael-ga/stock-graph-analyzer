@@ -34,6 +34,11 @@ class LiveState:
     kind: str = ""                     # immediate / breakout_wait / no_trade
     trigger: float | None = None       # breakout_wait: the wall to close beyond
     bull: bool = True                  # plan direction (True = long)
+    # Per-signal polarity + engine weight, keyed by name: ((name, sign, weight), …).
+    # Carried alongside `signals` so signal events can be color/weight annotated;
+    # the new/gone diff still keys on `signals` (names only) so weight drift on an
+    # existing signal doesn't spuriously fire a clear+new pair.
+    signal_meta: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,16 @@ class Event:
                                        # signal_new / signal_gone / stop / target / level
     text: str
     severity: str = "info"             # good / bad / warn / info
+    sign: int = 0                      # signal polarity: +1 bullish, -1 bearish, 0 neutral
+    weight: float = 0.0                # engine contribution weight (category × strength)
+
+
+def _arrow(sign: int) -> str:
+    return "▲" if sign > 0 else "▼" if sign < 0 else "▬"
+
+
+def _wtag(weight: float) -> str:
+    return f" (w {weight:.1f})" if weight else ""
 
 
 def _crossed(level: float | None, a: float | None, b: float | None) -> bool:
@@ -84,11 +99,17 @@ def diff_states(prev: LiveState | None, cur: LiveState) -> list[Event]:
         events.append(Event("trend_change",
                             f"⚠️ Possible trend change toward {cur.trend_change_dir}", "warn"))
 
-    # New / cleared engine signals.
+    # New / cleared engine signals — annotated with polarity (▲/▼) and weight.
+    cur_meta = {n: (sg, w) for n, sg, w in cur.signal_meta}
+    prev_meta = {n: (sg, w) for n, sg, w in prev.signal_meta}
     for name in sorted(cur.signals - prev.signals):
-        events.append(Event("signal_new", f"New signal: {name}", "info"))
+        sg, w = cur_meta.get(name, (0, 0.0))
+        events.append(Event("signal_new", f"New signal: {name}{_wtag(w)} {_arrow(sg)}",
+                            "info", sign=sg, weight=w))
     for name in sorted(prev.signals - cur.signals):
-        events.append(Event("signal_gone", f"Signal cleared: {name}", "info"))
+        sg, w = prev_meta.get(name, (0, 0.0))
+        events.append(Event("signal_gone", f"Signal cleared: {name}{_wtag(w)} {_arrow(sg)}",
+                            "info", sign=sg, weight=w))
 
     # Plan kind changed (immediate ↔ breakout_wait ↔ no_trade).
     if cur.kind and prev.kind and cur.kind != prev.kind:

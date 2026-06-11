@@ -53,6 +53,12 @@ def _weights(strategy: Strategy, pace: SwingPace) -> dict[Timeframe, float]:
     return SWING_FAST_TIMEFRAME_WEIGHTS if pace == SwingPace.FAST else SWING_TIMEFRAME_WEIGHTS
 
 
+# How much live analyst/news sentiment moves the verdict vs pure technicals.
+# News-driven spikes (policy moves, sector headlines) lead technicals on the
+# swing horizon, so sentiment earns 37.5% of the blended score.
+SENTIMENT_WEIGHT = 0.375
+
+
 @dataclass
 class Verdict:
     label: str                 # "Buy" / "Sell" / "Hold" lean
@@ -84,9 +90,9 @@ def build_verdict(
 
     tech_score = weighted_sum / weight_total if weight_total else 0.0
 
-    # Blend sentiment (Phase 2+). Technicals dominate 70/30 until proven otherwise.
+    # Blend live analyst/news sentiment with the technical read.
     if sentiment_score is not None:
-        score = 0.7 * tech_score + 0.3 * sentiment_score
+        score = (1 - SENTIMENT_WEIGHT) * tech_score + SENTIMENT_WEIGHT * sentiment_score
     else:
         score = tech_score
 
@@ -102,8 +108,8 @@ def build_verdict(
     explanation = _explain(reports, score, direction)
     if sentiment_score is not None:
         explanation.insert(1, (
-            f"Blended 70% technicals ({tech_score:+.2f}) + 30% "
-            f"analyst/news sentiment ({sentiment_score:+.2f})."
+            f"Blended {(1 - SENTIMENT_WEIGHT) * 100:.1f}% technicals ({tech_score:+.2f}) "
+            f"+ {SENTIMENT_WEIGHT * 100:.1f}% analyst/news sentiment ({sentiment_score:+.2f})."
         ))
     confidence = round(min(1.0, abs(score) + 0.2 * _agreement(per_tf)), 3)
 

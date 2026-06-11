@@ -4,6 +4,7 @@ Used by the dashboard and by scripts.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -83,12 +84,42 @@ def analyze_ticker(
     reports: dict[Timeframe, TimeframeReport] = {}
     errors: dict[str, str] = {}
     notices: list[str] = []
-    for tf in timeframes:
-        try:
-            df = provider.fetch_cached(ticker, tf, live_mode=live_mode, notices=notices)
-            reports[tf] = analyze_timeframe(df)
-        except (ProviderError, ValueError, Exception) as exc:  # keep going per-timeframe
-            errors[tf.value] = str(exc)
+
+    # The timeframe fetches are independent network calls (~0.4-1.6s each) and
+    # so is the Finnhub enrichment batch — run them all concurrently. Cold-load
+    # wall time drops from the SUM of ~14 round trips to roughly the slowest one.
+    def _frame_job(tf: Timeframe) -> TimeframeReport:
+        df = provider.fetch_cached(ticker, tf, live_mode=live_mode, notices=notices)
+        return analyze_timeframe(df)
+
+    def _enrich_job():
+        client = FinnhubClient()
+        if not client.available:
+            return None
+        to = datetime.now()
+        frm = to - timedelta(days=news_days)
+        info = client.company_info(ticker, frm.strftime("%Y-%m-%d"), to.strftime("%Y-%m-%d"))
+        return info, client.quote(ticker), client.next_earnings(ticker)
+
+    with ThreadPoolExecutor(max_workers=len(timeframes) + 1) as pool:
+        frame_futs = {tf: pool.submit(_frame_job, tf) for tf in timeframes}
+        enrich_fut = pool.submit(_enrich_job) if include_fundamentals else None
+        for tf, fut in frame_futs.items():
+            try:
+                reports[tf] = fut.result()
+            except (ProviderError, ValueError, Exception) as exc:  # keep going per-timeframe
+                errors[tf.value] = str(exc)
+
+        company: CompanyInfo | None = None
+        quote: Quote | None = None
+        earnings_date: str | None = None
+        if enrich_fut is not None:
+            try:
+                enriched = enrich_fut.result()
+                if enriched is not None:
+                    company, quote, earnings_date = enriched
+            except Exception as exc:  # never let enrichment break the core report
+                errors["finnhub"] = str(exc)
 
     last_price = None
     if reports:
@@ -98,24 +129,8 @@ def analyze_ticker(
                 last_price = reports[tf].meta.get("last_close")
                 break
 
-    # Fundamentals / analyst / news (Phase 2). Degrades silently without a key.
-    company: CompanyInfo | None = None
     sentiment: SentimentResult | None = None
-    quote: Quote | None = None
-    earnings_date: str | None = None
     if include_fundamentals:
-        client = FinnhubClient()
-        if client.available:
-            try:
-                to = datetime.now()
-                frm = to - timedelta(days=news_days)
-                company = client.company_info(
-                    ticker, frm.strftime("%Y-%m-%d"), to.strftime("%Y-%m-%d")
-                )
-                quote = client.quote(ticker)
-                earnings_date = client.next_earnings(ticker)
-            except Exception as exc:  # never let enrichment break the core report
-                errors["finnhub"] = str(exc)
         sentiment = score_sentiment(company, last_price) if company else None
 
     # Prefer the session-aware derived quote during extended hours, since Finnhub's

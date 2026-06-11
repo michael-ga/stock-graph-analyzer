@@ -136,6 +136,54 @@ def _daily_atr(all_reports, df, price: float) -> tuple[float, str]:
 
 
 # --------------------------------------------------------------------------- #
+# Level map — geometry must see ALL the structure, not just the decision frame.
+# --------------------------------------------------------------------------- #
+_LEVEL_FRAMES = (Timeframe.M1, Timeframe.M6, Timeframe.Y1, Timeframe.Y5)
+_LEVEL_CLUSTER_PCT = 0.006     # walls within 0.6% of each other merge into one
+
+
+def _merged_levels(report, all_reports, price: float) -> tuple[list[float], list[float]]:
+    """(walls ascending, supports descending) merged across timeframes.
+
+    The decision chart (e.g. 5D) only maps a few days of structure — after a
+    run-up every wall it knows is below price, the geometry declares "blue sky"
+    and targets sail straight through ceilings the 6M/1Y charts know about
+    (the INTC $133-above-the-all-time-high failure). Frame highs/lows count as
+    levels too: the all-time high IS resistance. Clusters keep the value
+    nearest to price, so targets stay conservative.
+    """
+    walls = {lv.price for lv in report.levels if lv.price > price}
+    supports = {lv.price for lv in report.levels if lv.price < price}
+    if all_reports:
+        for tf in _LEVEL_FRAMES:
+            rep = all_reports.get(tf)
+            if rep is None or rep is report:
+                continue
+            for lv in rep.levels:
+                (walls if lv.price > price else supports).add(lv.price)
+            try:
+                hi = float(rep.df["high"].max())
+                lo = float(rep.df["low"].min())
+                if hi > price:
+                    walls.add(hi)
+                if lo < price:
+                    supports.add(lo)
+            except Exception:
+                pass
+
+    def _cluster(vals: set, nearest_first_sorted: list) -> list[float]:
+        out: list[float] = []
+        for v in nearest_first_sorted:
+            if out and abs(v / out[-1] - 1) < _LEVEL_CLUSTER_PCT:
+                continue
+            out.append(v)
+        return out
+
+    return (_cluster(walls, sorted(walls)),
+            _cluster(supports, sorted(supports, reverse=True)))
+
+
+# --------------------------------------------------------------------------- #
 # Honest target geometry (long side; mirrored for shorts).
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -395,7 +443,30 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
             "No conflict with the long-term read", ok,
             f"investor conviction {inv_pct}% bullish", 4))
 
+    # News/analyst tailwind — live sentiment must not fight the direction.
+    sent = context.get("sentiment")
+    if sent is not None:
+        ok = sent >= 0.05 if bull else sent <= -0.05
+        checks.append(SwingCheck(
+            "News/analyst tailwind", ok,
+            f"sentiment {sent:+.2f} (analyst + price target + news)", 6))
+
     # --- informational rows (weight 0 — shown, never scored) -----------------
+    # 52-week-high headroom: targets beyond known history deserve a flag.
+    hi52 = None
+    if all_reports:
+        for tf in (Timeframe.Y1, Timeframe.M6):
+            rep = all_reports.get(tf)
+            if rep is not None and len(rep.df):
+                hi52 = float(rep.df["high"].max())
+                break
+    if hi52:
+        headroom = (hi52 / geom.entry - 1) * 100
+        checks.append(SwingCheck(
+            "52-week-high headroom", geom.target <= hi52 * 1.001,
+            f"52w high ${hi52:.2f} ({headroom:+.1f}% from entry) — "
+            + ("target stays under it" if geom.target <= hi52 * 1.001
+               else "target is BEYOND it (blue-sky run needed)"), 0))
     edays = context.get("earnings_days")
     if edays is not None:
         checks.append(SwingCheck("Earnings proximity", edays > context.get(
@@ -547,8 +618,7 @@ def _detect_short_setup(report, price, df, names, atr_abs, ind_df=None) -> str |
 def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
                 context, atr_abs, atr_frac, atr_src, short: bool, own: bool) -> SwingPlan:
     bias = Direction.BEAR if short else Direction.BULL
-    walls = sorted(lv.price for lv in report.levels if lv.price > price)
-    supports = sorted((lv.price for lv in report.levels if lv.price < price), reverse=True)
+    walls, supports = _merged_levels(report, all_reports, price)
 
     ind_df = _ind_frame(all_reports, df)
     setup = (_detect_short_setup(report, price, df, names, atr_abs, ind_df) if short

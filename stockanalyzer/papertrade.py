@@ -4,42 +4,38 @@ later judged against what the market actually did.
 The point is the feedback loop: per alert level (60/70/80%) you can inspect
 win rate and average result, and keep calibrating the algorithm with evidence.
 
-Records persist to `.papertrade.json`. Outcome judging is pure (`judge_outcome`)
+Records persist to ``trades.db``.  Outcome judging is pure (`judge_outcome`)
 and conservative: on a bar where both stop and target were touched, the stop
 counts first.
 """
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
+from .data.store import (
+    insert_paper_trade,
+    load_paper_trades,
+    update_paper_status,
+)
+
+# Legacy path kept only so the JSON→SQLite migration can find the old file.
 _PATH = Path(__file__).resolve().parent.parent / ".papertrade.json"
 
-# Final statuses — never re-evaluated.
 _FINAL = {"target_hit", "stop_hit", "expired", "not_triggered"}
 
 
 def load(path: Path = _PATH) -> list[dict]:
-    try:
-        data = json.loads(path.read_text())
-        if isinstance(data, list):
-            return data
-    except Exception:
-        pass
-    return []
+    return load_paper_trades()
 
 
 def _write(path: Path, records: list[dict]) -> None:
-    try:
-        path.write_text(json.dumps(records, indent=1))
-    except Exception:
-        pass
+    pass
 
 
 def recent_duplicate(records: list[dict], ticker: str, level: int,
                      ts: float, hours: float = 24.0) -> bool:
-    """True if the same (ticker, level) was already recorded within `hours`."""
+    """True if the same (ticker, level) was already recorded within ``hours``."""
     cutoff = ts - hours * 3600
     return any(r.get("ticker") == ticker and r.get("level") == level
                and r.get("ts", 0) >= cutoff for r in records)
@@ -47,28 +43,20 @@ def recent_duplicate(records: list[dict], ticker: str, level: int,
 
 def record(rec: dict, path: Path = _PATH) -> bool:
     """Append a proposition unless it's a fresh duplicate. Returns True if stored."""
-    records = load(path)
-    if recent_duplicate(records, rec.get("ticker", ""), rec.get("level", 0),
-                        rec.get("ts", time.time())):
-        return False
-    records.append(rec)
-    _write(path, records)
-    return True
+    return insert_paper_trade(rec)
 
 
-# --------------------------------------------------------------------------- #
-# Outcome judging (pure).
-# --------------------------------------------------------------------------- #
+# ── outcome judging (pure) ────────────────────────────────────────────────── #
+
 def judge_outcome(bars: list[tuple[float, float, float]], entry: float,
                   stop: float, target: float, trigger: float | None = None,
                   horizon_days: int = 3) -> tuple[str, float]:
     """Judge a LONG proposition against daily (high, low, close) bars after the alert.
 
-    breakout_wait records carry `trigger`: the trade activates only on a bar
-    whose CLOSE clears it (the rule the guidance states — a 120-point backtest
-    showed touch-fills win 48% vs 70% for close-fills), filling at that close.
-    Active trades: stop first (conservative), then target, expiring after
-    `horizon_days` active days at mark-to-market. Returns (status, result_pct).
+    breakout_wait records carry ``trigger``: the trade activates only on a bar
+    whose CLOSE clears it, filling at that close.  Active trades: stop first
+    (conservative), then target, expiring after ``horizon_days`` active days at
+    mark-to-market.  Returns (status, result_pct).
     """
     if not bars:
         return "open", 0.0
@@ -79,8 +67,8 @@ def judge_outcome(bars: list[tuple[float, float, float]], entry: float,
         if not active:
             if close >= trigger:
                 active = True
-                entry = close              # filled at the confirming close
-                active_days += 1           # fill bar consumed; judge from next bar
+                entry = close
+                active_days += 1
                 continue
             waited += 1
             if waited >= horizon_days:
@@ -117,8 +105,7 @@ def _bars_after(df, alert_ts: float) -> list[tuple[float, float, float]]:
 
 def evaluate_all(frames_by_ticker: dict, path: Path = _PATH) -> list[dict]:
     """Re-judge every non-final record using fresh daily frames. Saves + returns."""
-    records = load(path)
-    changed = False
+    records = load_paper_trades()
     for r in records:
         if r.get("status") in _FINAL:
             continue
@@ -131,19 +118,17 @@ def evaluate_all(frames_by_ticker: dict, path: Path = _PATH) -> list[dict]:
             trigger=r.get("trigger"), horizon_days=int(r.get("horizon_days", 3)))
         if status != r.get("status") or result != r.get("result_pct"):
             r["status"], r["result_pct"] = status, result
-            changed = True
-    if changed:
-        _write(path, records)
+            rid = r.get("id")
+            if rid is not None:
+                update_paper_status(rid, status, result)
     return records
 
 
-# --------------------------------------------------------------------------- #
-# The report card — per-level stats for inspecting the algorithm.
-# --------------------------------------------------------------------------- #
+# ── report card ───────────────────────────────────────────────────────────── #
+
 def summarize(records: list[dict]) -> dict:
     """{level: {n, wins, losses, expired, open, not_triggered, win_rate, avg_result}}
-    plus an 'all' rollup. Win = target_hit; loss = stop_hit; expired counts by
-    its sign; open/not_triggered excluded from the win rate."""
+    plus an 'all' rollup."""
     out: dict = {}
     for key in (60, 70, 80, "all"):
         out[key] = dict(n=0, wins=0, losses=0, expired=0, open=0,

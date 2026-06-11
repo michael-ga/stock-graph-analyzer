@@ -44,13 +44,18 @@ _DEFAULT = Caps(per_min=20)
 
 
 class _Bucket:
-    """A simple token bucket: `per_min` tokens, refilling continuously."""
+    """A simple token bucket: `per_min` tokens, refilling continuously.
+
+    Thread-safe: timeframe fetches now run concurrently, so refill+take must be
+    atomic or parallel callers could double-spend the same token.
+    """
 
     def __init__(self, per_min: int):
         self.capacity = float(per_min)
         self.tokens = float(per_min)
         self.refill_per_sec = per_min / 60.0
         self.last = time.monotonic()
+        self._lock = Lock()
 
     def _refill(self) -> None:
         now = time.monotonic()
@@ -61,10 +66,11 @@ class _Bucket:
         """Consume a token, waiting up to max_wait seconds for one to refill."""
         deadline = time.monotonic() + max_wait
         while True:
-            self._refill()
-            if self.tokens >= 1.0:
-                self.tokens -= 1.0
-                return True
+            with self._lock:
+                self._refill()
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return True
             if time.monotonic() >= deadline:
                 return False
             time.sleep(min(0.25, self.refill_per_sec and 1.0 / self.refill_per_sec or 0.25))
