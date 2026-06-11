@@ -23,7 +23,7 @@ import streamlit as st
 
 from stockanalyzer import papertrade, swingwatch, virtualbook, watchlist
 from stockanalyzer.analysis.engine import CATEGORY_WEIGHTS, analyze_timeframe
-from stockanalyzer.explain.swing import build_swing_plan
+from stockanalyzer.explain.swing import _MIN_RR, build_swing_plan
 from stockanalyzer.analysis.signals import Direction
 from stockanalyzer.charting import candlestick_figure
 from stockanalyzer.data.realtime import RealtimeStream, summarize, ticks_to_candles
@@ -998,6 +998,34 @@ def _orders_guide(plan, usecase: UseCase, live_momentum: str | None = None,
     b.metric("You're risking", f"{plan.stop_pct:+.1f}%")
     c2.metric("Reward : Risk", f"{plan.rr:.1f} : 1")
     d.metric("Score", f"{plan.score}%", plan.score_label, delta_color="off")
+
+    # Non-GO plans get watch framing, never broker instructions — a forming
+    # breakout below the R:R gate dressed up as an order ticket is how the
+    # NOK $16.95 plan happened. OWN keeps its protective orders regardless.
+    if not getattr(plan, "actionable", True) and usecase != UseCase.OWN:
+        st.markdown("**👀 Watch plan — conditions not met yet, no orders to place**")
+        if plan.kind == "breakout_wait":
+            trig = plan.trigger or plan.entry
+            word = "above" if long_side else "below"
+            steps = [
+                f"1️⃣ **Set an alert** just {word} **${trig:.2f}** — the breakout trigger.",
+                f"2️⃣ **If a session *closes* {word} it**, re-run the analysis — the plan "
+                f"only becomes actionable if R:R clears {_MIN_RR:g}:1 at that point.",
+                "3️⃣ **No position before the close confirms** — arming orders here "
+                "front-runs an unconfirmed level.",
+            ]
+        else:
+            steps = [
+                f"1️⃣ **Set alerts** at **${plan.entry:.2f}** (entry zone) and "
+                f"**${plan.stop:.2f}** (invalidation).",
+                "2️⃣ **Re-check when one fires** — the failing gate is named in the "
+                "guidance line above.",
+            ]
+        for s in steps:
+            st.write(s)
+        st.caption("Levels are reference points, not broker instructions — the GO gate "
+                   "isn't met. · **not financial advice.**")
+        return
 
     st.markdown("**📋 Your orders — exactly what to place**")
     if plan.kind == "breakout_wait":

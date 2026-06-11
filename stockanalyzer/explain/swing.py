@@ -96,6 +96,7 @@ class SwingPlan:
     trigger: float | None = None    # breakout_wait: the wall a close must clear
     daily_atr_pct: float = 0.0      # daily volatility used for risk sizing
     atr_source: str = ""
+    actionable: bool = True         # False → show watch framing, not broker orders
 
 
 def _last(df, col: str, default: float | None = None) -> float | None:
@@ -116,10 +117,28 @@ def _rising(df, col: str, lookback: int = 10) -> bool:
 _DAILY_FRAMES = (Timeframe.M6, Timeframe.M1, Timeframe.YTD, Timeframe.Y1)
 
 
-def _daily_atr(all_reports, df, price: float) -> tuple[float, str]:
-    """(daily ATR as fraction of price, source label). Prefers the 6M frame
-    (126 daily bars — stable ATR(14)); falls back through other daily frames,
-    then the decision chart itself (intraday — flagged as such)."""
+def _daily_atr(all_reports, df, price: float) -> tuple[float, float, str]:
+    """(live ATR fraction, damped ATR fraction, source label).
+
+    Live = latest ATR(14) — sizes the STOP, where too-wide is the safe error.
+    Damped = min(live, median ATR/close over the last ~60 daily bars) — sizes
+    the TARGET budget: after a panic spike the live ATR runs 2-3× its norm
+    (NOK: 8.5%/day vs 3.3% median), inflating aims to moves the tape has never
+    actually delivered. Median-damping keeps the aim honest while the stop
+    stays wide enough to survive the elevated noise.
+
+    Prefers the 6M frame (126 daily bars — stable ATR(14)); falls back through
+    other daily frames, then the decision chart itself (intraday — flagged).
+    """
+    def _damped(rep_df, live: float) -> float:
+        try:
+            series = (rep_df["atr"] / rep_df["close"]).dropna().tail(60)
+            if len(series) >= 20:
+                return min(live, float(series.median()))
+        except Exception:
+            pass
+        return live
+
     if all_reports:
         for tf in _DAILY_FRAMES:
             rep = all_reports.get(tf)
@@ -128,11 +147,13 @@ def _daily_atr(all_reports, df, price: float) -> tuple[float, str]:
             atr = _last(rep.df, "atr")
             ref = rep.meta.get("last_close") or price
             if atr and ref:
-                return atr / ref, f"{tf.value} daily bars"
+                live = atr / ref
+                return live, _damped(rep.df, live), f"{tf.value} daily bars"
     atr = _last(df, "atr")
     if atr and price:
-        return atr / price, "decision chart (intraday — may understate)"
-    return 0.02, "default 2%"
+        live = atr / price
+        return live, _damped(df, live), "decision chart (intraday — may understate)"
+    return 0.02, 0.02, "default 2%"
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +163,8 @@ _LEVEL_FRAMES = (Timeframe.M1, Timeframe.M6, Timeframe.Y1, Timeframe.Y5)
 _LEVEL_CLUSTER_PCT = 0.006     # walls within 0.6% of each other merge into one
 
 
-def _merged_levels(report, all_reports, price: float) -> tuple[list[float], list[float]]:
+def _merged_levels(report, all_reports, price: float,
+                   noise_abs: float = 0.0) -> tuple[list[float], list[float]]:
     """(walls ascending, supports descending) merged across timeframes.
 
     The decision chart (e.g. 5D) only maps a few days of structure — after a
@@ -151,6 +173,11 @@ def _merged_levels(report, all_reports, price: float) -> tuple[list[float], list
     (the INTC $133-above-the-all-time-high failure). Frame highs/lows count as
     levels too: the all-time high IS resistance. Clusters keep the value
     nearest to price, so targets stay conservative.
+
+    `noise_abs` (≈ one daily ATR): a frame extreme INSIDE that band is just
+    where the trend currently trades, not resistance — counting it demoted
+    every healthy uptrend pullback to breakout_wait (the recent bar high is
+    always ~1% overhead). Mapped pivot levels stay regardless of distance.
     """
     walls = {lv.price for lv in report.levels if lv.price > price}
     supports = {lv.price for lv in report.levels if lv.price < price}
@@ -164,9 +191,9 @@ def _merged_levels(report, all_reports, price: float) -> tuple[list[float], list
             try:
                 hi = float(rep.df["high"].max())
                 lo = float(rep.df["low"].min())
-                if hi > price:
+                if hi > price + noise_abs:
                     walls.add(hi)
-                if lo < price:
+                if lo < price - noise_abs:
                     supports.add(lo)
             except Exception:
                 pass
@@ -196,9 +223,11 @@ class _Geometry:
     note: str                  # extra guidance fragment
 
 
-def _long_geometry(price, walls, supports, atr_abs, tuning: PaceTuning,
-                   countertrend: bool) -> _Geometry:
-    budget = atr_abs / price * math.sqrt(tuning.budget_days)     # fraction
+def _long_geometry(price, walls, supports, atr_abs, budget_atr_abs,
+                   tuning: PaceTuning, countertrend: bool) -> _Geometry:
+    # Target budget runs on the DAMPED ATR (panic spikes can't inflate the aim);
+    # stops run on the live ATR (must survive today's actual noise).
+    budget = budget_atr_abs / price * math.sqrt(tuning.budget_days)  # fraction
     cap = min(tuning.target_cap, budget)
     buffer = max(0.001 * price, 0.02 * atr_abs)
     s1 = supports[0] if supports else None
@@ -234,8 +263,16 @@ def _long_geometry(price, walls, supports, atr_abs, tuning: PaceTuning,
         trigger_wall = walls[i]
         entry = trigger_wall + buffer
         nxt = walls[i + 1] if i + 1 < len(walls) else None
-        target = (min(nxt * 0.995, entry * (1 + cap)) if nxt is not None
-                  else entry * (1 + cap))
+        if nxt is not None:
+            # Ladder sanity: if the next wall sits beyond the vol budget, a
+            # budget-capped target would float mid-air in the gap — a zone the
+            # level mapper has no structure for but recent buyers fill with
+            # supply (the NOK 15.19→17.04 trap). Skip the rung.
+            if nxt * 0.995 / entry - 1 > cap:
+                continue
+            target = nxt * 0.995
+        else:
+            target = entry * (1 + cap)
         room = target / entry - 1
         if room >= _BREAKOUT_ROOM_FACTOR * tuning.min_move:
             stop = min(trigger_wall * 0.998, entry - tuning.stop_atr_mult * atr_abs)
@@ -244,12 +281,12 @@ def _long_geometry(price, walls, supports, atr_abs, tuning: PaceTuning,
                              f"wait for a close above ${trigger_wall:.2f}")
     return _Geometry("no_trade", price, _stop_for(price, s1),
                      max(r1 * 0.995, price), None,
-                     "walls are stacked too close — chop zone")
+                     "no breakout leg fits the volatility budget — chop zone")
 
 
-def _short_geometry(price, walls, supports, atr_abs, tuning: PaceTuning,
-                    countertrend: bool) -> _Geometry:
-    budget = atr_abs / price * math.sqrt(tuning.budget_days)
+def _short_geometry(price, walls, supports, atr_abs, budget_atr_abs,
+                    tuning: PaceTuning, countertrend: bool) -> _Geometry:
+    budget = budget_atr_abs / price * math.sqrt(tuning.budget_days)
     cap = min(tuning.target_cap, budget)
     buffer = max(0.001 * price, 0.02 * atr_abs)
     r1 = walls[0] if walls else None                     # resistance above (stop side)
@@ -281,8 +318,12 @@ def _short_geometry(price, walls, supports, atr_abs, tuning: PaceTuning,
         trigger_wall = supports[i]
         entry = trigger_wall - buffer
         nxt = supports[i + 1] if i + 1 < len(supports) else None
-        target = (max(nxt * 1.005, entry * (1 - cap)) if nxt is not None
-                  else entry * (1 - cap))
+        if nxt is not None:
+            if 1 - nxt * 1.005 / entry > cap:    # next floor beyond the vol budget
+                continue
+            target = nxt * 1.005
+        else:
+            target = entry * (1 - cap)
         room = 1 - target / entry
         if room >= _BREAKOUT_ROOM_FACTOR * tuning.min_move:
             stop = max(trigger_wall * 1.002, entry + tuning.stop_atr_mult * atr_abs)
@@ -290,7 +331,44 @@ def _short_geometry(price, walls, supports, atr_abs, tuning: PaceTuning,
                              f"wait for a close below ${trigger_wall:.2f}")
     return _Geometry("no_trade", price, _stop_for(price, r1),
                      min(s1 * 1.005, price), None,
-                     "floors are stacked too close — chop zone")
+                     "no breakdown leg fits the volatility budget — chop zone")
+
+
+# --------------------------------------------------------------------------- #
+# Crash-rebound regime — the NOK trap.
+# --------------------------------------------------------------------------- #
+_CRASH_DD = 0.15        # ≥15% off the 1-month extreme = crash/spike regime
+_CRASH_RETRACE = 0.5    # an aim recovering ≥50% of that move counts as "large"
+
+
+def _crash_regime(all_reports, price, entry, target, bull) -> tuple[bool, bool, float, float | None]:
+    """(in_regime, large_aim, drawdown_frac, 1-month extreme).
+
+    Backtest on NOK 1Y daily: when price sat ≥15% below its 1-month high, a
+    +11.5% recovery within 10 days hit 0 of 34 times — V-shaped snapbacks to
+    the crash-origin high basically don't happen on this horizon. Small
+    first-wall bounces stay legitimate (that's the cluster the backtest
+    actually liked); only LARGE aims — retracing most of the crash — get
+    flagged. Mirrored for shorts fading a fresh spike.
+    """
+    rep = None
+    if all_reports:
+        rep = all_reports.get(Timeframe.M1) or all_reports.get(Timeframe.M6)
+    if rep is None or not len(rep.df):
+        return False, False, 0.0, None
+    month = rep.df.tail(22)                       # ~1 month of daily bars
+    try:
+        if bull:
+            ref = float(month["high"].max())
+            dd = 1 - price / ref if ref else 0.0
+            large = ref > entry and (target - entry) >= _CRASH_RETRACE * (ref - entry)
+        else:
+            ref = float(month["low"].min())
+            dd = price / ref - 1 if ref else 0.0
+            large = ref < entry and (entry - target) >= _CRASH_RETRACE * (entry - ref)
+    except Exception:
+        return False, False, 0.0, None
+    return dd >= _CRASH_DD, large, dd, ref
 
 
 # --------------------------------------------------------------------------- #
@@ -311,7 +389,8 @@ _BIAS_FRAMES = (Timeframe.D1, Timeframe.D5, Timeframe.M1)
 def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
                  countertrend: bool, rr: float, geom: _Geometry, walls, supports,
                  fast: bool, df, all_reports, daily_atr_pct: float,
-                 context: dict) -> tuple[int, str, list[SwingCheck]]:
+                 context: dict, crash_info=(False, False, 0.0, None),
+                 ) -> tuple[int, str, list[SwingCheck]]:
     bull = bias == Direction.BULL
     side = "above" if bull else "below"
     checks: list[SwingCheck] = []
@@ -331,6 +410,25 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
                              ("clear air" if not between else
                               ", ".join(f"${w:.2f}" for w in between[:3]) + " in the way"),
                              8))
+
+    # Crash-rebound regime: ≥15% below the 1-month high + a target that retraces
+    # most of the crash = the V-shaped-snapback bet that historically never fills
+    # on this horizon. Small first-wall bounces pass; large aims fail hard.
+    in_crash, large_aim, dd, ref = crash_info
+    if ref is not None:
+        ok = not (in_crash and large_aim)
+        name = ("Not betting on a crash snapback" if bull
+                else "Not fading a fresh vertical spike")
+        if in_crash and large_aim:
+            detail = (f"price {dd*100:.0f}% off the 1-month {'high' if bull else 'low'} "
+                      f"${ref:.2f} and the target retraces most of it — these recoveries "
+                      "historically don't land inside a swing horizon")
+        elif in_crash:
+            detail = (f"{dd*100:.0f}% off the 1-month {'high' if bull else 'low'}, but the "
+                      "aim is a modest first-wall move — scalp tier, allowed")
+        else:
+            detail = "no fresh crash/spike in the last month"
+        checks.append(SwingCheck(name, ok, detail, 10))
 
     # Rebound value — the backtest's winning cluster: entries taken low, not chased.
     rsi_now = _last(df, "rsi")
@@ -537,15 +635,17 @@ def build_swing_plan(report: TimeframeReport, usecase: UseCase,
     context = dict(context or {})
     context.setdefault("earnings_guard_days", tuning.earnings_guard_days)
 
-    atr_frac, atr_src = _daily_atr(all_reports, df, price)
+    atr_frac, budget_frac, atr_src = _daily_atr(all_reports, df, price)
     atr_abs = atr_frac * price
+    budget_abs = budget_frac * price
 
     if usecase == UseCase.SELL:
         return _build_side(report, price, df, names, fast, tuning, all_reports,
-                           context, atr_abs, atr_frac, atr_src, short=True, own=False)
+                           context, atr_abs, budget_abs, atr_frac, atr_src,
+                           short=True, own=False)
     return _build_side(report, price, df, names, fast, tuning, all_reports,
-                       context, atr_abs, atr_frac, atr_src, short=False,
-                       own=(usecase == UseCase.OWN))
+                       context, atr_abs, budget_abs, atr_frac, atr_src,
+                       short=False, own=(usecase == UseCase.OWN))
 
 
 def _ind_frame(all_reports, df):
@@ -616,9 +716,10 @@ def _detect_short_setup(report, price, df, names, atr_abs, ind_df=None) -> str |
 
 
 def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
-                context, atr_abs, atr_frac, atr_src, short: bool, own: bool) -> SwingPlan:
+                context, atr_abs, budget_atr_abs, atr_frac, atr_src,
+                short: bool, own: bool) -> SwingPlan:
     bias = Direction.BEAR if short else Direction.BULL
-    walls, supports = _merged_levels(report, all_reports, price)
+    walls, supports = _merged_levels(report, all_reports, price, noise_abs=atr_abs)
 
     ind_df = _ind_frame(all_reports, df)
     setup = (_detect_short_setup(report, price, df, names, atr_abs, ind_df) if short
@@ -630,8 +731,10 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
                         and sma200 is not None and price < sma200)
     setup_present = setup is not None and not strong_downtrend
 
-    geom = (_short_geometry(price, walls, supports, atr_abs, tuning, countertrend) if short
-            else _long_geometry(price, walls, supports, atr_abs, tuning, countertrend))
+    geom = (_short_geometry(price, walls, supports, atr_abs, budget_atr_abs,
+                            tuning, countertrend) if short
+            else _long_geometry(price, walls, supports, atr_abs, budget_atr_abs,
+                                tuning, countertrend))
 
     entry, stop, target1 = geom.entry, geom.stop, geom.target
     risk = abs(entry - stop)
@@ -639,12 +742,16 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
     rr = reward / risk if risk > 0 else 0.0
     aim = reward / entry  # fraction
 
+    crash_info = _crash_regime(all_reports, price, entry, target1, bull=not short)
+    crash_block = crash_info[0] and crash_info[1]
+
     score, score_label, checks = _swing_score(
         bias, setup, setup_present, countertrend, rr, geom, walls, supports,
-        fast, df, all_reports, atr_frac, context)
+        fast, df, all_reports, atr_frac, context, crash_info)
 
     # GO gating: only an immediate plan, with-trend tier (or sanctioned scalp),
-    # honest R:R, a worthwhile aim, and no earnings landmine inside the horizon.
+    # honest R:R, a worthwhile aim, no earnings landmine inside the horizon,
+    # and not a large-aim bet on a V-shaped crash recovery.
     inv_pct = context.get("investor_pct")
     tier_ok = (not countertrend) or (inv_pct is None or inv_pct >= 45) or \
               (tuning.budget_days <= 3)     # fast pace may scalp first-wall bounces
@@ -652,7 +759,7 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
     earnings_block = edays is not None and edays <= tuning.earnings_guard_days
     go = (geom.kind == "immediate" and setup_present and tier_ok
           and rr >= _MIN_RR and aim >= tuning.min_move
-          and not strong_downtrend and not earnings_block)
+          and not strong_downtrend and not earnings_block and not crash_block)
     light = "go" if go else ("forming" if (setup_present or geom.kind == "breakout_wait")
                              else "no")
 
@@ -678,6 +785,10 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
         guidance = f"Earnings in {edays} days — inside the {tuning.horizon} horizon; stand aside."
     elif not setup_present:
         guidance = "No valid setup — wait for a pullback, an oversold bounce, or a breakout to line up."
+    elif crash_block:
+        guidance = (f"Crash-rebound regime — price is {crash_info[2]*100:.0f}% off its 1-month "
+                    f"{'high' if not short else 'low'} and the aim retraces most of that move; "
+                    "snapbacks this fast historically don't fill. Wait for the tape to settle.")
     elif rr < _MIN_RR:
         guidance = (f"Setup present but honest R:R is only {rr:.1f}:1 (need ≥{_MIN_RR:g}) — "
                     f"wait for a better entry or more room.")
@@ -700,6 +811,11 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
         reasons.append("⚠️ R:R above 4:1 on a countertrend setup is usually a math artifact — "
                        "treat with suspicion.")
     reasons.append(f"Daily volatility ~{atr_frac*100:.1f}%/day (from {atr_src}) sizes the stop.")
+    budget_frac = budget_atr_abs / price if price else atr_frac
+    if budget_frac < atr_frac * 0.9:
+        reasons.append(f"⚖️ Target budget uses the calmer 60-day median ATR "
+                       f"(~{budget_frac*100:.1f}%/day) — the recent volatility spike "
+                       "doesn't inflate the aim.")
     reasons.append(f"Entry ${entry:.2f} · Stop ${stop:.2f} ({(stop/entry-1)*100:+.1f}%) · "
                    f"Target ${target1:.2f} ({(target1/entry-1)*100:+.1f}%) · R:R {rr:.1f}:1.")
     if own:
@@ -713,6 +829,12 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
         beyond = [w for w in walls if w > target1 * 1.005]
         target2 = beyond[0] if beyond else None
 
+    # Broker-instruction worthiness: a GO plan, or a trigger-confirmed breakout
+    # leg that already clears the R:R gate. Everything else renders as a watch
+    # plan (alerts, not orders).
+    actionable = go or (geom.kind == "breakout_wait" and rr >= _MIN_RR
+                        and not crash_block and not earnings_block)
+
     return SwingPlan(
         setup=setup or "No setup", bias=bias, entry=round(entry, 2),
         entry_note=geom.note,
@@ -725,6 +847,7 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
         score=score, score_label=score_label, checks=checks,
         kind=geom.kind, guidance=guidance, trigger=geom.trigger,
         daily_atr_pct=round(atr_frac * 100, 1), atr_source=atr_src,
+        actionable=actionable,
     )
 
 
