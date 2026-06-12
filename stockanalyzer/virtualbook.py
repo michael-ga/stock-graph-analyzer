@@ -37,12 +37,23 @@ STAKE_USD = 1000.0
 _PATH = Path(__file__).resolve().parent.parent / ".virtualbook.json"
 
 
+def _db(path: Path) -> Path:
+    """Resolve a caller-supplied book path to its SQLite DB.
+
+    The default path maps to the global ``trades.db``; any other path (tests)
+    gets its own isolated DB file alongside it."""
+    if path == _PATH:
+        return DB_PATH
+    path = Path(path)
+    return path if path.suffix == ".db" else path.with_suffix(".db")
+
+
 def load(path: Path = _PATH) -> list[dict]:
-    return load_trades()
+    return load_trades(_db(path))
 
 
 def has_open(ticker: str, trader: str, path: Path = _PATH) -> bool:
-    return has_open_trade(ticker.upper(), trader)
+    return has_open_trade(ticker.upper(), trader, db_path=_db(path))
 
 
 def open_position(*, ticker: str, trader: str, entry: float, stop: float,
@@ -73,13 +84,13 @@ def open_position(*, ticker: str, trader: str, entry: float, stop: float,
         exit_price=None, close_reason=None, closed=None,
         pnl_pct=0.0, pnl_usd=0.0,
     )
-    insert_trade(trade, context=snapshot)
+    insert_trade(trade, context=snapshot, db_path=_db(path))
     return trade
 
 
 def close_position(pid: str, exit_price: float, reason: str = "manual",
                    now: float | None = None, path: Path = _PATH) -> dict | None:
-    return close_trade(pid, exit_price, reason, now)
+    return close_trade(pid, exit_price, reason, now, db_path=_db(path))
 
 
 def mark(ticker: str, price: float, now: float | None = None,
@@ -87,7 +98,7 @@ def mark(ticker: str, price: float, now: float | None = None,
     """Mark a ticker's positions to ``price``: activate pending breakout orders,
     auto-close stop/target hits (stop wins on ambiguity), expire stale trades.
     Returns the positions whose status changed (for toasts)."""
-    return mark_trades(ticker, price, now)
+    return mark_trades(ticker, price, now, db_path=_db(path))
 
 
 def stats(positions: list[dict] | None = None) -> dict:

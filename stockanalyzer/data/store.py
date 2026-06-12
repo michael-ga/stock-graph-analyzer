@@ -10,11 +10,16 @@ The API is intentionally functional (module-level functions with a default
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent.parent.parent / "trades.db"
+# Default DB lives at the project root; STOCKANALYZER_DB (read at import time)
+# lets deployments and tests point the whole store elsewhere.
+_DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "trades.db"
+DB_PATH = (Path(os.environ["STOCKANALYZER_DB"])
+           if os.environ.get("STOCKANALYZER_DB") else _DEFAULT_DB_PATH)
 SCHEMA_VERSION = 2
 
 _connections: dict[str, sqlite3.Connection] = {}
@@ -522,7 +527,7 @@ def _band(score) -> str:
         s = float(score)
     except (TypeError, ValueError):
         return "?"
-    return "80+" if s >= 80 else "70-79" if s >= 70 else "60-69" if s >= 60 else "<60"
+    return "80+" if s >= 80 else "70–79" if s >= 70 else "60–69" if s >= 60 else "<60"
 
 
 def trade_stats(db_path: Path = DB_PATH) -> dict:

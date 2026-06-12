@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from .data.store import (
+    DB_PATH,
     insert_paper_trade,
     load_paper_trades,
     update_paper_status,
@@ -25,12 +26,19 @@ _PATH = Path(__file__).resolve().parent.parent / ".papertrade.json"
 _FINAL = {"target_hit", "stop_hit", "expired", "not_triggered"}
 
 
+def _db(path: Path) -> Path:
+    """Resolve a caller-supplied journal path to its SQLite DB.
+
+    The default path maps to the global ``trades.db``; any other path (tests)
+    gets its own isolated DB file alongside it."""
+    if path == _PATH:
+        return DB_PATH
+    path = Path(path)
+    return path if path.suffix == ".db" else path.with_suffix(".db")
+
+
 def load(path: Path = _PATH) -> list[dict]:
-    return load_paper_trades()
-
-
-def _write(path: Path, records: list[dict]) -> None:
-    pass
+    return load_paper_trades(_db(path))
 
 
 def recent_duplicate(records: list[dict], ticker: str, level: int,
@@ -43,7 +51,7 @@ def recent_duplicate(records: list[dict], ticker: str, level: int,
 
 def record(rec: dict, path: Path = _PATH) -> bool:
     """Append a proposition unless it's a fresh duplicate. Returns True if stored."""
-    return insert_paper_trade(rec)
+    return insert_paper_trade(rec, db_path=_db(path))
 
 
 # ── outcome judging (pure) ────────────────────────────────────────────────── #
@@ -105,7 +113,7 @@ def _bars_after(df, alert_ts: float) -> list[tuple[float, float, float]]:
 
 def evaluate_all(frames_by_ticker: dict, path: Path = _PATH) -> list[dict]:
     """Re-judge every non-final record using fresh daily frames. Saves + returns."""
-    records = load_paper_trades()
+    records = load_paper_trades(_db(path))
     for r in records:
         if r.get("status") in _FINAL:
             continue
@@ -120,7 +128,7 @@ def evaluate_all(frames_by_ticker: dict, path: Path = _PATH) -> list[dict]:
             r["status"], r["result_pct"] = status, result
             rid = r.get("id")
             if rid is not None:
-                update_paper_status(rid, status, result)
+                update_paper_status(rid, status, result, db_path=_db(path))
     return records
 
 
