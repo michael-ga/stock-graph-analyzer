@@ -303,3 +303,102 @@ def test_countertrend_scores_below_withtrend_same_geometry():
                                all_reports=reports, context={"investor_pct": 62})
     assert counter.setup == "Trend-change reversal (early)"
     assert counter.score <= with_trend.score
+
+
+# --------------------------------------------------------------------------- #
+# AAL replica — actionability failure. Price $14.74 after a +9% news day; the
+# nearest rung ($14.95) has no room so geometry correctly waits on $15.33 — but
+# that trigger is a full day's range (+4%) overhead, with the untested $14.95
+# wall in between. The plan must render as a WATCH (alerts), never "arm a
+# stop-limit BUY now": an order parked there fills only after a +4% momentum
+# rip, front-running the close-confirmation the guidance itself demands.
+# --------------------------------------------------------------------------- #
+def _aal_reports(price: float = 14.74):
+    dec = _report(
+        _ind(_frame(price, 4.4, drift_pct=9.0), atr_pct=4.4, rsi=64,
+             macd=0.4, macd_signal=0.2, sma50=price * 0.93, sma200=price * 0.88),
+        levels=[_lv(14.95, "resistance"), _lv(15.33, "resistance"),
+                _lv(16.31, "resistance"), _lv(14.66, "support"),
+                _lv(13.98, "support")],
+        bias=0.35, trend_dir=Direction.BULL,
+        signals=[Signal("volume_spike", Direction.BULL, 0.7, "volume 3x average", "volume"),
+                 Signal("premarket_gap_up", Direction.BULL, 0.6, "gap +9%", "gap")],
+    )
+    daily = _report(_ind(_frame(price, 4.4, drift_pct=20.0), atr_pct=4.4,
+                         sma20=price * 0.95), bias=0.3, trend_dir=Direction.BULL)
+    return dec, {Timeframe.D5: dec, Timeframe.M1: daily, Timeframe.M6: daily,
+                 Timeframe.Y1: daily}
+
+
+def test_aal_replica_far_trigger_is_watch_not_order():
+    dec, reports = _aal_reports()
+    plan = build_swing_plan(dec, UseCase.BUY, SwingPace.FAST, all_reports=reports,
+                            context={"investor_pct": 63})
+    assert plan.kind == "breakout_wait"
+    assert plan.trigger == 15.33
+    # Trigger is +4.0% overhead (band: max(1.5%, 0.6×4.4%) = 2.6%) → watch only.
+    assert plan.actionable is False, \
+        f"far trigger must not arm orders (guidance: {plan.guidance})"
+    assert "alert" in plan.guidance.lower()
+
+
+def test_aal_replica_coiled_at_wall_can_arm():
+    # Same structure with price consolidating just under the wall (+0.5% away):
+    # an armed stop order now genuinely catches the break instead of chasing it.
+    dec, reports = _aal_reports(price=15.25)
+    plan = build_swing_plan(dec, UseCase.BUY, SwingPace.FAST, all_reports=reports,
+                            context={"investor_pct": 63})
+    assert plan.kind == "breakout_wait"
+    assert plan.trigger == 15.33
+    if plan.rr >= 1.5:                       # R:R gate still applies independently
+        assert plan.actionable is True, \
+            f"coiled-at-wall breakout should arm (guidance: {plan.guidance})"
+
+
+# --------------------------------------------------------------------------- #
+# NOK replica #2 — far-ladder failure. Price $14.58 rebounding after the crash
+# from the $17.45 spike high; nearest wall $14.82 has no room, and the next
+# rungs ($17.04 / $17.45) sit a +17-20% climb away. The old ladder scan only
+# validated each LEG and happily framed the whole plan around a trigger the
+# volatility budget (~8% over the horizon) can never reach — "wait for a close
+# above $17.45" is not a 1-3 day swing plan. Honest answer: no_trade, with the
+# near walls as watch levels.
+# --------------------------------------------------------------------------- #
+def _nok_far_ladder_reports():
+    price = 14.58
+    dec = _report(
+        _ind(_frame(price, 4.7), atr_pct=4.7, rsi=55, macd=0.1, macd_signal=0.0,
+             sma50=price * 0.92, sma200=price * 0.75),
+        levels=[_lv(14.82, "resistance"), _lv(17.04, "resistance"),
+                _lv(17.45, "resistance"), _lv(14.50, "support"),
+                _lv(13.91, "support")],
+        bias=0.25, trend_dir=Direction.BULL,
+        signals=[Signal("volume_spike", Direction.BULL, 0.6, "volume 2x average", "volume")],
+    )
+    daily = _report(_ind(_frame(price, 4.7), atr_pct=4.7, sma20=price * 0.97),
+                    bias=0.2, trend_dir=Direction.BULL)
+    return dec, {Timeframe.D5: dec, Timeframe.M1: daily, Timeframe.M6: daily,
+                 Timeframe.Y1: daily}
+
+
+def test_nok_far_ladder_is_no_trade_not_skyhook_breakout():
+    dec, reports = _nok_far_ladder_reports()
+    plan = build_swing_plan(dec, UseCase.BUY, SwingPace.FAST, all_reports=reports,
+                            context={"investor_pct": 60})
+    assert plan.kind == "no_trade", \
+        f"unreachable rungs must collapse to no_trade (got {plan.kind}: {plan.guidance})"
+    assert plan.trigger is None
+    assert plan.actionable is False
+    assert "beyond" in plan.guidance.lower()         # names the reachability gate
+    assert "14.82" in plan.guidance                  # near wall offered as the watch level
+    # Target never framed around the unreachable ceiling.
+    assert plan.target1 < 15.0
+
+
+def test_reachable_rung_still_produces_breakout_wait():
+    # AAL-shaped control: rungs within the vol budget keep the breakout framing.
+    dec, reports = _aal_reports()
+    plan = build_swing_plan(dec, UseCase.BUY, SwingPace.FAST, all_reports=reports,
+                            context={"investor_pct": 63})
+    assert plan.kind == "breakout_wait"
+    assert plan.trigger == 15.33
