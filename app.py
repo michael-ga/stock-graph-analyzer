@@ -103,12 +103,31 @@ def main() -> None:
     ss = st.session_state
     ss.setdefault("ticker", "MSFT")
     ss.setdefault("submitted", False)
+    ss.setdefault("page", "analyze")
 
-    st.title("📈 Stock Graph Analyzer")
-    st.caption("Plain-English technical analysis (rules from John Murphy's *Technical "
-               "Analysis of the Financial Markets*). Rule-based, no AI. **Not financial advice.**")
+    head_l, head_r = st.columns([4.2, 1])
+    with head_l:
+        st.title("📈 Stock Graph Analyzer")
+        st.caption("Plain-English technical analysis (rules from John Murphy's *Technical "
+                   "Analysis of the Financial Markets*). Rule-based, no AI. **Not financial advice.**")
+    with head_r:
+        # Mode switcher (top-right) — more modes will live here later.
+        if ss.page == "movers":
+            if st.button("📊 Analyzer", use_container_width=True,
+                         help="Back to the full analyzer"):
+                ss.page = "analyze"
+                st.rerun()
+        else:
+            if st.button("🔥 Top movers", use_container_width=True,
+                         help="Today's 10 most-active stocks — suggested swing candidates"):
+                ss.page = "movers"
+                st.rerun()
 
     mode, prefer, usecase, strategy, pace, uploaded, live_on, buy_price = _sidebar()
+
+    if ss.page == "movers":
+        _movers_page()
+        return
 
     flash = ss.pop("vb_flash", None)
     if flash:
@@ -458,12 +477,18 @@ def _quiet_sentiment(ticker: str) -> float | None:
         return None
 
 
-def _radar_plan(res, sentiment: float | None = None):
+def _radar_decision_rep(res):
+    """The frame the fast-pace radar plan is built on (shortest available)."""
     for tf in (Timeframe.D5, Timeframe.D1, Timeframe.M1):
         rep = res.reports.get(tf)
         if rep is not None:
-            break
-    else:
+            return rep
+    return None
+
+
+def _radar_plan(res, sentiment: float | None = None):
+    rep = _radar_decision_rep(res)
+    if rep is None:
         return None
     inv = round((build_verdict(res.reports, sentiment).score + 1) / 2 * 100)
     return build_swing_plan(rep, UseCase.BUY, SwingPace.FAST,
@@ -471,29 +496,71 @@ def _radar_plan(res, sentiment: float | None = None):
                             context={"investor_pct": inv, "sentiment": sentiment})
 
 
-def _radar_card(tk: str, plan) -> None:
+def _plan_brief(plan) -> tuple[str, str, str]:
+    """(color, state label, instruction) — the one-line read of a swing plan.
+
+    Four-state ladder, weakest → strongest:
+    ⚪ NO SETUP → 🟡 BUILDUP (setup forming, no trigger yet) →
+    👀 WATCH CLOSE (buildup seen — confirm with a close past the trigger) → 🟢 GO.
+    """
     if plan.go:
-        color, head = "#1b9e3e", "🟢 GO"
-        instr = (f"Entry ${plan.entry:.2f} · stop ${plan.stop:.2f} · "
-                 f"tgt ${plan.target1:.2f} · R:R {plan.rr:.1f}:1")
-    elif plan.kind == "breakout_wait":
-        color, head = "#f9a825", "⏳ WAIT"
-        instr = f"Close above ${plan.trigger:.2f} → tgt ${plan.target1:.2f}"
-    elif plan.light == "forming":
-        color, head = "#f9a825", "🟡 FORMING"
-        instr = plan.setup
-    else:
-        color, head = "#546e7a", "⚪ NO SWING"
-        instr = "no clean setup right now"
+        return ("#1b9e3e", "🟢 GO",
+                f"Enter ${plan.entry:.2f} · stop ${plan.stop:.2f} · "
+                f"tgt ${plan.target1:.2f} · R:R {plan.rr:.1f}:1")
+    if plan.kind == "breakout_wait":
+        return ("#fb8c00", "👀 WATCH CLOSE",
+                f"Buildup seen — needs a close above ${plan.trigger:.2f} "
+                f"→ tgt ${plan.target1:.2f}")
+    if plan.light == "forming":
+        return ("#f9a825", "🟡 BUILDUP", f"{plan.setup} — forming, no trigger yet")
+    return ("#546e7a", "⚪ NO SETUP", "no clean setup right now")
+
+
+def _radar_card(tk: str, plan, res=None) -> None:
+    """One glance = one decision: ticker + live price/change on top, the state
+    pill + score next, then trend / signal-ratio / volatility, then the action."""
+    color, state, instr = _plan_brief(plan)
     bells = "🔔" * sum(1 for lv in swingwatch.LEVELS if plan.score >= lv)
+
+    px_html = ""
+    info_bits: list[str] = []
+    if res is not None:
+        q = res.quote
+        if q is not None:
+            up = q.change_pct >= 0
+            c, arrow = ("#1b9e3e", "▲") if up else ("#e53935", "▼")
+            px_html = (f"<span style='font-weight:700'>${q.price:,.2f}</span> "
+                       f"<span style='color:{c};font-size:0.85em;font-weight:600'>"
+                       f"{arrow}{q.change_pct:+.1f}%</span>")
+        dec = _radar_decision_rep(res)
+        m1 = res.reports.get(Timeframe.M1)
+        trend_bits = []
+        if dec is not None:
+            trend_bits.append(f"5D{_DIR_EMOJI[dec.trend.direction]}")
+        if m1 is not None and m1 is not dec:
+            trend_bits.append(f"1M{_DIR_EMOJI[m1.trend.direction]}")
+        if trend_bits:
+            info_bits.append("trend " + " ".join(trend_bits))
+        if dec is not None:
+            bull = sum(1 for s in dec.signals
+                       if s.name != "trend" and s.direction == Direction.BULL)
+            bear = sum(1 for s in dec.signals
+                       if s.name != "trend" and s.direction == Direction.BEAR)
+            info_bits.append(f"signals 🟢{bull}·🔴{bear}")
+    info_bits.append(f"vol {plan.daily_atr_pct:.1f}%/d")
+
     st.markdown(
         f"<div style='background:{color}26;border:1px solid {color};border-radius:10px;"
         f"padding:8px 10px;margin:2px 0'>"
         f"<div style='display:flex;justify-content:space-between;align-items:baseline'>"
-        f"<b style='font-size:1.1em'>{tk}</b>"
+        f"<b style='font-size:1.15em'>{tk}</b><span>{px_html}</span></div>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center;"
+        f"margin:3px 0'>"
+        f"<span style='background:{color};color:#fff;border-radius:5px;padding:1px 8px;"
+        f"font-weight:700;font-size:0.82em;white-space:nowrap'>{state}</span>"
         f"<span style='color:{color};font-weight:700'>{plan.score}% {bells}</span></div>"
-        f"<div style='font-size:0.85em;font-weight:600'>{head} · {plan.score_label}</div>"
-        f"<div style='font-size:0.8em;color:#bbb'>{instr}</div></div>",
+        f"<div style='font-size:0.78em;color:#8a93a0'>{' · '.join(info_bits)}</div>"
+        f"<div style='font-size:0.8em;margin-top:2px'>{instr}</div></div>",
         unsafe_allow_html=True)
     if st.button(f"🔎 Open {tk}", key=f"radar_open_{tk}", use_container_width=True):
         st.session_state.ticker = tk
@@ -506,16 +573,28 @@ def _radar_panel(tracked: list[str]) -> None:
     def _radar():
         ss = st.session_state
         ss.setdefault("radar_levels", {})
-        st.markdown("#### 📡 Swing radar — quiet daily-swing watch")
+        head_l, head_r = st.columns([3, 1])
+        head_l.markdown("#### 📡 Swing radar — fast 1–3 day swings")
+        sort_pct = head_r.toggle("Sort by %", value=True, key="radar_sort",
+                                 help="Highest swing score first. Off = the order "
+                                      "you added them.")
+
+        items: list[tuple[str, object, object]] = []
+        for tk in tracked:
+            try:
+                res = _run_quiet(tk)
+                plan = (_radar_plan(res, _quiet_sentiment(tk))
+                        if res.reports else None)
+            except Exception:
+                res, plan = None, None
+            items.append((tk, res, plan))
+        if sort_pct:
+            items.sort(key=lambda it: it[2].score if it[2] is not None else -1,
+                       reverse=True)
+
         cols = st.columns(min(4, max(1, len(tracked))))
-        for i, tk in enumerate(tracked):
+        for i, (tk, res, plan) in enumerate(items):
             with cols[i % len(cols)]:
-                try:
-                    res = _run_quiet(tk)
-                    plan = (_radar_plan(res, _quiet_sentiment(tk))
-                            if res.reports else None)
-                except Exception:
-                    plan = None
                 if plan is None:
                     st.caption(f"{tk}: no data")
                     continue
@@ -543,14 +622,171 @@ def _radar_panel(tracked: list[str]) -> None:
                         else:
                             st.toast(f"💼 {chg['trader']}'s breakout order filled in {tk}",
                                      icon="🚀")
-                _radar_card(tk, plan)
-        st.caption("Scans every ~2½ min (cached, rate-safe) · fast 1–3 day pace · "
-                   "🔔 = score reached 60 / 70 / 80% · each new level is toasted **and "
-                   "recorded as a paper-trade proposition** below.")
+                _radar_card(tk, plan, res)
+        st.caption("States, weakest → strongest: ⚪ NO SETUP → 🟡 BUILDUP (setup forming) "
+                   "→ 👀 WATCH CLOSE (buildup seen — wait for a close past the trigger) "
+                   "→ 🟢 GO (enter per the plan) · scans every ~2½ min, fast 1–3 day pace · "
+                   "🔔 = score reached 60 / 70 / 80%, toasted **and recorded as a "
+                   "paper-trade proposition** below.")
 
     _radar()
     _journal_panel()
     st.divider()
+
+
+# --------------------------------------------------------------------------- #
+# Top movers — suggested tickers from the most-active screener.
+# --------------------------------------------------------------------------- #
+@st.cache_data(show_spinner=False, ttl=300)
+def _fetch_movers(count: int = 10):
+    from stockanalyzer.data.movers import most_active
+    return most_active(count)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _movers_trends(symbols: tuple[str, ...]) -> dict[str, str]:
+    """1M structural trend per ticker (light fetch, threaded across tickers)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def job(tk: str) -> tuple[str, str]:
+        try:
+            res = analyze_ticker(tk, timeframes=[Timeframe.M1],
+                                 include_fundamentals=False)
+            rep = res.reports.get(Timeframe.M1)
+            return tk, (_badge(rep.trend.direction) if rep is not None else "—")
+        except Exception:
+            return tk, "—"
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        return dict(pool.map(job, symbols))
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _movers_plans(symbols: tuple[str, ...]) -> dict:
+    """Fast-pace swing plan per ticker — the radar's read, run on demand."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def job(tk: str):
+        try:
+            res = analyze_ticker(tk, include_fundamentals=False)
+            return tk, (_radar_plan(res) if res.reports else None)
+        except Exception:
+            return tk, None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return dict(pool.map(job, symbols))
+
+
+def _fmt_volume(v: int | None) -> str:
+    if not v:
+        return "—"
+    if v >= 1e9:
+        return f"{v / 1e9:.1f}B"
+    if v >= 1e6:
+        return f"{v / 1e6:.0f}M"
+    if v >= 1e3:
+        return f"{v / 1e3:.0f}K"
+    return str(v)
+
+
+def _movers_page() -> None:
+    ss = st.session_state
+    st.markdown("### 🔥 Most active today — suggested tickers")
+    st.caption("The 10 highest-volume US stocks right now (Yahoo screener). Heavy volume "
+               "is where swings happen — add candidates to the **📡 swing radar**, or run "
+               "the radar here for an immediate swing read on all of them. "
+               "List refreshes every ~5 min.")
+
+    movers = _fetch_movers()
+    if not movers:
+        st.error("Couldn't fetch the most-active list right now — the screener may be "
+                 "briefly unavailable. Try again in a minute.")
+        if st.button("↻ Retry"):
+            _fetch_movers.clear()
+            st.rerun()
+        return
+
+    b1, b2 = st.columns([1.6, 1])
+    if b1.button("⚡ Run radar — quick swing read on all 10", type="primary",
+                 use_container_width=True,
+                 help="Runs the swing-radar scan (fast 1–3 day pace) on every "
+                      "suggested ticker and shows the immediate suggestion."):
+        ss.movers_scan = True
+    if b2.button("↻ Refresh list", use_container_width=True):
+        _fetch_movers.clear()
+        _movers_trends.clear()
+        _movers_plans.clear()
+        ss.movers_scan = False
+        st.rerun()
+
+    with st.spinner("Reading 1-month trends…"):
+        trends = _movers_trends(tuple(m.symbol for m in movers))
+
+    plans: dict = {}
+    if ss.get("movers_scan"):
+        with st.spinner("Running the swing radar on all tickers…"):
+            plans = _movers_plans(tuple(m.symbol for m in movers))
+
+    tracked = set(swingwatch.load())
+    for m in movers:
+        with st.container(border=True):
+            cols = st.columns([2.0, 1.1, 1.1, 0.9, 1.3, 1.0, 1.0, 1.0])
+            cols[0].markdown(
+                f"**{m.symbol}**<br><span style='color:gray;font-size:0.8em'>"
+                f"{m.name[:30]}</span>", unsafe_allow_html=True)
+            cols[1].markdown(f"**${m.price:,.2f}**" if m.price is not None else "—")
+            if m.change_pct is not None:
+                up = m.change_pct >= 0
+                color, arrow = ("#1b9e3e", "▲") if up else ("#e53935", "▼")
+                cols[2].markdown(f"<span style='color:{color};font-weight:600'>"
+                                 f"{arrow} {m.change_pct:+.2f}%</span>",
+                                 unsafe_allow_html=True)
+            else:
+                cols[2].markdown("—")
+            cols[3].markdown(f"{_fmt_volume(m.volume)}<br>"
+                             f"<span style='color:gray;font-size:0.75em'>volume</span>",
+                             unsafe_allow_html=True)
+            cols[4].markdown(f"{trends.get(m.symbol, '—')}<br>"
+                             f"<span style='color:gray;font-size:0.75em'>1M trend</span>",
+                             unsafe_allow_html=True)
+            if m.symbol in tracked:
+                cols[5].button("✓ On radar", key=f"mv_radar_{m.symbol}",
+                               disabled=True, use_container_width=True)
+            elif cols[5].button("➕ Radar", key=f"mv_radar_{m.symbol}",
+                                use_container_width=True,
+                                help=f"Track {m.symbol} on the swing radar "
+                                     "(60/70/80% alerts)"):
+                swingwatch.add(m.symbol)
+                st.toast(f"📡 {m.symbol} added to the swing radar", icon="➕")
+                st.rerun()
+            if cols[6].button("🔎 Open", key=f"mv_open_{m.symbol}",
+                              use_container_width=True,
+                              help=f"Full analysis of {m.symbol}"):
+                ss.ticker = m.symbol
+                ss.submitted = True
+                ss.page = "analyze"
+                st.rerun()
+            cols[7].link_button("📈 Yahoo",
+                                f"https://finance.yahoo.com/quote/{m.symbol}/",
+                                use_container_width=True,
+                                help=f"Open {m.symbol} on Yahoo Finance (new tab)")
+
+            if ss.get("movers_scan"):
+                plan = plans.get(m.symbol)
+                if plan is None:
+                    st.caption("⚪ No swing read available (data fetch failed).")
+                else:
+                    color, head, instr = _plan_brief(plan)
+                    st.markdown(
+                        f"<div style='background:{color}26;border:1px solid {color};"
+                        f"border-radius:8px;padding:6px 10px;margin-top:2px'>"
+                        f"<b style='color:{color}'>{head}</b> · score {plan.score}% · "
+                        f"{plan.score_label} — <span style='font-size:0.9em'>{instr}</span>"
+                        f"<div style='font-size:0.8em;color:#bbb'>{plan.guidance}</div></div>",
+                        unsafe_allow_html=True)
+
+    st.caption("⚡ Swing reads use the radar's fast 1–3 day pace · suggestions are "
+               "rule-based, **not financial advice.**")
 
 
 def _pnl_style(df, pct_cols=(), usd_cols=(), price_cols=()):

@@ -6,6 +6,7 @@ __pycache__/
 .pytest_cache/
 st_out.log
 st_err.log
+*.log
 # Local runtime state (per-user; ephemeral on cloud anyway)
 .watchlist.json
 .swingwatch.json
