@@ -105,6 +105,16 @@ def main() -> None:
     ss.setdefault("submitted", False)
     ss.setdefault("page", "analyze")
 
+    # An "Open" click (top-movers row or radar card) stashes the symbol here.
+    # We apply it now — before _sidebar() instantiates the key="ticker" widget —
+    # because Streamlit forbids assigning a widget-backed key once that widget
+    # has been created in the same run.
+    pending = ss.pop("_pending_ticker", None)
+    if pending:
+        ss.ticker = pending
+        ss.submitted = True
+        ss.page = "analyze"
+
     head_l, head_r = st.columns([4.2, 1])
     with head_l:
         st.title("📈 Stock Graph Analyzer")
@@ -563,8 +573,7 @@ def _radar_card(tk: str, plan, res=None) -> None:
         f"<div style='font-size:0.8em;margin-top:2px'>{instr}</div></div>",
         unsafe_allow_html=True)
     if st.button(f"🔎 Open {tk}", key=f"radar_open_{tk}", use_container_width=True):
-        st.session_state.ticker = tk
-        st.session_state.submitted = True
+        st.session_state._pending_ticker = tk   # applied at top of main()
         st.rerun(scope="app")
 
 
@@ -762,9 +771,7 @@ def _movers_page() -> None:
             if cols[6].button("🔎 Open", key=f"mv_open_{m.symbol}",
                               use_container_width=True,
                               help=f"Full analysis of {m.symbol}"):
-                ss.ticker = m.symbol
-                ss.submitted = True
-                ss.page = "analyze"
+                ss._pending_ticker = m.symbol   # applied at top of main()
                 st.rerun()
             cols[7].link_button("📈 Yahoo",
                                 f"https://finance.yahoo.com/quote/{m.symbol}/",
