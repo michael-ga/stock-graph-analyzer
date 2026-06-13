@@ -35,6 +35,7 @@ from .usecase import UseCase
 # +0.5R expectancy. The sweep (rr 1.4-1.8 all positive) brackets this choice.
 _MIN_RR = 1.5
 _BREAKOUT_ROOM_FACTOR = 0.75   # breakout leg may be slightly under min_move (trigger-confirmed)
+_TRIGGER_NEAR_PCT = 0.015      # armed breakout orders only when price is coiled at the wall
 _CHASE_PCT = 5.0               # a ≥5% daily move in the last 3 daily bars = chase risk
 _EXTENSION_PCT = 10.0          # price >10% from the 6M sma20 = rubber band stretched
 
@@ -262,6 +263,18 @@ def _long_geometry(price, walls, supports, atr_abs, budget_atr_abs,
     for i in range(min(len(walls), 3)):
         trigger_wall = walls[i]
         entry = trigger_wall + buffer
+        if entry / price - 1 > cap:
+            # Rung reachability: walls ascend, so once a trigger sits beyond
+            # what the volatility budget covers within the horizon, every later
+            # rung is worse. "Wait for a close above" framed +20% overhead is
+            # not a swing plan (the NOK $17.45 read at $14.58) — the honest
+            # answer is no_trade with the near walls as watch levels.
+            return _Geometry(
+                "no_trade", price, _stop_for(price, s1),
+                max(walls[0] * 0.995, price), None,
+                f"the workable ceiling ${trigger_wall:.2f} is "
+                f"{(trigger_wall / price - 1) * 100:+.0f}% away — beyond this "
+                f"horizon's ~{cap * 100:.0f}% reach")
         nxt = walls[i + 1] if i + 1 < len(walls) else None
         if nxt is not None:
             # Ladder sanity: if the next wall sits beyond the vol budget, a
@@ -317,6 +330,14 @@ def _short_geometry(price, walls, supports, atr_abs, budget_atr_abs,
     for i in range(min(len(supports), 3)):
         trigger_wall = supports[i]
         entry = trigger_wall - buffer
+        if 1 - entry / price > cap:
+            # Mirror of the long-side rung-reachability guard.
+            return _Geometry(
+                "no_trade", price, _stop_for(price, r1),
+                min(supports[0] * 1.005, price), None,
+                f"the workable floor ${trigger_wall:.2f} is "
+                f"{(1 - trigger_wall / price) * 100:.0f}% away — beyond this "
+                f"horizon's ~{cap * 100:.0f}% reach")
         nxt = supports[i + 1] if i + 1 < len(supports) else None
         if nxt is not None:
             if 1 - nxt * 1.005 / entry > cap:    # next floor beyond the vol budget
@@ -745,6 +766,18 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
     crash_info = _crash_regime(all_reports, price, entry, target1, bull=not short)
     crash_block = crash_info[0] and crash_info[1]
 
+    # Breakout-trigger proximity: an armed stop order is only honest when price
+    # is already coiled at the wall. A trigger a day's range away (the AAL
+    # $15.35 arm with price at $14.74) fills only after a +4% momentum rip
+    # through untested walls — front-running the close-confirmation this very
+    # plan asks for. Far trigger = watch framing, never an order ticket.
+    trigger_dist: float | None = None
+    if geom.kind == "breakout_wait" and geom.trigger and price:
+        trigger_dist = ((1 - geom.trigger / price) if short
+                        else (geom.trigger / price - 1))
+    trigger_near_band = max(_TRIGGER_NEAR_PCT, 0.6 * atr_frac)
+    trigger_near = trigger_dist is not None and trigger_dist <= trigger_near_band
+
     score, score_label, checks = _swing_score(
         bias, setup, setup_present, countertrend, rr, geom, walls, supports,
         fast, df, all_reports, atr_frac, context, crash_info)
@@ -773,6 +806,10 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
         guidance = (f"No room to the next {'floor' if short else 'ceiling'} — "
                     f"{geom.note}, then target ${target1:.2f} "
                     f"({abs(target1/entry-1)*100:.1f}% from the trigger).")
+        if trigger_dist is not None and not trigger_near:
+            guidance += (f" The trigger sits {trigger_dist*100:.1f}% "
+                         f"{'below' if short else 'above'} the current price — "
+                         "set an alert, don't park an order this far out.")
         if tuning.stop_atr_mult * atr_frac > abs(target1 / entry - 1):
             guidance += (f" Note: daily volatility ~{atr_frac*100:.1f}% exceeds that room — "
                          "size small or skip.")
@@ -829,11 +866,12 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
         beyond = [w for w in walls if w > target1 * 1.005]
         target2 = beyond[0] if beyond else None
 
-    # Broker-instruction worthiness: a GO plan, or a trigger-confirmed breakout
-    # leg that already clears the R:R gate. Everything else renders as a watch
-    # plan (alerts, not orders).
+    # Broker-instruction worthiness: a GO plan, or a breakout leg whose trigger
+    # is within reach (price coiled at the wall, ≤ max(1.5%, 0.6×dailyATR)) and
+    # already clears the R:R gate. Everything else renders as a watch plan
+    # (alerts, not orders).
     actionable = go or (geom.kind == "breakout_wait" and rr >= _MIN_RR
-                        and not crash_block and not earnings_block)
+                        and trigger_near and not crash_block and not earnings_block)
 
     return SwingPlan(
         setup=setup or "No setup", bias=bias, entry=round(entry, 2),
