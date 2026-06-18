@@ -49,27 +49,56 @@ def test_mark_expiry_at_market(tmp_path):
     assert changed[0]["exit_price"] == 14.1
 
 
-def test_pending_breakout_activates_then_wins(tmp_path):
+def test_pending_breakout_confirms_then_fills_on_retest(tmp_path):
+    # Two-phase throwback: confirm the break, THEN fill on the pullback to entry.
     p = tmp_path / "book.json"
-    pos = _open(p, kind="breakout_wait", trigger=14.2, entry=14.21, target=15.0)
+    pos = _open(p, kind="breakout_wait", trigger=14.2, entry=14.2, target=15.0)
     assert pos["status"] == "pending"
-    # Below the trigger: nothing happens.
+    # Below the trigger: nothing.
     assert vb.mark("NOK", 14.1, now=1_000_050.0, path=p) == []
-    # Touching the bare wall (14.2) is NOT enough — needs the buffered entry.
-    assert vb.mark("NOK", 14.205, now=1_000_060.0, path=p) == []
-    # Beyond the buffered entry → fills there.
-    changed = vb.mark("NOK", 14.3, now=1_000_100.0, path=p)
-    assert changed[0]["status"] == "open" and changed[0]["entry"] == 14.21
+    # A bare touch of the wall is not a confirmed break (needs the margin).
+    assert vb.mark("NOK", 14.21, now=1_000_060.0, path=p) == []
+    # A real break clears the trigger — but does NOT fill yet (await the retest).
+    assert vb.mark("NOK", 14.35, now=1_000_100.0, path=p) == []
+    # The throwback to the entry fills the order.
+    changed = vb.mark("NOK", 14.2, now=1_000_150.0, path=p)
+    assert changed[0]["status"] == "open" and changed[0]["entry"] == 14.2
     # Then the target.
     changed = vb.mark("NOK", 15.1, now=1_000_200.0, path=p)
     assert changed[0]["close_reason"] == "target_hit"
 
 
-def test_pending_cancelled_when_stale(tmp_path):
+def test_breakout_that_runs_away_is_missed_not_chased(tmp_path):
+    # Confirms the break then only rises — never retests. We do NOT chase; the
+    # order expires unfilled (the honest cost of waiting for the pullback).
+    p = tmp_path / "book.json"
+    _open(p, kind="breakout_wait", trigger=14.2, entry=14.2, target=15.0)
+    assert vb.mark("NOK", 14.35, now=1_000_100.0, path=p) == []   # broke out
+    assert vb.mark("NOK", 14.9, now=1_000_200.0, path=p) == []    # ran away, no retest
+    week_later = 1_000_000.0 + 6 * 86400
+    changed = vb.mark("NOK", 14.95, now=week_later, path=p)
+    assert changed[0]["status"] == "closed"
+    assert changed[0]["close_reason"] == "cancelled"              # never filled
+
+
+def test_breakout_then_failed_collapse_is_cancelled_not_stopped(tmp_path):
+    # Break confirms, then price collapses straight through the stop before any
+    # retest fill — a failed breakout. We were never filled, so it's cancelled,
+    # NOT a stop-loss (that's the loss the throwback model avoids).
+    p = tmp_path / "book.json"
+    _open(p, kind="breakout_wait", trigger=14.2, entry=14.2, stop=14.0, target=15.0)
+    assert vb.mark("NOK", 14.35, now=1_000_100.0, path=p) == []   # broke out
+    changed = vb.mark("NOK", 13.9, now=1_000_150.0, path=p)       # collapses < stop
+    assert changed[0]["status"] == "closed"
+    assert changed[0]["close_reason"] == "cancelled"
+    assert changed[0]["pnl_pct"] == 0.0                           # never held → no loss
+
+
+def test_pending_cancelled_when_break_never_comes(tmp_path):
     p = tmp_path / "book.json"
     _open(p, kind="breakout_wait", trigger=14.2)
     week_later = 1_000_000.0 + 6 * 86400
-    changed = vb.mark("NOK", 14.0, now=week_later, path=p)
+    changed = vb.mark("NOK", 14.0, now=week_later, path=p)        # never broke out
     assert changed[0]["status"] == "closed"
     assert changed[0]["close_reason"] == "cancelled"
 

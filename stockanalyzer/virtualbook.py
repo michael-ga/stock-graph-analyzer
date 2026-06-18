@@ -23,6 +23,7 @@ from pathlib import Path
 
 from .data.store import (
     DB_PATH,
+    algorithm_correctness as _algorithm_correctness,
     close_trade,
     has_open_trade,
     insert_trade,
@@ -121,3 +122,12 @@ def stats(positions: list[dict] | None = None) -> dict:
             bands={k: _agg(v) for k, v in sorted(by_band.items())},
         )
     return trade_stats()
+
+
+def algorithm_correctness(path: Path = _PATH) -> dict:
+    """Idea-level report (deduped across bots) — judge the algorithm's calls.
+
+    See ``store.algorithm_correctness``: collapses every trader that took one
+    plan into a single idea, so the win rate reflects the engine's decisions
+    rather than how many bots copied them."""
+    return _algorithm_correctness(_db(path))

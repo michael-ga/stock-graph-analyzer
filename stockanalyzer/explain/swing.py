@@ -28,6 +28,7 @@ from ..analysis.engine import TimeframeReport
 from ..analysis.signals import Direction
 from ..data.schema import Timeframe
 from ..strategy import SWING_PACE, PaceTuning, SwingPace
+from .emerging import EMERGING_MAX_BARS, EmergingScore, score_emerging
 from .usecase import UseCase
 
 # GO threshold. Classic books say 2:1 assuming ~45% win rate; this engine's
@@ -38,6 +39,12 @@ _BREAKOUT_ROOM_FACTOR = 0.75   # breakout leg may be slightly under min_move (tr
 _TRIGGER_NEAR_PCT = 0.015      # armed breakout orders only when price is coiled at the wall
 _CHASE_PCT = 5.0               # a ≥5% daily move in the last 3 daily bars = chase risk
 _EXTENSION_PCT = 10.0          # price >10% from the 6M sma20 = rubber band stretched
+
+# Famous-indicator guards (Murphy canon). They only fire when the column exists,
+# so controlled fixtures without these columns are unaffected — the muscle lands
+# on real data where add_indicators() supplies them.
+_ADX_TREND = 25.0              # ADX ≥ 25 = a real trend; an adverse strong trend vetoes a GO
+_BB_BLOWOFF_PCT = 0.5          # daily close this % beyond the upper band = 2σ blowoff
 
 # Signal names that confirm a bullish swing entry.
 _BULL_CONFIRM = {"hammer", "bullish_engulfing", "double_bottom",
@@ -98,6 +105,8 @@ class SwingPlan:
     daily_atr_pct: float = 0.0      # daily volatility used for risk sizing
     atr_source: str = ""
     actionable: bool = True         # False → show watch framing, not broker orders
+    emerging: EmergingScore | None = None  # low-history demand read (IPOs etc.); when
+    #                                        set, score/score_label come from it
 
 
 def _last(df, col: str, default: float | None = None) -> float | None:
@@ -116,6 +125,92 @@ def _rising(df, col: str, lookback: int = 10) -> bool:
 # Daily volatility — the risk yardstick for every horizon.
 # --------------------------------------------------------------------------- #
 _DAILY_FRAMES = (Timeframe.M6, Timeframe.M1, Timeframe.YTD, Timeframe.Y1)
+
+
+def _daily_frame(all_reports, df):
+    """The frame whose daily bars drive the trend/overextension guards."""
+    if all_reports:
+        for tf in _DAILY_FRAMES:
+            rep = all_reports.get(tf)
+            if rep is not None:
+                return rep.df
+    return df
+
+
+def _indicator_guards(all_reports, df, short: bool) -> tuple[bool, bool, list[str]]:
+    """(overextended, adverse_trend, notes) from Bollinger + ADX/DMI.
+
+    The two famous indicators that would have vetoed the worst radar trades:
+    a close outside the 2σ Bollinger band = a blowoff you shouldn't chase
+    (SPCX/INTC), and a strong ADX trend running *against* the entry = a falling
+    knife you shouldn't catch (NOK). Both no-op when the column is absent."""
+    fdf = _daily_frame(all_reports, df)
+    close = _last(fdf, "close")
+    notes: list[str] = []
+
+    overext = False
+    band = _last(fdf, "bb_upper" if not short else "bb_lower")
+    if close is not None and band is not None:
+        if not short and close > band * (1 + _BB_BLOWOFF_PCT / 100):
+            overext = True
+            notes.append(f"close ${close:.2f} is outside the upper Bollinger band "
+                         f"${band:.2f} — 2σ blowoff, don't chase")
+        elif short and close < band * (1 - _BB_BLOWOFF_PCT / 100):
+            overext = True
+            notes.append(f"close ${close:.2f} is below the lower Bollinger band "
+                         f"${band:.2f} — overextended down")
+
+    adverse = False
+    adx_v = _last(fdf, "adx")
+    plus_di = _last(fdf, "plus_di")
+    minus_di = _last(fdf, "minus_di")
+    if adx_v is not None and plus_di is not None and minus_di is not None and adx_v >= _ADX_TREND:
+        if not short and minus_di > plus_di:
+            adverse = True
+            notes.append(f"ADX {adx_v:.0f} with −DI>{'+'}DI — a strong downtrend; "
+                         "going long is catching a falling knife")
+        elif short and plus_di > minus_di:
+            adverse = True
+            notes.append(f"ADX {adx_v:.0f} with +DI>−DI — a strong uptrend against the short")
+    return overext, adverse, notes
+
+
+def _macd_against(all_reports, df, short: bool) -> tuple[bool, str | None]:
+    """(daily momentum is actively against the entry, note).
+
+    The cleanest winner/loser separator in the trade book was daily MACD: losers
+    were entered with the daily MACD below its signal (negative histogram). But a
+    *raw* below-signal veto also kills the textbook with-trend pullback — any
+    healthy multi-day dip rolls the MACD line under its signal even while price
+    holds the trend. So the veto fires only when the histogram is BOTH on the
+    wrong side AND still deteriorating (last bar worse than the one before): a
+    falling knife is blocked, a dip that's already stabilizing is let through —
+    which is exactly when you buy the dip.
+
+    Daily-only: it reads a true daily frame (6M/1M/YTD/1Y). With no daily frame
+    (controlled fixtures, intraday-only) it no-ops — so it never mislabels an
+    intraday MACD as 'daily', and never suppresses a thin-history name.
+    """
+    rep_df = None
+    if all_reports:
+        for tf in _DAILY_FRAMES:
+            rep = all_reports.get(tf)
+            if rep is not None:
+                rep_df = rep.df
+                break
+    if rep_df is None or "macd_hist" not in rep_df:
+        return False, None
+    hist = rep_df["macd_hist"].dropna()
+    if len(hist) < 2:
+        return False, None
+    last, prev = float(hist.iloc[-1]), float(hist.iloc[-2])
+    against = (last < 0 and last < prev) if not short else (last > 0 and last > prev)
+    if not against:
+        return False, None
+    state = ("negative and still falling" if not short
+             else "positive and still rising")
+    return True, (f"daily MACD histogram {last:+.3f} is {state} — momentum is "
+                  "still moving against the entry")
 
 
 def _daily_atr(all_reports, df, price: float) -> tuple[float, float, str]:
@@ -225,7 +320,8 @@ class _Geometry:
 
 
 def _long_geometry(price, walls, supports, atr_abs, budget_atr_abs,
-                   tuning: PaceTuning, countertrend: bool) -> _Geometry:
+                   tuning: PaceTuning, countertrend: bool,
+                   leg_spent: bool = False) -> _Geometry:
     # Target budget runs on the DAMPED ATR (panic spikes can't inflate the aim);
     # stops run on the live ATR (must survive today's actual noise).
     budget = budget_atr_abs / price * math.sqrt(tuning.budget_days)  # fraction
@@ -259,10 +355,22 @@ def _long_geometry(price, walls, supports, atr_abs, budget_atr_abs,
                          max(r1 * 0.995, price), None,
                          f"bounce room to ${r1:.2f} is only {room1*100:+.1f}% — too small")
 
-    # No room — scan the ladder for the first viable breakout leg.
+    # Leg-spent gate: price is already 2σ-extended (outside the upper Bollinger
+    # band) and coiled under a wall — the move that got here is mostly done.
+    # Chasing the break now buys the top, where (today's data) the breakout
+    # either pays scraps or fails outright. Don't arm it.
+    if leg_spent:
+        return _Geometry("no_trade", price, _stop_for(price, s1),
+                         max(r1 * 0.995, price), None,
+                         "the leg is already spent (price is 2σ-extended) — don't chase "
+                         "a breakout into a tired move; wait for a pullback")
+
+    # No room — scan the ladder for the first viable breakout leg. We buy the
+    # *throwback*: let price reclaim the wall, then fill on the retest of that
+    # level (entry at the wall) rather than chasing the spike above it.
     for i in range(min(len(walls), 3)):
         trigger_wall = walls[i]
-        entry = trigger_wall + buffer
+        entry = trigger_wall                             # retest of the breakout level
         if entry / price - 1 > cap:
             # Rung reachability: walls ascend, so once a trigger sits beyond
             # what the volatility budget covers within the horizon, every later
@@ -291,14 +399,16 @@ def _long_geometry(price, walls, supports, atr_abs, budget_atr_abs,
             stop = min(trigger_wall * 0.998, entry - tuning.stop_atr_mult * atr_abs)
             return _Geometry("breakout_wait", entry, max(0.01, stop), target,
                              trigger_wall,
-                             f"wait for a close above ${trigger_wall:.2f}")
+                             f"let it close above ${trigger_wall:.2f}, then buy the "
+                             "retest of that level — don't chase the spike")
     return _Geometry("no_trade", price, _stop_for(price, s1),
                      max(r1 * 0.995, price), None,
                      "no breakout leg fits the volatility budget — chop zone")
 
 
 def _short_geometry(price, walls, supports, atr_abs, budget_atr_abs,
-                    tuning: PaceTuning, countertrend: bool) -> _Geometry:
+                    tuning: PaceTuning, countertrend: bool,
+                    leg_spent: bool = False) -> _Geometry:
     budget = budget_atr_abs / price * math.sqrt(tuning.budget_days)
     cap = min(tuning.target_cap, budget)
     buffer = max(0.001 * price, 0.02 * atr_abs)
@@ -327,9 +437,17 @@ def _short_geometry(price, walls, supports, atr_abs, budget_atr_abs,
                          min(s1 * 1.005, price), None,
                          f"drop room to ${s1:.2f} is only {room1*100:.1f}% — too small")
 
+    # Leg-spent gate (mirror): price already 2σ-extended below the lower band —
+    # the down-move is tired; don't chase a fresh breakdown into it.
+    if leg_spent:
+        return _Geometry("no_trade", price, _stop_for(price, r1),
+                         min(s1 * 1.005, price), None,
+                         "the down-leg is already spent (price is 2σ-extended) — don't "
+                         "chase a breakdown into a tired move; wait for a bounce")
+
     for i in range(min(len(supports), 3)):
         trigger_wall = supports[i]
-        entry = trigger_wall - buffer
+        entry = trigger_wall                             # retest of the breakdown level
         if 1 - entry / price > cap:
             # Mirror of the long-side rung-reachability guard.
             return _Geometry(
@@ -349,7 +467,8 @@ def _short_geometry(price, walls, supports, atr_abs, budget_atr_abs,
         if room >= _BREAKOUT_ROOM_FACTOR * tuning.min_move:
             stop = max(trigger_wall * 1.002, entry + tuning.stop_atr_mult * atr_abs)
             return _Geometry("breakout_wait", entry, stop, target, trigger_wall,
-                             f"wait for a close below ${trigger_wall:.2f}")
+                             f"let it close below ${trigger_wall:.2f}, then sell the "
+                             "retest of that level — don't chase the flush")
     return _Geometry("no_trade", price, _stop_for(price, r1),
                      min(s1 * 1.005, price), None,
                      "no breakdown leg fits the volatility budget — chop zone")
@@ -554,6 +673,25 @@ def _swing_score(bias: Direction, setup: str | None, setup_present: bool,
                 "Not overextended vs 20-day average", ok,
                 f"{ext:+.1f}% from the daily 20-MA", 5))
 
+        # Bollinger Bands — closing outside the 2σ band is a textbook blowoff.
+        bb = _last(daily_rep.df, "bb_upper" if bull else "bb_lower")
+        if bb and price_d:
+            inside = price_d <= bb if bull else price_d >= bb
+            checks.append(SwingCheck(
+                "Inside the Bollinger band (not a 2σ blowoff)", inside,
+                f"close ${price_d:.2f} vs {'upper' if bull else 'lower'} band ${bb:.2f}", 5))
+
+        # ADX/DMI — is the trend strong, and in our direction?
+        adx_v = _last(daily_rep.df, "adx")
+        pdi, mdi = _last(daily_rep.df, "plus_di"), _last(daily_rep.df, "minus_di")
+        if adx_v is not None and pdi is not None and mdi is not None:
+            with_dir = pdi >= mdi if bull else mdi >= pdi
+            ok = with_dir or adx_v < _ADX_TREND   # a weak trend can't fight us; a strong adverse one can
+            checks.append(SwingCheck(
+                "Trend strength agrees (ADX/DMI)", ok,
+                f"ADX {adx_v:.0f}, {'+DI' if pdi >= mdi else '−DI'} leads"
+                + (" — strong trend" if adx_v >= _ADX_TREND else " — weak/chop"), 5))
+
     # Strategy conflict — swinging against the app's own long-term read.
     inv_pct = context.get("investor_pct")
     if inv_pct is not None:
@@ -660,13 +798,64 @@ def build_swing_plan(report: TimeframeReport, usecase: UseCase,
     atr_abs = atr_frac * price
     budget_abs = budget_frac * price
 
-    if usecase == UseCase.SELL:
-        return _build_side(report, price, df, names, fast, tuning, all_reports,
-                           context, atr_abs, budget_abs, atr_frac, atr_src,
-                           short=True, own=False)
-    return _build_side(report, price, df, names, fast, tuning, all_reports,
+    plan = _build_side(report, price, df, names, fast, tuning, all_reports,
                        context, atr_abs, budget_abs, atr_frac, atr_src,
-                       short=False, own=(usecase == UseCase.OWN))
+                       short=(usecase == UseCase.SELL),
+                       own=(usecase == UseCase.OWN))
+
+    # Low-history names (fresh IPOs / new listings) have no sma50, no level map,
+    # and no MACD history — the mature setup score is mostly `n/a`. Route the
+    # *score* to the emerging demand read instead: it rewards genuine eager
+    # buying but caps how certain a thin-history call can look and refuses to
+    # greenlight a stretched, extended move. Geometry/levels stay as built.
+    if usecase != UseCase.SELL:
+        _apply_emerging(plan, all_reports, df, context)
+    return plan
+
+
+def _longest_daily(all_reports, df) -> tuple[object, int]:
+    """(frame with the most daily-bar history, its bar count).
+
+    Intraday frames (1D/5D) are excluded — only true daily frames count toward
+    'how much history exists'. Falls back to the decision frame when no daily
+    frame is present."""
+    best_df, best_bars = df, len(df)
+    if all_reports:
+        for tf in _DAILY_FRAMES:
+            rep = all_reports.get(tf)
+            if rep is not None and len(rep.df) > best_bars:
+                best_df, best_bars = rep.df, len(rep.df)
+    return best_df, best_bars
+
+
+def _apply_emerging(plan: SwingPlan, all_reports, df, context: dict) -> None:
+    """When history is too thin to trust the mature score, overwrite the score
+    with the emerging demand read and let an `extended` flag veto a GO."""
+    daily_df, bars = _longest_daily(all_reports, df)
+    if bars >= EMERGING_MAX_BARS:
+        return
+    es = score_emerging(daily_df,
+                        offering_price=context.get("offering_price"),
+                        vwap=context.get("vwap"))
+    plan.emerging = es
+    plan.score = es.score
+    plan.score_label = es.label
+    plan.confidence = "low"            # thin history is never high-conviction
+    plan.reasons.insert(0, es.summary)
+
+    # The score can be high (real demand) while the move is too stretched to
+    # chase — keep the two jobs separate: demand raises the score, 'extended'
+    # vetoes the entry. An extended name is never an order ticket (no GO, no
+    # armed breakout), only a watch.
+    if es.extended:
+        plan.actionable = False
+        if plan.go or plan.light == "go":
+            plan.go = False
+            plan.light = "forming"
+        plan.guidance = (
+            f"Demand looks genuine, but price is {es.extension_pct:+.0f}% above "
+            f"the ${es.anchor:.2f} anchor — too stretched to chase. Wait for it "
+            "to hold a higher low before entering.")
 
 
 def _ind_frame(all_reports, df):
@@ -752,10 +941,23 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
                         and sma200 is not None and price < sma200)
     setup_present = setup is not None and not strong_downtrend
 
+    # Famous-indicator guards, computed once: an extended close (outside the 2σ
+    # Bollinger band) means the leg is already spent — don't chase a breakout into
+    # it; a strong adverse ADX trend vetoes a GO further down.
+    overext, adverse_trend, veto_notes = _indicator_guards(all_reports, df, short)
+
+    # Daily-MACD momentum veto. In the trade book this was the single cleanest
+    # winner/loser separator: losers were systematically entered with the daily
+    # MACD *below* its signal (negative histogram), winners above it. So an entry
+    # whose own daily momentum line disagrees with its direction never reaches GO.
+    macd_against, macd_note = _macd_against(all_reports, df, short)
+    if macd_note:
+        veto_notes.append(macd_note)
+
     geom = (_short_geometry(price, walls, supports, atr_abs, budget_atr_abs,
-                            tuning, countertrend) if short
+                            tuning, countertrend, leg_spent=overext) if short
             else _long_geometry(price, walls, supports, atr_abs, budget_atr_abs,
-                                tuning, countertrend))
+                                tuning, countertrend, leg_spent=overext))
 
     entry, stop, target1 = geom.entry, geom.stop, geom.target
     risk = abs(entry - stop)
@@ -790,9 +992,13 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
               (tuning.budget_days <= 3)     # fast pace may scalp first-wall bounces
     edays = context.get("earnings_days")
     earnings_block = edays is not None and edays <= tuning.earnings_guard_days
+    # Famous-indicator vetoes (overext / adverse_trend computed above): a 2σ
+    # Bollinger blowoff (don't chase) or a strong ADX trend running against the
+    # entry (don't catch the knife) is never a GO.
     go = (geom.kind == "immediate" and setup_present and tier_ok
           and rr >= _MIN_RR and aim >= tuning.min_move
-          and not strong_downtrend and not earnings_block and not crash_block)
+          and not strong_downtrend and not earnings_block and not crash_block
+          and not overext and not adverse_trend and not macd_against)
     light = "go" if go else ("forming" if (setup_present or geom.kind == "breakout_wait")
                              else "no")
 
@@ -802,6 +1008,10 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
         guidance = (f"Enter {d} near ${entry:.2f} now · stop ${stop:.2f} "
                     f"({(stop/entry-1)*100:+.1f}%) · {geom.note} → target ${target1:.2f} "
                     f"({(target1/entry-1)*100:+.1f}%).")
+    elif (setup_present and (overext or adverse_trend or macd_against)
+          and geom.kind == "immediate"):
+        guidance = ("Setup is there, but a key indicator says don't enter here: "
+                    + "; ".join(veto_notes) + ". Wait for it to reset.")
     elif geom.kind == "breakout_wait":
         guidance = (f"No room to the next {'floor' if short else 'ceiling'} — "
                     f"{geom.note}, then target ${target1:.2f} "
