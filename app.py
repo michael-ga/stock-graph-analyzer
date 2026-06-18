@@ -333,7 +333,8 @@ def _plan_snapshot(plan, reports=None, verdict=None, rec=None) -> dict:
             indicators = {}
             for col in ("close", "sma20", "sma50", "sma200", "ema20",
                         "rsi", "macd", "macd_signal", "macd_hist",
-                        "stoch_k", "stoch_d", "atr"):
+                        "stoch_k", "stoch_d", "atr",
+                        "adx", "plus_di", "minus_di", "bb_upper", "bb_lower"):
                 if col in rep.df.columns:
                     series = rep.df[col].dropna()
                     if not series.empty:
@@ -429,18 +430,34 @@ def _virtual_buy_button(plan, ticker: str, key_suffix: str = "",
                "panel at the top with your stake and P&L.")
 
 
+def _is_extended(p) -> bool:
+    """The plan's own 'too stretched / not real demand' verdict (emerging path)."""
+    es = getattr(p, "emerging", None)
+    return bool(es and (es.extended or "distribution_risk" in es.flags))
+
+
 _BOTS = (
     # (name, condition, uses pending trigger)  — contrasting strategies so the
     # data shows which rules actually make money.
     ("bot-GO",  lambda p: p.go, False),
-    ("bot-70",  lambda p: p.score >= 70 and p.kind == "immediate" and not p.go, False),
+    # bot-70 now respects the engine's own guardrails: a high score on a
+    # with-trend momentum name, NOT an extended blowoff it should never chase.
+    ("bot-70",  lambda p: p.score >= 70 and p.kind == "immediate" and not p.go
+                and p.actionable and not _is_extended(p), False),
     ("bot-BRK", lambda p: p.kind == "breakout_wait" and p.score >= 55, True),
 )
 
 
 def _run_bots(ticker: str, plan, reports=None, verdict=None, rec=None) -> None:
     """Auto virtual-traders: each bot opens (at most one) position per ticker
-    when its rule matches the current plan."""
+    when its rule matches the current plan.
+
+    Every bot is gated on the plan's own verdict: a non-actionable plan, an
+    extended/distribution emerging read — these are watch-only and never become
+    a position. This is the chokepoint that stops the radar from buying the very
+    setups the engine flagged as bad (the SPCX/INTC/NOK class)."""
+    if not getattr(plan, "actionable", True) or _is_extended(plan):
+        return
     for name, cond, _pending in _BOTS:
         try:
             if cond(plan) and not virtualbook.has_open(ticker, name):
@@ -881,7 +898,8 @@ def _portfolio_panel() -> None:
                     udollar = (upnl / 100 * p.get("stake", 1000.0)) if upnl is not None else None
                     rows.append({
                         "ticker": p["ticker"], "trader": p["trader"],
-                        "status": "⏳ armed" if p["status"] == "pending" else "📈 open",
+                        "status": ("🔓 retest" if (p["status"] == "pending" and p.get("broke_out_ts"))
+                                   else "⏳ armed" if p["status"] == "pending" else "📈 open"),
                         "opened": _fmt_ts(p.get("opened_ts") or p["opened"]),
                         "stake $": p.get("stake", 1000.0),
                         "entry": p["entry"], "now": cur,
@@ -940,6 +958,47 @@ def _portfolio_panel() -> None:
                                             pct_cols=["avg_pnl_pct"],
                                             usd_cols=["total_pnl_usd"]),
                                  use_container_width=True)
+
+                # Algorithm correctness — the deduped view. The book copies one
+                # idea across bot-GO/bot-70/bot-BRK/me, which inflates the sample;
+                # this collapses each plan to a single idea so the numbers judge
+                # the engine's CALLS, not how many bots echoed them.
+                try:
+                    algo = virtualbook.algorithm_correctness()
+                    at = algo["totals"]
+                    if at["n_ideas"]:
+                        st.markdown(
+                            f"**🧭 Algorithm correctness** — {at['n_ideas']} distinct "
+                            f"ideas (from {at['n_trades']} bot-trades) · "
+                            f"idea win-rate **{at['win_rate']}%** · "
+                            f"avg **{at['avg_pnl_pct']:+.2f}%** per idea")
+                        idea_setup = [{"setup": k, "ideas": v["n_ideas"],
+                                       "wins": v["wins"], "losses": v["losses"],
+                                       "win_rate": v["win_rate"],
+                                       "avg_pnl_pct": v["avg_pnl_pct"]}
+                                      for k, v in algo["setups"].items()]
+                        idea_band = [{"score band": k, "ideas": v["n_ideas"],
+                                      "win_rate": v["win_rate"],
+                                      "avg_pnl_pct": v["avg_pnl_pct"]}
+                                     for k, v in algo["bands"].items()]
+                        a1, a2 = st.columns(2)
+                        with a1:
+                            st.caption("By setup — one vote per idea")
+                            st.dataframe(_pnl_style(pd.DataFrame(idea_setup),
+                                                    pct_cols=["avg_pnl_pct"]),
+                                         use_container_width=True)
+                        with a2:
+                            st.caption("By score band — does a higher score win more?")
+                            st.dataframe(_pnl_style(pd.DataFrame(idea_band),
+                                                    pct_cols=["avg_pnl_pct"]),
+                                         use_container_width=True)
+                        st.caption("Same idea taken by several bots counts once "
+                                   "here — so a duplicated call can't masquerade as "
+                                   "a winning streak. Compare with the per-trader "
+                                   "cards above to see which bot *rule* earns its place.")
+                except Exception:
+                    pass
+
                 hist = [p for p in book if p["status"] == "closed"]
                 st.markdown(f"**Trade history ({len(hist)})**")
                 h_rows = [{

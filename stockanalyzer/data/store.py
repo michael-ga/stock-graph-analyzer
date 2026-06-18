@@ -9,6 +9,7 @@ The API is intentionally functional (module-level functions with a default
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -20,7 +21,7 @@ from pathlib import Path
 _DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "trades.db"
 DB_PATH = (Path(os.environ["STOCKANALYZER_DB"])
            if os.environ.get("STOCKANALYZER_DB") else _DEFAULT_DB_PATH)
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 _connections: dict[str, sqlite3.Connection] = {}
 
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS trades (
     opened_ts     REAL NOT NULL,
     opened        TEXT NOT NULL,
     activated_ts  REAL,
+    broke_out_ts  REAL,
     entry         REAL NOT NULL,
     stop          REAL NOT NULL,
     target        REAL NOT NULL,
@@ -80,12 +82,16 @@ CREATE TABLE IF NOT EXISTS trades (
     snap_light_color   TEXT,
     snap_preset        TEXT,
     snap_bullish_pct   INTEGER,
-    snap_manual_levels INTEGER DEFAULT 0
+    snap_manual_levels INTEGER DEFAULT 0,
+    cohort_id          TEXT          -- groups the same trade IDEA across bots/manual
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker);
 CREATE INDEX IF NOT EXISTS idx_trades_trader ON trades(trader);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_opened ON trades(opened_ts);
+-- idx_trades_cohort is created by the v4 migration (after the column is added),
+-- so it is intentionally NOT here: this DDL runs before migrations on existing
+-- DBs, where cohort_id may not exist yet.
 
 CREATE TABLE IF NOT EXISTS trade_signals (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,6 +122,11 @@ CREATE TABLE IF NOT EXISTS trade_indicators (
     stoch_k     REAL,
     stoch_d     REAL,
     atr         REAL,
+    adx         REAL,
+    plus_di     REAL,
+    minus_di    REAL,
+    bb_upper    REAL,
+    bb_lower    REAL,
     bias_score  REAL,
     trend_dir   TEXT
 );
@@ -192,6 +203,97 @@ def _ensure_schema(conn: sqlite3.Connection, db_path: Path) -> None:
         conn.execute("INSERT OR REPLACE INTO schema_version VALUES (?, ?)",
                      (2, time.strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
+    if current < 3:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        if "broke_out_ts" not in cols:    # two-phase throwback fill for breakouts
+            conn.execute("ALTER TABLE trades ADD COLUMN broke_out_ts REAL")
+            conn.commit()
+        conn.execute("INSERT OR REPLACE INTO schema_version VALUES (?, ?)",
+                     (3, time.strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+    if current < 4:
+        # v4: judge the ALGORITHM, not just the bots. `cohort_id` groups every
+        # trade that acted on one plan (same ticker/setup/levels/day) so the same
+        # idea taken by bot-GO/bot-70/bot-BRK/me counts once. Persist the famous
+        # guard indicators (ADX/DMI, Bollinger) that the score already uses but
+        # that were never stored — so a post-mortem can see them. Repair the
+        # NULL/epoch close timestamps that broke duration analysis.
+        tcols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        if "cohort_id" not in tcols:
+            conn.execute("ALTER TABLE trades ADD COLUMN cohort_id TEXT")
+        icols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(trade_indicators)").fetchall()}
+        for col in ("adx", "plus_di", "minus_di", "bb_upper", "bb_lower"):
+            if col not in icols:
+                conn.execute(f"ALTER TABLE trade_indicators ADD COLUMN {col} REAL")
+        conn.commit()
+        _backfill_cohorts(conn)
+        _repair_closed_ts(conn)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_cohort ON trades(cohort_id)")
+        conn.execute("INSERT OR REPLACE INTO schema_version VALUES (?, ?)",
+                     (4, time.strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+
+
+# ── cohort identity + data repair ─────────────────────────────────────────── #
+
+def _cohort_id(ticker: str | None, setup: str | None, kind: str | None,
+               entry, stop, target, opened: str | None) -> str:
+    """Stable id grouping the same trade IDEA across traders.
+
+    Every bot (and a manual buy) that acts on one plan shares the ticker, setup,
+    entry/stop/target and day — so they collapse to one cohort. This lets the
+    book judge whether the *algorithm's decision* was right (one vote per idea),
+    separately from which *bot rule* happened to take it. Levels are rounded to
+    cents so trivially-different fills still group.
+    """
+    def _n(v) -> str:
+        try:
+            return f"{float(v):.2f}"
+        except (TypeError, ValueError):
+            return "0.00"
+    key = "|".join([(ticker or "").upper(), (setup or ""), (kind or ""),
+                    _n(entry), _n(stop), _n(target), (opened or "")[:10]])
+    return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def _backfill_cohorts(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """SELECT id, ticker, snap_setup, kind, entry, stop, target, opened
+           FROM trades WHERE cohort_id IS NULL"""
+    ).fetchall()
+    for r in rows:
+        cid = _cohort_id(r["ticker"], r["snap_setup"], r["kind"],
+                         r["entry"], r["stop"], r["target"], r["opened"])
+        conn.execute("UPDATE trades SET cohort_id=? WHERE id=?", (cid, r["id"]))
+    conn.commit()
+
+
+def _repair_closed_ts(conn: sqlite3.Connection) -> None:
+    """Backfill closed_ts where it is NULL or impossibly before opened_ts.
+
+    Older rows (JSON migration, and a batch closed with test-sized clocks) carry
+    NULL or near-epoch closed_ts, so any holding-period query silently breaks.
+    Recover the real time from the human ``closed`` text; fall back to opened_ts.
+    """
+    rows = conn.execute(
+        """SELECT id, opened_ts, closed, closed_ts FROM trades
+           WHERE status='closed' AND (closed_ts IS NULL OR closed_ts < opened_ts)"""
+    ).fetchall()
+    for r in rows:
+        ts = None
+        if r["closed"]:
+            try:
+                ts = time.mktime(time.strptime(r["closed"], "%Y-%m-%d %H:%M"))
+            except Exception:
+                # Out-of-range years raise OverflowError (not ValueError) and
+                # would otherwise propagate out of the migration on EVERY connect,
+                # bricking the DB. Any unparseable text just falls back below.
+                ts = None
+        if ts is None or ts < r["opened_ts"]:
+            ts = r["opened_ts"]
+        conn.execute("UPDATE trades SET closed_ts=? WHERE id=?", (ts, r["id"]))
+    conn.commit()
 
 
 # ── JSON migration ────────────────────────────────────────────────────────── #
@@ -312,6 +414,9 @@ def insert_trade(trade: dict, context: dict | None = None,
     ctx = context or {}
     snap = ctx if ctx else trade.get("snapshot") or {}
     rec_data = snap.get("recommendation") or {}
+    cohort = _cohort_id(trade["ticker"], snap.get("setup"), trade["kind"],
+                        trade["entry"], trade["stop"], trade["target"],
+                        trade["opened"])
 
     conn.execute(
         """INSERT INTO trades
@@ -320,8 +425,8 @@ def insert_trade(trade: dict, context: dict | None = None,
             shares, horizon_days, snap_score, snap_label, snap_setup,
             snap_kind, snap_rr, snap_daily_atr_pct, snap_guidance,
             snap_go_score, snap_light_color, snap_preset, snap_bullish_pct,
-            snap_manual_levels)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            snap_manual_levels, cohort_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (trade["id"], trade["ticker"], trade["trader"], trade["status"],
          trade["kind"], trade["opened_ts"], trade["opened"],
          trade.get("activated_ts"), trade["entry"], trade["stop"],
@@ -333,7 +438,7 @@ def insert_trade(trade: dict, context: dict | None = None,
          snap.get("guidance"),
          rec_data.get("go_score"), rec_data.get("light_color"),
          rec_data.get("preset"), rec_data.get("bullish_pct"),
-         int(snap.get("manual_levels", False))))
+         int(snap.get("manual_levels", False)), cohort))
 
     tid = trade["id"]
 
@@ -353,14 +458,16 @@ def insert_trade(trade: dict, context: dict | None = None,
                 """INSERT INTO trade_indicators
                    (trade_id, timeframe, close, sma20, sma50, sma200, ema20,
                     rsi, macd, macd_signal, macd_hist, stoch_k, stoch_d, atr,
+                    adx, plus_di, minus_di, bb_upper, bb_lower,
                     bias_score, trend_dir)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (tid, tf_key, ind.get("close"), ind.get("sma20"),
                  ind.get("sma50"), ind.get("sma200"), ind.get("ema20"),
                  ind.get("rsi"), ind.get("macd"), ind.get("macd_signal"),
                  ind.get("macd_hist"), ind.get("stoch_k"), ind.get("stoch_d"),
-                 ind.get("atr"), tf_info.get("bias_score"),
-                 tf_info.get("trend_dir")))
+                 ind.get("atr"), ind.get("adx"), ind.get("plus_di"),
+                 ind.get("minus_di"), ind.get("bb_upper"), ind.get("bb_lower"),
+                 tf_info.get("bias_score"), tf_info.get("trend_dir")))
 
     # Verdict
     vdict = snap.get("verdict") or {}
@@ -435,9 +542,22 @@ def close_trade(pid: str, exit_price: float | None, reason: str,
     return trade
 
 
+# A break is only "confirmed" once price clears the trigger by this margin —
+# a hair past the wall, not the bare touch. Then we wait for the throwback.
+_CONFIRM_MARGIN = 0.002
+
+
 def mark_trades(ticker: str, price: float, now: float | None = None,
                 db_path: Path = DB_PATH) -> list[dict]:
-    """Mark-to-market, activate pending orders, auto-close on stop/target/expiry."""
+    """Mark-to-market, activate pending orders, auto-close on stop/target/expiry.
+
+    Breakout (pending) orders fill in **two phases** — the throwback model: first
+    price must clear the trigger by ``_CONFIRM_MARGIN`` (the break is real), then
+    it must pull *back* to the entry (the retest of the broken level) to fill.
+    We never chase the spike: a break that runs away without retesting is missed
+    (it expires unfilled), and a break that immediately collapses through the
+    stop is cancelled, not filled-then-stopped. This matches the live data — the
+    move to the wall is already spent, so the honest fill is the pullback."""
     if not price or price <= 0:
         return []
     now = now or time.time()
@@ -448,34 +568,54 @@ def mark_trades(ticker: str, price: float, now: float | None = None,
         (ticker,)
     ).fetchall()
     changed: list[dict] = []
+    dirty = False
     expiry_factor = 1.5
     stake_default = 1000.0
+
+    def _cancel(p: dict, pid: str, reason: str = "cancelled") -> None:
+        closed_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+        conn.execute(
+            """UPDATE trades SET status='closed', close_reason=?,
+               closed_ts=?, closed=? WHERE id=?""",
+            (reason, now, closed_str, pid))
+        p.update(status="closed", close_reason=reason, closed_ts=now, closed=closed_str)
+        changed.append(p)
 
     for row in rows:
         p = _row_to_trade(row)
         pid = p["id"]
         expiry_s = p["horizon_days"] * expiry_factor * 86400
+        stale = now - p["opened_ts"] > expiry_s
 
         if p["status"] == "pending":
-            fill_level = max(p["entry"], p.get("trigger") or 0)
-            if price >= fill_level:
-                new_shares = round(p.get("stake", stake_default) / fill_level, 4)
+            trigger = p.get("trigger") or p["entry"]
+            retest_entry = p["entry"]
+            confirm_level = trigger * (1 + _CONFIRM_MARGIN)
+
+            if not p.get("broke_out_ts"):
+                # Phase 1 — wait for a real break above the trigger.
+                if price >= confirm_level:
+                    conn.execute("UPDATE trades SET broke_out_ts=? WHERE id=?",
+                                 (now, pid))
+                    p["broke_out_ts"] = now
+                    dirty = True                 # internal sub-state, not a user toast
+                elif stale:
+                    _cancel(p, pid)              # break never came
+                continue
+
+            # Phase 2 — broke out; wait for the throwback to the entry (retest).
+            if price <= p["stop"]:
+                _cancel(p, pid)                  # broke out then failed — no fill
+            elif price <= retest_entry:
+                new_shares = round(p.get("stake", stake_default) / retest_entry, 4)
                 conn.execute(
                     """UPDATE trades SET status='open', activated_ts=?,
-                       entry=?, shares=? WHERE id=?""",
-                    (now, fill_level, new_shares, pid))
-                p.update(status="open", activated_ts=now, entry=fill_level,
-                         shares=new_shares)
+                       shares=? WHERE id=?""",
+                    (now, new_shares, pid))
+                p.update(status="open", activated_ts=now, shares=new_shares)
                 changed.append(p)
-            elif now - p["opened_ts"] > expiry_s:
-                closed_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
-                conn.execute(
-                    """UPDATE trades SET status='closed', close_reason='cancelled',
-                       closed_ts=?, closed=? WHERE id=?""",
-                    (now, closed_str, pid))
-                p.update(status="closed", close_reason="cancelled",
-                         closed_ts=now, closed=closed_str)
-                changed.append(p)
+            elif stale:
+                _cancel(p, pid)                  # ran away, never retested — missed
             continue
 
         ref_ts = p.get("activated_ts") or p["opened_ts"]
@@ -489,7 +629,7 @@ def mark_trades(ticker: str, price: float, now: float | None = None,
             _close_row(conn, p, price, "expired", now)
             changed.append(p)
 
-    if changed:
+    if changed or dirty:
         conn.commit()
     return changed
 
@@ -548,6 +688,62 @@ def trade_stats(db_path: Path = DB_PATH) -> dict:
         traders={k: _agg(v) for k, v in sorted(by_trader.items())},
         setups={k: _agg(v) for k, v in sorted(by_setup.items())},
         bands={k: _agg(v) for k, v in sorted(by_band.items())},
+    )
+
+
+def algorithm_correctness(db_path: Path = DB_PATH) -> dict:
+    """Judge the ALGORITHM's decisions, not the bots.
+
+    Collapse closed trades by ``cohort_id`` so every trader that acted on one
+    plan counts as a single idea (its outcome = mean P&L across the bots that
+    took it). This strips the sample inflation from the same idea being copied
+    across bot-GO/bot-70/bot-BRK/me, giving an honest, deduplicated read on
+    whether the engine's *calls* were right. Returns idea-level totals, the same
+    breakdowns by setup and score band as ``trade_stats``, and the idea list.
+    """
+    rows = _conn(db_path).execute(
+        "SELECT * FROM trades WHERE status='closed' AND close_reason != 'cancelled'"
+    ).fetchall()
+    closed = [_row_to_trade(r) for r in rows]
+    by_cohort: dict = {}
+    for p in closed:
+        by_cohort.setdefault(p.get("cohort_id") or p["id"], []).append(p)
+
+    ideas: list[dict] = []
+    for cid, trades in by_cohort.items():
+        pnls = [t["pnl_pct"] for t in trades]
+        idea_pnl = round(sum(pnls) / len(pnls), 2)
+        snap = trades[0].get("snapshot", {})
+        ideas.append(dict(
+            cohort_id=cid, ticker=trades[0]["ticker"],
+            setup=snap.get("setup", "?"), score=snap.get("score"),
+            band=_band(snap.get("score")), n_trades=len(trades),
+            traders=sorted({t["trader"] for t in trades}),
+            idea_pnl_pct=idea_pnl, win=idea_pnl > 0,
+            best_pnl_pct=round(max(pnls), 2), worst_pnl_pct=round(min(pnls), 2),
+        ))
+
+    def _agg_ideas(items: list[dict]) -> dict:
+        n = len(items)
+        wins = [i for i in items if i["win"]]
+        return dict(
+            n_ideas=n, n_trades=sum(i["n_trades"] for i in items),
+            wins=len(wins), losses=n - len(wins),
+            win_rate=(round(len(wins) / n * 100) if n else None),
+            avg_pnl_pct=(round(sum(i["idea_pnl_pct"] for i in items) / n, 2)
+                         if n else None),
+        )
+
+    by_setup: dict = {}
+    by_band: dict = {}
+    for i in ideas:
+        by_setup.setdefault(i["setup"], []).append(i)
+        by_band.setdefault(i["band"], []).append(i)
+    return dict(
+        totals=_agg_ideas(ideas),
+        setups={k: _agg_ideas(v) for k, v in sorted(by_setup.items())},
+        bands={k: _agg_ideas(v) for k, v in sorted(by_band.items())},
+        ideas=sorted(ideas, key=lambda i: i["idea_pnl_pct"]),
     )
 
 

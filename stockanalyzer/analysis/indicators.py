@@ -63,6 +63,33 @@ def bollinger(close: pd.Series, length: int = 20, mult: float = 2.0) -> pd.DataF
     return pd.DataFrame({"mid": mid, "upper": mid + mult * std, "lower": mid - mult * std})
 
 
+def adx(high: pd.Series, low: pd.Series, close: pd.Series,
+        length: int = 14) -> pd.DataFrame:
+    """Wilder's ADX / DMI — the canonical trend-strength + direction gauge.
+
+    `adx` measures how *strongly* price trends (not the direction): >25 trending,
+    <20 chop. `plus_di`/`minus_di` give the direction — +DI over −DI = buyers in
+    control. Together they answer the question the radar kept getting wrong: is
+    this a real trend to ride, a downtrend to avoid going long into, or chop to
+    skip? Uses Wilder's smoothing (the RSI/ATR convention already in this file).
+    """
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = ((up > down) & (up > 0)) * up.clip(lower=0.0)
+    minus_dm = ((down > up) & (down > 0)) * down.clip(lower=0.0)
+    tr = pd.concat(
+        [(high - low), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
+        axis=1).max(axis=1)
+    atr_w = tr.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / length, adjust=False,
+                                min_periods=length).mean() / atr_w.replace(0.0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=1 / length, adjust=False,
+                                  min_periods=length).mean() / atr_w.replace(0.0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
+    adx_line = dx.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    return pd.DataFrame({"adx": adx_line, "plus_di": plus_di, "minus_di": minus_di})
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Attach the standard indicator set used across the engine and charts."""
     out = df.copy()
@@ -76,4 +103,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     s = stochastic(df["high"], df["low"], df["close"])
     out[["stoch_k", "stoch_d"]] = s[["k", "d"]]
     out["atr"] = atr(df["high"], df["low"], df["close"], 14)
+    bb = bollinger(df["close"])                       # overextension / blowoff guard
+    out[["bb_mid", "bb_upper", "bb_lower"]] = bb[["mid", "upper", "lower"]]
+    dmi = adx(df["high"], df["low"], df["close"])      # trend strength + direction
+    out[["adx", "plus_di", "minus_di"]] = dmi[["adx", "plus_di", "minus_di"]]
     return out
