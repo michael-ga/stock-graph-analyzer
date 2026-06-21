@@ -72,6 +72,7 @@ again without materially more data:**
 | H2 | **The high-conviction layer is mis-calibrated (inverted).** 80+ score, high R:R, "engine bias agrees", "A-grade confluence" clustered on losers; snap_rr anti-predictive (winners R:R 1.38 vs losers 1.72; the 1.5–2.0 R:R band was worst). | Consistent across cuts, none significant. | **Watch only.** Do NOT re-weight yet. | When n≥100 ideas, split win-rate by score band and by R:R band; re-weight only if the inversion holds. |
 | H3 | **"Support test (uptrend)" is the real edge; with-trend > counter-trend.** | Support-test 6/6; Breakout(volume) 6/8; counter-trend Pullback/Momentum poor. | Watch only (n too small). | Track idea-level win-rate per setup over time. |
 | H4 | **The throwback/breakout model doesn't beat immediate entries.** | breakout_wait 9/15 (60%) vs immediate 8/13 (62%), but immediate captured ~2× profit/trade. | Watch only. | Compare idea-level avg_pnl breakout_wait vs immediate at larger n. |
+| H5 | **Active exit management beats a fixed stop/target** on identical Gap-and-Go entries. | None yet — instrumentation shipped 2026-06-21. | **Collecting.** Do NOT conclude until pairs accumulate. | `store.managed_vs_fixed()`: pair `bot-gap-mgd` vs `bot-gap-fixed` by `cohort_id`; positive mean Δ at n≥~30 pairs = management earns its place. |
 
 ---
 
@@ -129,3 +130,54 @@ guardrails that would be overfitting. Those wait for H2/H3 to accumulate data.
 **Next session, start here:** run `analyze.py`; if idea count has grown
 meaningfully (say ≥60), begin testing H2 (score/R:R calibration). Otherwise just
 keep logging and confirm the MACD veto (H1) isn't over-suppressing GOs.
+
+### 2026-06-21 — Gap-and-Go day-trade engine + adaptive radar + managed exits (H5)
+
+**What changed (code), all additive — baseline preserved:**
+1. **Adaptive radar CPU** (`app.py` `_radar_tier`/`_radar_panel`): the radar
+   fragment ticks every 5s but each ticker recomputes only when its tier is due
+   (HOT 5s · WATCH_CLOSE 10s · BUILDUP 25s · FAR 60s), so far-away buildups stop
+   burning CPU. Far buildups now cost ~1/12 of a hot name. No trade-logic change.
+2. **Gap-and-Go (Carter ORB) intraday rules:**
+   - New `stockanalyzer/session.py` ET clock: opening-range freeze (first 15 min,
+     **no entries**), the 9:45–11:30 entry window, the Friday flatten cutoff.
+   - Radar escalates to WATCH_CLOSE/HOT toward the opening-range HIGH **only** for
+     a real **gap-up** (open > prev close +2%) **inside the morning window**;
+     non-gappers/afternoon fall back to swing tiering.
+   - **Volume confirmation**: `swing.py` `go` now requires RVOL > **1.5** for
+     *breakout* setups (scoped so it doesn't suppress quiet pullback/support buys
+     — preserves the H1 buy-the-dip lesson). Gap-and-Go entry needs RVOL > 1.5 too.
+3. **Managed exits, MEASURED (H5):** two new bots take the *same* ORB entry
+   (hard stop just below the opening-range LOW, 2R target, shared `cohort_id`):
+   - `bot-gap-fixed` — fixed stop/target control.
+   - `bot-gap-mgd` — (a) cautious protective stop: spread-adjusted breakeven at
+     +1R then trail the tighter of 3×ATR chandelier and 5-min EMA8, **ratchet-only**;
+     (b) smart trend-flip: a flip (conf ≥0.6) or a 5-min close below EMA8 *tightens*
+     the stop to test the move (never market-dumps a winner on one noisy bar);
+     plus a Friday weekend-flat. Applied in `store.manage_trades` (managed rows
+     only) — `mark_trades` and the existing bots are untouched.
+4. **Risk realism:** `_SPREAD_PER_SHARE = 0.02` (flat $/share) — breakeven =
+   entry + $0.02; managed closes and `_cost_basis_block` deduct the flat per-share
+   spread (baseline `_close_row` default `spread=0.0`, byte-identical).
+5. **Schema v5**: `init_stop, mfe_pct, mae_pct, stop_moves, managed, entry_rvol,
+   hold_weekend` + `trade_events`. `algorithm_correctness` now filters `managed=0`
+   so the idea-level baseline is unchanged. `store.managed_vs_fixed()` + an
+   `analyze.py` section + an app panel surface the paired comparison.
+
+**Assumption challenged:** the naive "plan.go needs RVOL>1.5" would have suppressed
+textbook low-volume pullback buys (pullbacks trade quiet) — re-derives the H1
+mistake in volume form. The volume gate is now **scoped by setup type**, not blanket:
+breakout / gap-and-go / momentum-gap need a **surge** (rvol > 1.5); pullbacks need
+**drying** volume (rvol < 1.0 = seller exhaustion, a *low*-volume pass, never blocked
+for being quiet); all other setups get no volume veto. Guards:
+`test_pullback_on_heavy_volume_is_not_go` + `test_clean_pullback_stays_go_with_strong_score`.
+
+**Measurement honesty:** the shared ORB entry rules reset the historical baseline,
+so pre/post comparisons across this change are invalid. The **only** clean read is
+the paired `managed_vs_fixed` (same entry, two exits). At today's n that is **zero
+pairs** — H5 is *collecting*, not concluded. No score re-weighting was done.
+
+**Next session, start here:** run `analyze.py` view 4 (MANAGED vs FIXED). If pairs
+≥~30 with a positive mean Δ, the management earns its place; if negative, inspect
+which rule (over-tight trail? premature trend-test?) is bleeding the edge before
+touching thresholds in `manage.py`.

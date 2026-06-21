@@ -21,7 +21,7 @@ from pathlib import Path
 _DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "trades.db"
 DB_PATH = (Path(os.environ["STOCKANALYZER_DB"])
            if os.environ.get("STOCKANALYZER_DB") else _DEFAULT_DB_PATH)
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _connections: dict[str, sqlite3.Connection] = {}
 
@@ -180,6 +180,20 @@ CREATE TABLE IF NOT EXISTS paper_trades (
 );
 CREATE INDEX IF NOT EXISTS idx_pt_ticker ON paper_trades(ticker);
 CREATE INDEX IF NOT EXISTS idx_pt_status ON paper_trades(status);
+
+CREATE TABLE IF NOT EXISTS trade_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id  TEXT NOT NULL REFERENCES trades(id),
+    ts        REAL NOT NULL,
+    kind      TEXT NOT NULL,      -- move_stop_breakeven | trail_stop |
+                                  -- trend_test_tighten | weekend_flat
+    detail    TEXT,
+    price     REAL,
+    old_stop  REAL,
+    new_stop  REAL,
+    fraction  REAL
+);
+CREATE INDEX IF NOT EXISTS idx_tevt_trade ON trade_events(trade_id);
 """
 
 
@@ -232,6 +246,34 @@ def _ensure_schema(conn: sqlite3.Connection, db_path: Path) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_cohort ON trades(cohort_id)")
         conn.execute("INSERT OR REPLACE INTO schema_version VALUES (?, ?)",
                      (4, time.strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+    if current < 5:
+        # v5: managed Gap-and-Go A/B. `bot-gap-mgd` and `bot-gap-fixed` take the
+        # same ORB entry (shared cohort_id) but differ in exit policy, so
+        # `managed_vs_fixed` isolates whether the management is smarter.
+        #   init_stop  — original 1R risk (so trailing never shrinks the R math)
+        #   mfe/mae    — best/worst excursion (how much was left on the table)
+        #   stop_moves — how many times the stop ratcheted
+        #   managed    — 1 for the managed variant
+        #   entry_rvol — relative volume at the breakout (post-mortem)
+        #   hold_weekend — opt-out of the Friday flatten
+        tcols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        for col, ddl in (
+            ("init_stop",   "ALTER TABLE trades ADD COLUMN init_stop REAL"),
+            ("mfe_pct",     "ALTER TABLE trades ADD COLUMN mfe_pct REAL DEFAULT 0.0"),
+            ("mae_pct",     "ALTER TABLE trades ADD COLUMN mae_pct REAL DEFAULT 0.0"),
+            ("stop_moves",  "ALTER TABLE trades ADD COLUMN stop_moves INTEGER DEFAULT 0"),
+            ("managed",     "ALTER TABLE trades ADD COLUMN managed INTEGER DEFAULT 0"),
+            ("entry_rvol",  "ALTER TABLE trades ADD COLUMN entry_rvol REAL"),
+            ("hold_weekend","ALTER TABLE trades ADD COLUMN hold_weekend INTEGER DEFAULT 0"),
+        ):
+            if col not in tcols:
+                conn.execute(ddl)
+        # existing rows: original stop == current stop (no management yet).
+        conn.execute("UPDATE trades SET init_stop=stop WHERE init_stop IS NULL")
+        conn.commit()
+        conn.execute("INSERT OR REPLACE INTO schema_version VALUES (?, ?)",
+                     (5, time.strftime("%Y-%m-%d %H:%M:%S")))
         conn.commit()
 
 
@@ -407,6 +449,18 @@ def has_open_trade(ticker: str, trader: str, db_path: Path = DB_PATH) -> bool:
     return row is not None
 
 
+def has_any_open(ticker: str, db_path: Path = DB_PATH) -> bool:
+    """True if ANY trader holds an open/pending position in this ticker.
+
+    Lets the radar promote a ticker we already hold to the fastest tier without
+    four per-bot queries."""
+    row = _conn(db_path).execute(
+        "SELECT 1 FROM trades WHERE ticker=? AND status IN ('open','pending') LIMIT 1",
+        (ticker.upper(),)
+    ).fetchone()
+    return row is not None
+
+
 def insert_trade(trade: dict, context: dict | None = None,
                  db_path: Path = DB_PATH) -> dict:
     """Insert a trade and its full decision context into the DB."""
@@ -425,8 +479,9 @@ def insert_trade(trade: dict, context: dict | None = None,
             shares, horizon_days, snap_score, snap_label, snap_setup,
             snap_kind, snap_rr, snap_daily_atr_pct, snap_guidance,
             snap_go_score, snap_light_color, snap_preset, snap_bullish_pct,
-            snap_manual_levels, cohort_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            snap_manual_levels, cohort_id,
+            managed, init_stop, entry_rvol, hold_weekend)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (trade["id"], trade["ticker"], trade["trader"], trade["status"],
          trade["kind"], trade["opened_ts"], trade["opened"],
          trade.get("activated_ts"), trade["entry"], trade["stop"],
@@ -438,7 +493,10 @@ def insert_trade(trade: dict, context: dict | None = None,
          snap.get("guidance"),
          rec_data.get("go_score"), rec_data.get("light_color"),
          rec_data.get("preset"), rec_data.get("bullish_pct"),
-         int(snap.get("manual_levels", False)), cohort))
+         int(snap.get("manual_levels", False)), cohort,
+         int(trade.get("managed", False)),
+         round(float(trade.get("init_stop") or trade["stop"]), 4),
+         trade.get("entry_rvol"), int(trade.get("hold_weekend", False))))
 
     tid = trade["id"]
 
@@ -635,9 +693,13 @@ def mark_trades(ticker: str, price: float, now: float | None = None,
 
 
 def _close_row(conn: sqlite3.Connection, p: dict, exit_price: float,
-               reason: str, now: float) -> None:
-    pnl_pct = round((exit_price / p["entry"] - 1) * 100, 2)
-    pnl_usd = round((exit_price - p["entry"]) * p["shares"], 2)
+               reason: str, now: float, spread: float = 0.0) -> None:
+    # spread is a flat per-SHARE cost (managed Gap-and-Go closes) deducted from the
+    # exit so realized P&L is friction-honest; the default 0.0 keeps the baseline
+    # byte-identical.
+    eff_exit = exit_price - spread
+    pnl_pct = round((eff_exit / p["entry"] - 1) * 100, 2)
+    pnl_usd = round((eff_exit - p["entry"]) * p["shares"], 2)
     closed_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
     conn.execute(
         """UPDATE trades SET status='closed', exit_price=?, close_reason=?,
@@ -646,6 +708,98 @@ def _close_row(conn: sqlite3.Connection, p: dict, exit_price: float,
     p.update(status="closed", exit_price=round(exit_price, 4),
              close_reason=reason, closed_ts=now, closed=closed_str,
              pnl_pct=pnl_pct, pnl_usd=pnl_usd)
+
+
+# ── active position management (managed bots only) ──────────────────────────── #
+
+def _log_event(conn: sqlite3.Connection, trade_id: str, ts: float, kind: str,
+               detail: str | None, price: float | None,
+               old_stop: float | None, new_stop: float | None,
+               fraction: float | None) -> None:
+    conn.execute(
+        """INSERT INTO trade_events
+           (trade_id, ts, kind, detail, price, old_stop, new_stop, fraction)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (trade_id, ts, kind, detail, price, old_stop, new_stop, fraction))
+
+
+def _update_excursions(conn: sqlite3.Connection, p: dict, price: float) -> None:
+    """Track max favorable / adverse excursion (% from entry) on an open row."""
+    entry = p.get("entry")
+    if not entry:
+        return
+    fav = round((price / entry - 1) * 100, 2)
+    cur_mfe = p.get("mfe_pct") or 0.0
+    cur_mae = p.get("mae_pct") or 0.0
+    new_mfe, new_mae = max(cur_mfe, fav), min(cur_mae, fav)
+    if new_mfe != cur_mfe or new_mae != cur_mae:
+        conn.execute("UPDATE trades SET mfe_pct=?, mae_pct=? WHERE id=?",
+                     (new_mfe, new_mae, p["id"]))
+        p["mfe_pct"], p["mae_pct"] = new_mfe, new_mae
+
+
+def _friday_flat_now(now: float) -> bool:
+    try:
+        import pandas as pd
+
+        from .. import session
+        return session.is_friday_flat(pd.Timestamp(now, unit="s", tz="UTC"))
+    except Exception:
+        return False
+
+
+def manage_trades(ticker: str, price: float, reports=None, trend_change=None,
+                  now: float | None = None, friday_flat: bool | None = None,
+                  db_path: Path = DB_PATH) -> list[dict]:
+    """Apply best-practice exit management to MANAGED open positions only.
+
+    Ratchets stops in-place (never widens), logs each action to ``trade_events``,
+    tracks MFE/MAE, and flattens day-trades into the Friday close. Closing on a
+    tightened stop still happens via ``mark_trades`` on the next tick — call this
+    BEFORE ``mark_trades`` so a fresh tighten can trigger the close same-tick.
+    """
+    if not price or price <= 0:
+        return []
+    now = now or time.time()
+    if friday_flat is None:
+        friday_flat = _friday_flat_now(now)
+    ticker = ticker.upper()
+    conn = _conn(db_path)
+    rows = conn.execute(
+        "SELECT * FROM trades WHERE ticker=? AND status='open' AND managed=1",
+        (ticker,)).fetchall()
+    if not rows:
+        return []
+
+    from ..manage import assess_position, intraday_readout, _SPREAD_PER_SHARE
+    ema8, iclose = intraday_readout(reports)
+    changed: list[dict] = []
+    for row in rows:
+        p = _row_to_trade(row)
+        _update_excursions(conn, p, price)
+        actions = assess_position(
+            p, price, reports, None, trend_change, now,
+            ema8_5m=ema8, intraday_close=iclose, is_friday_flat=friday_flat,
+            hold_weekend=bool(p.get("hold_weekend")))
+        for a in actions:
+            if a.kind == "weekend_flat":
+                _close_row(conn, p, price, "weekend_flat", now,
+                           spread=_SPREAD_PER_SHARE)
+                _log_event(conn, p["id"], now, a.kind, a.reason, price,
+                           p["stop"], None, a.fraction)
+                changed.append(p)
+                break
+            if a.new_stop is not None and a.new_stop > p["stop"]:
+                old = p["stop"]
+                conn.execute(
+                    "UPDATE trades SET stop=?, stop_moves=COALESCE(stop_moves,0)+1 "
+                    "WHERE id=?", (round(a.new_stop, 4), p["id"]))
+                _log_event(conn, p["id"], now, a.kind, a.reason, price,
+                           old, round(a.new_stop, 4), None)
+                p["stop"] = round(a.new_stop, 4)
+                changed.append(dict(p))
+    conn.commit()
+    return changed
 
 
 # ── trade analytics ───────────────────────────────────────────────────────── #
@@ -702,7 +856,8 @@ def algorithm_correctness(db_path: Path = DB_PATH) -> dict:
     breakdowns by setup and score band as ``trade_stats``, and the idea list.
     """
     rows = _conn(db_path).execute(
-        "SELECT * FROM trades WHERE status='closed' AND close_reason != 'cancelled'"
+        "SELECT * FROM trades WHERE status='closed' AND close_reason != 'cancelled' "
+        "AND COALESCE(managed, 0) = 0"
     ).fetchall()
     closed = [_row_to_trade(r) for r in rows]
     by_cohort: dict = {}
@@ -744,6 +899,50 @@ def algorithm_correctness(db_path: Path = DB_PATH) -> dict:
         setups={k: _agg_ideas(v) for k, v in sorted(by_setup.items())},
         bands={k: _agg_ideas(v) for k, v in sorted(by_band.items())},
         ideas=sorted(ideas, key=lambda i: i["idea_pnl_pct"]),
+    )
+
+
+def managed_vs_fixed(db_path: Path = DB_PATH) -> dict:
+    """Paired A/B: does the managed Gap-and-Go exit beat the fixed-exit control?
+
+    ``bot-gap-mgd`` and ``bot-gap-fixed`` take the SAME entry (shared
+    ``cohort_id``), so pairing on the cohort isolates the exit policy. Returns the
+    mean P&L delta (managed − fixed), each side's win rate, and management
+    telemetry (avg stop moves, mean MFE captured) over the matched pairs.
+    """
+    rows = _conn(db_path).execute(
+        "SELECT * FROM trades WHERE status='closed' AND close_reason != 'cancelled' "
+        "AND trader IN ('bot-gap-mgd', 'bot-gap-fixed')"
+    ).fetchall()
+    by_cohort: dict = {}
+    for r in (_row_to_trade(x) for x in rows):
+        by_cohort.setdefault(r.get("cohort_id") or r["id"], {})[r["trader"]] = r
+
+    pairs: list[dict] = []
+    for cid, d in by_cohort.items():
+        m, f = d.get("bot-gap-mgd"), d.get("bot-gap-fixed")
+        if not (m and f):
+            continue
+        pairs.append(dict(
+            cohort_id=cid, ticker=m["ticker"],
+            mgd_pnl_pct=m["pnl_pct"], fixed_pnl_pct=f["pnl_pct"],
+            delta_pct=round(m["pnl_pct"] - f["pnl_pct"], 2),
+            stop_moves=m.get("stop_moves") or 0, mfe_pct=m.get("mfe_pct") or 0.0,
+            mgd_reason=m.get("close_reason"), fixed_reason=f.get("close_reason")))
+
+    n = len(pairs)
+    if not n:
+        return dict(n_pairs=0, mean_delta_pct=None, mgd_win_rate=None,
+                    fixed_win_rate=None, avg_stop_moves=None, mean_mfe_pct=None,
+                    pairs=[])
+    return dict(
+        n_pairs=n,
+        mean_delta_pct=round(sum(p["delta_pct"] for p in pairs) / n, 2),
+        mgd_win_rate=round(sum(1 for p in pairs if p["mgd_pnl_pct"] > 0) / n * 100),
+        fixed_win_rate=round(sum(1 for p in pairs if p["fixed_pnl_pct"] > 0) / n * 100),
+        avg_stop_moves=round(sum(p["stop_moves"] for p in pairs) / n, 2),
+        mean_mfe_pct=round(sum(p["mfe_pct"] for p in pairs) / n, 2),
+        pairs=sorted(pairs, key=lambda p: p["delta_pct"]),
     )
 
 

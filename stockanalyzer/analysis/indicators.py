@@ -90,12 +90,31 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series,
     return pd.DataFrame({"adx": adx_line, "plus_di": plus_di, "minus_di": minus_di})
 
 
+def relative_volume(df: pd.DataFrame, length: int = 20) -> float | None:
+    """Current bar's volume ÷ trailing average volume (RVOL).
+
+    The breakout-confirmation gauge: RVOL > 1 means the latest bar traded above
+    its recent norm — the volume surge that separates a real break from a drift.
+    Returns ``None`` when volume is missing or there's too little history to judge.
+    """
+    if df is None or "volume" not in df or len(df) < length:
+        return None
+    vol = df["volume"].dropna()
+    if len(vol) < length:
+        return None
+    avg = float(vol.tail(length).mean())
+    if avg <= 0:
+        return None
+    return float(vol.iloc[-1] / avg)
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Attach the standard indicator set used across the engine and charts."""
     out = df.copy()
     out["sma20"] = sma(df["close"], 20)
     out["sma50"] = sma(df["close"], 50)
     out["sma200"] = sma(df["close"], 200)
+    out["ema8"] = ema(df["close"], 8)                 # fast intraday trail reference
     out["ema20"] = ema(df["close"], 20)
     out["rsi"] = rsi(df["close"], 14)
     m = macd(df["close"])
