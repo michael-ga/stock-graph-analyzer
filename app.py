@@ -16,16 +16,21 @@ import os
 import threading
 import time
 
+import pandas as pd
 import plotly.graph_objects as go
 from dotenv import load_dotenv
 
 import streamlit as st
 
-from stockanalyzer import papertrade, swingwatch, virtualbook, watchlist
+from stockanalyzer import papertrade, session, swingwatch, virtualbook, watchlist
+from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
 from stockanalyzer.analysis.engine import CATEGORY_WEIGHTS, analyze_timeframe
+from stockanalyzer.analysis.indicators import relative_volume
 from stockanalyzer.explain.swing import _MIN_RR, build_swing_plan
+from stockanalyzer.manage import _SPREAD_PER_SHARE
 from stockanalyzer.analysis.signals import Direction
 from stockanalyzer.charting import candlestick_figure
+from stockanalyzer.data.market_session import _to_et
 from stockanalyzer.data.realtime import RealtimeStream, summarize, ticks_to_candles
 from stockanalyzer.data.schema import Timeframe
 from stockanalyzer.explain import UseCase, build_recommendation, timeframe_caption
@@ -95,6 +100,18 @@ def _run(ticker: str, prefer: str | None):
     return analyze_ticker(ticker, prefer=prefer)
 
 
+@st.cache_data(show_spinner=False, ttl=60)
+def _run_fast(ticker: str, prefer: str | None):
+    """Fast partial load: short timeframes only, no fundamentals. Powers the price
+    header + day-trader card so they paint in ~1 fetch while the full
+    multi-timeframe analysis (charts, fundamentals, sentiment) loads after. The
+    short frames it fetches warm the on-disk cache, so the later full `_run`
+    only pays for the longer ranges + Finnhub."""
+    return analyze_ticker(
+        ticker, timeframes=[Timeframe.D1, Timeframe.D5, Timeframe.M1],
+        prefer=prefer, include_fundamentals=False)
+
+
 def _badge(direction: Direction) -> str:
     return f"{_DIR_EMOJI[direction]} {direction.value}"
 
@@ -161,24 +178,40 @@ def main() -> None:
         return
 
     ticker = ss.ticker
-    with st.spinner(f"Analyzing {ticker}…"):
-        result = _run(ticker, None if prefer == "auto" else prefer)
+    prefer_arg = None if prefer == "auto" else prefer
 
-    if not result.reports:
-        st.error(f"Couldn't find data for '{ticker}'. Check the symbol. ({result.errors})")
+    # --- Fast path: short frames only, no fundamentals → the price header and
+    #     day-trader card paint immediately (Streamlit streams elements as they're
+    #     created), so the user gets an actionable snapshot before the heavy
+    #     multi-timeframe + fundamentals load finishes below.
+    with st.spinner(f"Loading {ticker} snapshot…"):
+        fast = _run_fast(ticker, prefer_arg)
+
+    if not fast.reports:
+        st.error(f"Couldn't find data for '{ticker}'. Check the symbol. ({fast.errors})")
         return
 
-    if prefer == "twelvedata" and result.provider != "twelvedata":
+    if prefer == "twelvedata" and fast.provider != "twelvedata":
         st.info("ℹ️ TWELVEDATA_KEY isn't set — using free yfinance data instead. "
                 "(Add the key to .env to use Twelve Data.)")
 
-    # Live mode takes over the whole page with a 1-second real-time dashboard.
+    _price_header(fast)
+    _extended_alert(fast)
+    _day_trader_card(fast)
+
+    # Live mode renders the real-time dashboard *below* the card. It needs the full
+    # context (sentiment, company, multi-timeframe verdict), so load that, then hand off.
     if live_on and RealtimeStream(ticker).available:
+        with st.spinner("Loading analysis context…"):
+            result = _run(ticker, prefer_arg)
         _live_dashboard(ticker, prefer, usecase, strategy, pace, buy_price, result)
         return
 
-    _price_header(result)
-    _extended_alert(result)
+    # --- Full path: every timeframe + fundamentals → recommendation, company,
+    #     signals, charts. Loads after the snapshot above is already on screen.
+    with st.spinner(f"Loading full analysis for {ticker}…"):
+        result = _run(ticker, prefer_arg)
+
     # Recompute the verdict for the chosen strategy (swing weights short timeframes).
     sent = result.sentiment.score if (result.sentiment and result.sentiment.available) else None
     verdict = build_verdict(result.reports, sent, strategy, pace)
@@ -436,6 +469,148 @@ def _is_extended(p) -> bool:
     return bool(es and (es.extended or "distribution_risk" in es.flags))
 
 
+# --------------------------------------------------------------------------- #
+# Gap-and-Go (opening-range breakout) — Carter-style intraday rules.
+# --------------------------------------------------------------------------- #
+_GAP_MIN_PCT       = 0.02      # ORB only for a real gap-up: open > prev_close +2%
+_OPENING_RANGE_MIN = 15        # opening range = first 15 minutes (9:30–9:45 ET)
+_MIN_BREAKOUT_RVOL = 1.5       # breakout needs volume > 1.5× average
+_ORB_STOP_BUFFER   = 0.001     # hard stop = OR-Low × (1 − 0.1%)
+_ORB_TARGET_R      = 2.0       # target = entry + 2R
+
+# Radar tiers → recompute cadence (seconds). Base fragment tick = 5s, so a far
+# buildup recomputes ~1/12 as often as a hot name — CPU spent where it matters.
+_RADAR_TIERS = {"HOT": 5, "WATCH_CLOSE": 10, "BUILDUP": 25, "PAUSED": 10, "FAR": 60}
+
+
+def _radar_tier(plan, price, has_open: bool, phase: str, orange, orb_window: bool) -> str:
+    """Cadence + state for one radar ticker. Gap-and-Go aware:
+       opening_range -> PAUSED (range forming, NO entries); a GAP-UP inside the
+       9:45–11:30 window -> escalate toward the OR-High breakout; everything else
+       -> standard swing-score tiering."""
+    if has_open:
+        return "HOT"                              # always babysit an open position
+    if phase in ("premarket", "closed"):
+        return "FAR"
+    if phase == "opening_range":
+        return "PAUSED"                           # 9:30–9:45 ET: no entries
+    # --- ORB branch: ONLY for a real gap-up, ONLY in the morning window ---
+    if (orb_window and orange and orange.get("gap_up")
+            and price and plan is not None):
+        or_high = orange["high"]
+        band = max(0.015, 0.6 * (plan.daily_atr_pct / 100.0))
+        dist = or_high / price - 1                # >0 = still below the breakout
+        if price >= or_high:
+            return "HOT"                          # broke OR-High (entry still needs vol)
+        if 0 <= dist <= band:
+            return "WATCH_CLOSE"
+        if 0 <= dist <= 2 * band:
+            return "BUILDUP"
+        return "FAR"
+    # --- fallback: standard swing-score tiering (non-gappers / afternoon) ---
+    if plan is None:
+        return "FAR"
+    if plan.go:
+        return "HOT"
+    band = max(0.015, 0.6 * (plan.daily_atr_pct / 100.0))
+    trig_near = (plan.kind == "breakout_wait" and plan.trigger and price
+                 and 0 <= plan.trigger / price - 1 <= band)
+    near_rung = any(0 < (lv - plan.score) <= 3 for lv in swingwatch.LEVELS)
+    if trig_near or near_rung:
+        return "WATCH_CLOSE"
+    if plan.light == "forming" or plan.kind == "breakout_wait":
+        return "BUILDUP"
+    return "FAR"
+
+
+def _opening_range(tk: str, res) -> dict | None:
+    """Cache the first-15-min High/Low + gap for a ticker, once per trading day.
+
+    Returns ``None`` until the opening range is complete (or when there's no
+    intraday data). Keyed by ET date in ``ss.opening_range`` so it resets daily.
+    """
+    if res is None:
+        return None
+    ss = st.session_state
+    ss.setdefault("opening_range", {})
+    ts = session.now_et()
+    day = ts.strftime("%Y-%m-%d")
+    cur = ss.opening_range.get(tk)
+    if cur and cur.get("day") == day:
+        return cur
+    if session.market_phase(ts) in ("opening_range", "premarket", "closed"):
+        return None                               # range not finished yet
+    df = _intraday_frame(getattr(res, "reports", None))
+    if df is None or not isinstance(df.index, pd.DatetimeIndex) or df.empty:
+        return None
+    try:
+        from stockanalyzer.analysis.daycard import _session_bars
+        sess = _session_bars(df)
+        hhmm = [_to_et(t).strftime("%H:%M") for t in sess.index]
+        win = sess[["09:30" <= t < "09:45" for t in hhmm]]
+        if win.empty:
+            return None
+        prev_close = res.quote.prev_close if (res.quote and res.quote.prev_close) else None
+        today_open = float(sess["open"].iloc[0])
+        gap_pct = (today_open / prev_close - 1) if (prev_close and today_open) else None
+        rng = {"day": day, "open": today_open,
+               "high": float(win["high"].max()), "low": float(win["low"].min()),
+               "gap_pct": gap_pct,
+               "gap_up": gap_pct is not None and gap_pct >= _GAP_MIN_PCT}
+    except Exception:
+        return None
+    ss.opening_range[tk] = rng
+    return rng
+
+
+def _gap_snapshot(tk: str, orange: dict, rvol: float | None,
+                  entry: float, stop: float, target: float) -> dict:
+    """Minimal decision snapshot for a Gap-and-Go trade. The shared setup/kind +
+    identical entry/stop/target make ``bot-gap-mgd`` and ``bot-gap-fixed`` collapse
+    to one ``cohort_id`` (the A/B pairing)."""
+    rr = round((target - entry) / (entry - stop), 1) if entry > stop else _ORB_TARGET_R
+    return dict(
+        setup="gap_and_go_orb", kind="immediate", score=None, label="Gap-and-Go",
+        rr=rr, daily_atr_pct=None,
+        guidance=(f"ORB break of ${orange['high']:.2f} on "
+                  f"{(rvol or 0):.1f}×vol — hard stop below OR-low ${orange['low']:.2f}, "
+                  f"target ${target:.2f} (2R)."))
+
+
+def _run_gap_bots(tk: str, reports, orange: dict | None, price: float | None) -> None:
+    """Open the Gap-and-Go pair when the ORB rules line up: a real gap-up, inside
+    the 9:45–11:30 window, price breaking the opening-range HIGH on >1.5× volume.
+    Hard stop sits just below the opening-range LOW (Carter's ORB rule)."""
+    if not (orange and orange.get("gap_up") and price and reports):
+        return
+    if not session.is_orb_window():
+        return
+    if price < orange["high"]:                    # not broken out yet
+        return
+    df = _intraday_frame(reports)
+    rvol = relative_volume(df) if df is not None else None
+    if rvol is not None and rvol <= _MIN_BREAKOUT_RVOL:
+        return                                    # break without volume — invalid
+    entry = float(price)
+    init_stop = round(orange["low"] * (1 - _ORB_STOP_BUFFER), 4)
+    if init_stop >= entry:                        # degenerate geometry — skip
+        return
+    target = round(entry + _ORB_TARGET_R * (entry - init_stop), 4)
+    snap = _gap_snapshot(tk, orange, rvol, entry, init_stop, target)
+    for trader, managed in (("bot-gap-fixed", False), ("bot-gap-mgd", True)):
+        try:
+            if not virtualbook.has_open(tk, trader):
+                virtualbook.open_position(
+                    ticker=tk, trader=trader, entry=entry, stop=init_stop,
+                    target=target, kind="immediate", horizon_days=1,
+                    managed=managed, entry_rvol=rvol, init_stop=init_stop,
+                    snapshot=snap)
+                st.toast(f"🚀 {trader} opened Gap-and-Go {tk} @ ${entry:.2f} "
+                         f"(stop ${init_stop:.2f}, {(rvol or 0):.1f}×vol)", icon="🚀")
+        except Exception:
+            pass
+
+
 _BOTS = (
     # (name, condition, uses pending trigger)  — contrasting strategies so the
     # data shows which rules actually make money.
@@ -448,14 +623,21 @@ _BOTS = (
 )
 
 
-def _run_bots(ticker: str, plan, reports=None, verdict=None, rec=None) -> None:
+def _run_bots(ticker: str, plan, reports=None, verdict=None, rec=None,
+              orange=None, price=None, phase=None) -> None:
     """Auto virtual-traders: each bot opens (at most one) position per ticker
     when its rule matches the current plan.
 
-    Every bot is gated on the plan's own verdict: a non-actionable plan, an
+    Every swing bot is gated on the plan's own verdict: a non-actionable plan, an
     extended/distribution emerging read — these are watch-only and never become
     a position. This is the chokepoint that stops the radar from buying the very
-    setups the engine flagged as bad (the SPCX/INTC/NOK class)."""
+    setups the engine flagged as bad (the SPCX/INTC/NOK class).
+
+    The Gap-and-Go bots have their own ORB entry logic (gap + window + OR-High
+    break + volume). No bot opens during the opening-range freeze (first 15 min)."""
+    if phase == "opening_range":
+        return                                    # 15-min freeze: no entries
+    _run_gap_bots(ticker, reports, orange, price)
     if not getattr(plan, "actionable", True) or _is_extended(plan):
         return
     for name, cond, _pending in _BOTS:
@@ -543,7 +725,11 @@ def _plan_brief(plan) -> tuple[str, str, str]:
     return ("#546e7a", "⚪ NO SETUP", "no clean setup right now")
 
 
-def _radar_card(tk: str, plan, res=None) -> None:
+_TIER_BADGE = {"HOT": "🔥 live", "WATCH_CLOSE": "👁 watch", "BUILDUP": "… building",
+               "PAUSED": "⏸ paused", "FAR": "💤 idle"}
+
+
+def _radar_card(tk: str, plan, res=None, tier: str | None = None) -> None:
     """One glance = one decision: ticker + live price/change on top, the state
     pill + score next, then trend / signal-ratio / volatility, then the action."""
     color, state, instr = _plan_brief(plan)
@@ -575,6 +761,8 @@ def _radar_card(tk: str, plan, res=None) -> None:
                        if s.name != "trend" and s.direction == Direction.BEAR)
             info_bits.append(f"signals 🟢{bull}·🔴{bear}")
     info_bits.append(f"vol {plan.daily_atr_pct:.1f}%/d")
+    if tier:
+        info_bits.append(_TIER_BADGE.get(tier, tier))
 
     st.markdown(
         f"<div style='background:{color}26;border:1px solid {color};border-radius:10px;"
@@ -595,65 +783,96 @@ def _radar_card(tk: str, plan, res=None) -> None:
 
 
 def _radar_panel(tracked: list[str]) -> None:
-    @st.fragment(run_every="10s")
+    @st.fragment(run_every="5s")
     def _radar():
         ss = st.session_state
         ss.setdefault("radar_levels", {})
+        ss.setdefault("radar_cache", {})     # tk -> {res, plan, orange, tier}
+        ss.setdefault("radar_due", {})        # tk -> next recompute epoch
+        now = time.time()
+        ts_et = session.now_et()
+        phase = session.market_phase(ts_et)
+        orb_window = session.is_orb_window(ts_et)
+
+        # Drop state for tickers no longer tracked (keep the dicts bounded).
+        for k in list(ss.radar_cache):
+            if k not in tracked:
+                ss.radar_cache.pop(k, None)
+                ss.radar_due.pop(k, None)
+
         head_l, head_r = st.columns([3, 1])
-        head_l.markdown("#### 📡 Swing radar — fast 1–3 day swings")
+        head_l.markdown("#### 📡 Swing radar — adaptive (Gap-and-Go aware)")
         sort_pct = head_r.toggle("Sort by %", value=True, key="radar_sort",
                                  help="Highest swing score first. Off = the order "
                                       "you added them.")
 
-        items: list[tuple[str, object, object]] = []
+        items: list[tuple] = []
         for tk in tracked:
-            try:
-                res = _run_quiet(tk)
-                plan = (_radar_plan(res, _quiet_sentiment(tk))
-                        if res.reports else None)
-            except Exception:
-                res, plan = None, None
-            items.append((tk, res, plan))
+            has_open = virtualbook.has_any_open(tk)
+            due = ss.radar_due.get(tk, 0) <= now
+            if due:                          # only recompute the heavy analysis when due
+                try:
+                    res = _run_quiet(tk)
+                    plan = (_radar_plan(res, _quiet_sentiment(tk))
+                            if res.reports else None)
+                except Exception:
+                    res, plan = None, None
+                orange = _opening_range(tk, res) if res is not None else None
+                price = res.quote.price if (res is not None and res.quote) else None
+                tier = _radar_tier(plan, price, has_open, phase, orange, orb_window)
+                ss.radar_cache[tk] = {"res": res, "plan": plan,
+                                      "orange": orange, "tier": tier}
+                ss.radar_due[tk] = now + _RADAR_TIERS.get(tier, 60)
+            cached = ss.radar_cache.get(tk) or {}
+            items.append((tk, cached.get("res"), cached.get("plan"),
+                          cached.get("tier", "FAR"), cached.get("orange"),
+                          has_open, due))
         if sort_pct:
             items.sort(key=lambda it: it[2].score if it[2] is not None else -1,
                        reverse=True)
 
         cols = st.columns(min(4, max(1, len(tracked))))
-        for i, (tk, res, plan) in enumerate(items):
+        for i, (tk, res, plan, tier, orange, has_open, due) in enumerate(items):
             with cols[i % len(cols)]:
                 if plan is None:
                     st.caption(f"{tk}: no data")
                     continue
-                fired = swingwatch.new_notice(ss.radar_levels.get(tk, 0), plan.score)
-                ss.radar_levels[tk] = swingwatch.notice_level(plan.score)
-                if fired:
-                    stored = papertrade.record(dict(
-                        ts=time.time(), date=time.strftime("%x %X"),
-                        ticker=tk, level=fired[0], score=plan.score,
-                        label=plan.score_label, kind=plan.kind, setup=plan.setup,
-                        entry=plan.entry, stop=plan.stop, target=plan.target1,
-                        rr=plan.rr, trigger=plan.trigger, horizon_days=3,
-                        guidance=plan.guidance, status="open", result_pct=0.0))
-                    note = " · 📒 recorded for paper trading" if stored else ""
-                    st.toast(f"📡 {tk}: {fired[1]} — {plan.guidance[:80]}{note}", icon="🔔")
-                # Virtual trading: bots act on the scan; positions mark to price.
-                _run_bots(tk, plan, reports=res.reports)
-                px = _quiet_price(tk)
-                if px:
-                    for chg in virtualbook.mark(tk, px):
-                        if chg["status"] == "closed":
-                            st.toast(f"💼 {chg['trader']} closed {tk}: "
-                                     f"{chg['close_reason']} ({chg['pnl_pct']:+.1f}%)",
-                                     icon="💼")
-                        else:
-                            st.toast(f"💼 {chg['trader']}'s breakout order filled in {tk}",
-                                     icon="🚀")
-                _radar_card(tk, plan, res)
-        st.caption("States, weakest → strongest: ⚪ NO SETUP → 🟡 BUILDUP (setup forming) "
-                   "→ 👀 WATCH CLOSE (buildup seen — wait for a close past the trigger) "
-                   "→ 🟢 GO (enter per the plan) · scans every ~2½ min, fast 1–3 day pace · "
-                   "🔔 = score reached 60 / 70 / 80%, toasted **and recorded as a "
-                   "paper-trade proposition** below.")
+                # Notices + trading only when we recomputed this tick, or when we
+                # already hold a position (babysit it every tick, any tier).
+                if due or has_open:
+                    fired = swingwatch.new_notice(ss.radar_levels.get(tk, 0), plan.score)
+                    ss.radar_levels[tk] = swingwatch.notice_level(plan.score)
+                    if fired:
+                        stored = papertrade.record(dict(
+                            ts=time.time(), date=time.strftime("%x %X"),
+                            ticker=tk, level=fired[0], score=plan.score,
+                            label=plan.score_label, kind=plan.kind, setup=plan.setup,
+                            entry=plan.entry, stop=plan.stop, target=plan.target1,
+                            rr=plan.rr, trigger=plan.trigger, horizon_days=3,
+                            guidance=plan.guidance, status="open", result_pct=0.0))
+                        note = " · 📒 recorded for paper trading" if stored else ""
+                        st.toast(f"📡 {tk}: {fired[1]} — {plan.guidance[:80]}{note}", icon="🔔")
+                    px = _quiet_price(tk)
+                    reports = res.reports if res is not None else None
+                    _run_bots(tk, plan, reports=reports, orange=orange,
+                              price=px, phase=phase)
+                    if px:
+                        dec = _radar_decision_rep(res) if res is not None else None
+                        tc = getattr(dec, "trend_change", None)
+                        virtualbook.manage(tk, px, reports, tc)   # before mark
+                        for chg in virtualbook.mark(tk, px):
+                            if chg["status"] == "closed":
+                                st.toast(f"💼 {chg['trader']} closed {tk}: "
+                                         f"{chg['close_reason']} ({chg['pnl_pct']:+.1f}%)",
+                                         icon="💼")
+                            else:
+                                st.toast(f"💼 {chg['trader']}'s breakout order filled in {tk}",
+                                         icon="🚀")
+                _radar_card(tk, plan, res, tier=tier)
+        st.caption("Adaptive scan — imminent setups refresh ~5–10s, far buildups ~60s "
+                   "(saves CPU). First 15 min after the open = ⏸ PAUSED, no entries. "
+                   "States: ⚪ NO SETUP → 🟡 BUILDUP → 👀 WATCH CLOSE → 🟢 GO · "
+                   "🔔 = score reached 60 / 70 / 80%.")
 
     _radar()
     _journal_panel()
@@ -999,6 +1218,28 @@ def _portfolio_panel() -> None:
                 except Exception:
                     pass
 
+                # Managed vs fixed — is the Gap-and-Go bot SMARTER? Paired on the
+                # same ORB entry (shared cohort_id), so this isolates the exit
+                # policy: breakeven/EMA8-trail/test-don't-dump vs fixed stop/target.
+                try:
+                    ab = virtualbook.managed_vs_fixed()
+                    if ab["n_pairs"]:
+                        delta = ab["mean_delta_pct"]
+                        st.markdown(
+                            f"**🤖 Managed vs fixed (Gap-and-Go)** — {ab['n_pairs']} "
+                            f"matched pair(s) · mean Δ **{delta:+.2f}%** "
+                            f"(managed − fixed) · win% mgd **{ab['mgd_win_rate']}%** "
+                            f"vs fixed **{ab['fixed_win_rate']}%** · avg "
+                            f"{ab['avg_stop_moves']} stop-moves · mean MFE "
+                            f"{ab['mean_mfe_pct']:+.2f}%")
+                        verdict = ("smarter ✅" if delta > 0 else
+                                   "not yet better ⚠️" if delta < 0 else "even")
+                        st.caption(f"Management looks **{verdict}** on this sample. "
+                                   "Small n — collect more before concluding "
+                                   "(see algolab/LEARNINGS.md H5).")
+                except Exception:
+                    pass
+
                 hist = [p for p in book if p["status"] == "closed"]
                 st.markdown(f"**Trade history ({len(hist)})**")
                 h_rows = [{
@@ -1126,6 +1367,121 @@ def _extended_alert(result) -> None:
             return
 
 
+def _day_trader_card(result) -> None:
+    """⚡ Focused day-trader snapshot for a quick action decision: today's range,
+    buyer/seller battle zones, the intraday bull/bear split, and the nearest
+    resistance target. Built from frames already fetched, so it renders instantly."""
+    price = result.quote.price if result.quote else None
+    card = build_day_card(result.reports, price)
+    if card is None:
+        return
+
+    with st.container(border=True):
+        head_l, head_r = st.columns([3, 1.5])
+        head_l.markdown("### ⚡ Day-trader card")
+        if card.day_change_pct is not None:
+            up = card.day_change_pct >= 0
+            c, arrow = ("#1b9e3e", "▲") if up else ("#e53935", "▼")
+            head_r.markdown(
+                f"<div style='text-align:right'>"
+                f"<span style='font-size:1.4em;font-weight:700'>${card.current_price:,.2f}</span><br>"
+                f"<span style='color:{c};font-weight:600'>{arrow} {card.day_change_pct:+.2f}% "
+                f"<span style='color:gray;font-size:0.8em'>since open</span></span></div>",
+                unsafe_allow_html=True)
+        else:
+            head_r.markdown(f"<div style='text-align:right;font-size:1.4em;font-weight:700'>"
+                            f"${card.current_price:,.2f}</div>", unsafe_allow_html=True)
+
+        # Buyers-vs-sellers split: who controlled the session's volume.
+        if card.bull_pct is not None:
+            bull, bear = card.bull_pct, card.bear_pct
+            bull_lbl = f"{bull:.0f}% buyers" if bull >= 18 else ""
+            bear_lbl = f"{bear:.0f}% sellers" if bear >= 18 else ""
+            st.markdown(
+                "<div style='display:flex;height:24px;border-radius:6px;overflow:hidden;"
+                "font-size:0.74em;font-weight:700;color:#fff;margin:2px 0 8px'>"
+                f"<div style='width:{bull}%;background:#1b9e3e;display:flex;align-items:center;"
+                f"justify-content:center'>{bull_lbl}</div>"
+                f"<div style='width:{bear}%;background:#e53935;display:flex;align-items:center;"
+                f"justify-content:center'>{bear_lbl}</div></div>",
+                unsafe_allow_html=True)
+
+        # Compact metric grid — custom HTML (not st.metric, whose oversized value
+        # font truncates dollar prices in a narrow column).
+        def _cell(label: str, value: str, sub: str, value_color: str = "") -> str:
+            vc = f"color:{value_color};" if value_color else ""
+            return (f"<div style='flex:1 1 120px;min-width:108px'>"
+                    f"<div style='font-size:0.76em;color:#8a93a0'>{label}</div>"
+                    f"<div style='font-size:1.08em;font-weight:700;{vc}white-space:nowrap'>{value}</div>"
+                    f"<div style='font-size:0.76em;color:#8a93a0'>{sub}</div></div>")
+
+        if card.session_low is not None and card.session_high is not None:
+            span = (f"{card.session_range_pct:.1f}% span"
+                    if card.session_range_pct is not None else "today")
+            range_cell = _cell("Today's range",
+                               f"${card.session_low:,.2f} – ${card.session_high:,.2f}", span)
+        else:
+            range_cell = _cell("Today's range", "—", "")
+
+        if card.next_target is not None:
+            tgt_cell = _cell("🎯 Next target", f"${card.next_target:,.2f}",
+                             f"{card.next_target_pct:+.1f}% to resistance", "#1b9e3e")
+        else:
+            tgt_cell = _cell("🎯 Next target", "—", "clear air above")
+
+        if card.next_support is not None:
+            sup_cell = _cell("🛡️ Support", f"${card.next_support:,.2f}",
+                             f"{card.next_support_pct:+.1f}% to floor", "#e53935")
+        else:
+            sup_cell = _cell("🛡️ Support", "—", "no floor on range")
+
+        bias_color = {"Bullish": "#1b9e3e", "Bearish": "#e53935"}.get(card.bias_label, "#8a93a0")
+        bias_sub = (f"{card.bull_pct:.0f}% buy / {card.bear_pct:.0f}% sell"
+                    if card.bull_pct is not None else "—")
+        bias_cell = _cell("Day bias", card.bias_label, bias_sub, bias_color)
+
+        st.markdown(
+            "<div style='display:flex;gap:14px;flex-wrap:wrap;margin:2px 0 4px'>"
+            + range_cell + tgt_cell + sup_cell + bias_cell + "</div>",
+            unsafe_allow_html=True)
+
+        # Where price sits in today's range — the day trader's "am I near the
+        # high (breakout watch) or the low (bounce watch)?" glance.
+        if card.range_position_pct is not None:
+            pos = card.range_position_pct
+            near = ("near the high — breakout watch" if pos >= 75
+                    else "near the low — bounce watch" if pos <= 25
+                    else "mid-range")
+            st.markdown(
+                f"<div style='margin:8px 0 2px;font-size:0.82em'>Position in today's range: "
+                f"<b>{pos:.0f}%</b> <span style='color:#8a93a0'>· {near}</span></div>"
+                "<div style='position:relative;height:10px;border-radius:5px;"
+                "background:linear-gradient(90deg,#e5393544,#9e9e9e22,#1b9e3e44)'>"
+                f"<div style='position:absolute;left:{pos}%;top:-4px;width:4px;height:18px;"
+                "background:#ff9800;border-radius:2px;transform:translateX(-50%)'></div></div>",
+                unsafe_allow_html=True)
+
+        if card.battle_zones:
+            chips = "".join(
+                f"<span style='background:#8e44ad22;border:1px solid #8e44ad;"
+                f"border-radius:5px;padding:2px 8px;margin-right:6px;font-size:0.92em'>"
+                f"${z.price:,.2f} · {z.volume_pct:.0f}% vol</span>"
+                for z in card.battle_zones)
+            st.markdown(
+                "<div style='margin-top:6px'><b>🥊 Battle zones</b> "
+                "<span style='color:gray;font-size:0.85em'>"
+                "(where buyers &amp; sellers fought hardest — heaviest traded prices):</span><br>"
+                f"<div style='margin-top:4px'>{chips}</div></div>",
+                unsafe_allow_html=True)
+
+        sup_s = " · ".join(f"${p:,.2f}" for p in card.supports) or "—"
+        res_s = " · ".join(f"${p:,.2f}" for p in card.resistances) or "—"
+        bars_note = (f"{card.n_session_bars} session bars" if card.intraday
+                     else "daily data (intraday unavailable)")
+        st.caption(f"🟩 **Support below:** {sup_s}  　🟥 **Resistance above:** {res_s}  ·  "
+                   f"levels from history + today · {bars_note} · for quick reads, **not advice**")
+
+
 def _gauge(go_score: int, color: str, title: str) -> go.Figure:
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
@@ -1173,12 +1529,15 @@ def _recommendation_section(result, rec, usecase: UseCase) -> None:
 
 
 def _cost_basis_block(buy_price: float, current: float,
-                       stop: float, target: float) -> None:
-    """Show P&L at current price, at stop, and at target — all relative to buy price."""
-    pnl_now  = (current - buy_price) / buy_price * 100
-    pnl_stop = (stop    - buy_price) / buy_price * 100
-    pnl_tgt  = (target  - buy_price) / buy_price * 100
-    locked   = stop >= buy_price           # stop is above cost → worst case = still profitable
+                       stop: float, target: float,
+                       spread: float = _SPREAD_PER_SHARE) -> None:
+    """Show P&L at current price, at stop, and at target — all relative to buy
+    price and NET of the flat $/share spread, so 'break-even' is honest."""
+    sp = spread / buy_price * 100 if buy_price else 0.0   # $/share fee as % of cost
+    pnl_now  = (current - buy_price) / buy_price * 100 - sp
+    pnl_stop = (stop    - buy_price) / buy_price * 100 - sp
+    pnl_tgt  = (target  - buy_price) / buy_price * 100 - sp
+    locked   = stop >= buy_price + spread   # stop covers cost + spread → real profit
 
     st.markdown("---")
     st.markdown("**📌 Your position — adjusted to your buy price**")
@@ -1204,7 +1563,7 @@ def _cost_basis_block(buy_price: float, current: float,
         else:
             msg = (f"🟡 Up **{pnl_now:.1f}%** but your stop (${stop:.2f}) is still below "
                    f"your ${buy_price:.2f} cost. Tip: raise the stop to "
-                   f"~${buy_price * 1.002:.2f} to make this trade risk-free.")
+                   f"~${buy_price + spread:.2f} (cost + spread) to make this trade risk-free.")
     elif pnl_now >= -3:
         msg = (f"🟡 Near break-even ({pnl_now:+.1f}%). "
                f"Stop at ${stop:.2f} limits downside to **{pnl_stop:.1f}%** from what you paid.")
@@ -1508,6 +1867,7 @@ def _live_dashboard(ticker, prefer, usecase, strategy, pace, buy_price, result) 
         ss.live_engine = None
         ss.live_prev_state = None
         ss.live_events = []
+        ss.live_reco_cache = None
 
     sent = result.sentiment.score if (result.sentiment and result.sentiment.available) else None
     ctx = dict(ticker=ticker, prefer=prefer, usecase=usecase, strategy=strategy, pace=pace,
@@ -1559,17 +1919,29 @@ def _live_frame(ctx: dict) -> None:
     if live_price is None and d1 is not None:
         live_price = d1.meta.get("last_close")
 
-    # --- recompute BOTH framings at the live price (cheap: cached reports) ---
-    reco_ctx = _reco_context(ctx["result"])
-    swing_verdict = build_verdict(reports, ctx["sent"], Strategy.SWING, ctx["pace"])
-    swing_rec = build_recommendation(
-        ticker, swing_verdict,
-        reports, ctx["usecase"], Strategy.SWING, ctx["pace"], price_override=live_price,
-        context=reco_ctx)
-    inv_rec = build_recommendation(
-        ticker, build_verdict(reports, ctx["sent"], Strategy.INVESTOR),
-        reports, ctx["usecase"], Strategy.INVESTOR, price_override=live_price,
-        context=reco_ctx)
+    # --- recompute BOTH framings only when it can matter: the engine refreshed
+    # (new reports) or the live price moved > 0.05%. Otherwise reuse the cached
+    # recs — the plan levels are price-independent within the 45s window. P&L and
+    # flip detection below still run on the FRESH live_price every tick. ---
+    mc = ss.get("live_reco_cache")
+    moved = (mc is None or not mc.get("price") or not live_price
+             or abs(live_price - mc["price"]) / mc["price"] > 0.0005)
+    if mc is None or mc.get("eng_ts") != eng["ts"] or moved:
+        reco_ctx = _reco_context(ctx["result"])
+        swing_verdict = build_verdict(reports, ctx["sent"], Strategy.SWING, ctx["pace"])
+        swing_rec = build_recommendation(
+            ticker, swing_verdict,
+            reports, ctx["usecase"], Strategy.SWING, ctx["pace"], price_override=live_price,
+            context=reco_ctx)
+        inv_rec = build_recommendation(
+            ticker, build_verdict(reports, ctx["sent"], Strategy.INVESTOR),
+            reports, ctx["usecase"], Strategy.INVESTOR, price_override=live_price,
+            context=reco_ctx)
+        ss.live_reco_cache = {"eng_ts": eng["ts"], "price": live_price,
+                              "sv": swing_verdict, "sr": swing_rec, "ir": inv_rec}
+    else:
+        c = ss.live_reco_cache
+        swing_verdict, swing_rec, inv_rec = c["sv"], c["sr"], c["ir"]
     plan = swing_rec.swing
     primary = swing_rec if ctx["strategy"] == Strategy.SWING else inv_rec
     key_level = _key_level(primary, ctx["usecase"])
@@ -1596,10 +1968,18 @@ def _live_frame(ctx: dict) -> None:
         top_ev = max(events, key=lambda e: _SEV_RANK.get(e.severity, 0))
         st.toast(top_ev.text, icon="⚡")
 
-    # Virtual book: bots act on the analyzed ticker too; mark holdings ~10s.
-    if plan is not None and live_price and now - ss.get("vb_last_mark", 0) > 10:
+    # Virtual book: bots act on the analyzed ticker too. Mark every ~2s when we
+    # hold a position (ASAP stop/target/trend reaction) else ~10s; manage runs
+    # BEFORE mark so a freshly-tightened stop can close on the same tick.
+    mark_gap = 2 if virtualbook.has_any_open(ticker) else 10
+    if plan is not None and live_price and now - ss.get("vb_last_mark", 0) > mark_gap:
         ss.vb_last_mark = now
-        _run_bots(ticker, plan, reports=reports, verdict=swing_verdict, rec=swing_rec)
+        phase = session.market_phase()
+        orange = _opening_range(ticker, ctx["result"])
+        _run_bots(ticker, plan, reports=reports, verdict=swing_verdict, rec=swing_rec,
+                  orange=orange, price=live_price, phase=phase)
+        tc = d1.trend_change if d1 is not None else None
+        virtualbook.manage(ticker, live_price, reports, tc)
         for chg in virtualbook.mark(ticker, live_price):
             if chg["status"] == "closed":
                 st.toast(f"💼 {chg['trader']} closed {ticker}: {chg['close_reason']} "

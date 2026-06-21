@@ -33,8 +33,13 @@ from stockanalyzer.strategy import SwingPace
 # Fixture builders: fully controlled frames + reports.
 # --------------------------------------------------------------------------- #
 def _frame(price: float, daily_range_pct: float, n: int = 60,
-           drift_pct: float = 0.0, last_jump_pct: float = 0.0) -> pd.DataFrame:
-    """Daily OHLCV frame ending at `price` with controlled daily range (≈ATR)."""
+           drift_pct: float = 0.0, last_jump_pct: float = 0.0,
+           vol: str = "flat") -> pd.DataFrame:
+    """Daily OHLCV frame ending at `price` with controlled daily range (≈ATR).
+
+    ``vol`` shapes the volume profile so the setup-scoped RVOL gate can be
+    exercised: "flat" (rvol≈1.0), "drying" (receding → rvol<1.0, a healthy
+    pullback), "surge" (last bar elevated → rvol>1.5, a confirmed breakout)."""
     idx = pd.date_range("2026-01-02", periods=n, freq="B")
     drift = price * drift_pct / 100.0
     closes = np.linspace(price - drift, price, n)
@@ -44,9 +49,15 @@ def _frame(price: float, daily_range_pct: float, n: int = 60,
     half = closes * daily_range_pct / 200.0
     highs = np.maximum(opens, closes) + half
     lows = np.minimum(opens, closes) - half
+    if vol == "drying":
+        volume = np.linspace(1.4e6, 0.6e6, n)        # sellers exhausting → rvol < 1
+    elif vol == "surge":
+        volume = np.full(n, 1e6); volume[-1] = 2.5e6  # breakout bar → rvol > 1.5
+    else:
+        volume = np.full(n, 1e6)
     return validate_ohlcv(pd.DataFrame(
         {"open": opens, "high": highs, "low": lows, "close": closes,
-         "volume": np.full(n, 1e6)}, index=idx))
+         "volume": volume}, index=idx))
 
 
 def _ind(df: pd.DataFrame, *, sma20=None, sma50=None, sma200=None, ema20=None,
@@ -226,10 +237,10 @@ def test_nok_replica_breakout_trigger_is_real_wall():
 # --------------------------------------------------------------------------- #
 # Clean pullback — the fixes must NOT kill real GOs.
 # --------------------------------------------------------------------------- #
-def _clean_pullback_reports():
+def _clean_pullback_reports(vol: str = "drying"):
     p = 100.0
     dec = _report(
-        _ind(_frame(p, 2.0, drift_pct=10), atr_pct=2.0, rsi=48, macd=0.6,
+        _ind(_frame(p, 2.0, drift_pct=10, vol=vol), atr_pct=2.0, rsi=48, macd=0.6,
              macd_signal=0.3, sma20=p * 0.995, sma50=p * 0.96, sma200=p * 0.88,
              ema20=p * 0.995),
         levels=[_lv(107.0, "resistance"), _lv(98.5, "support")],
@@ -254,6 +265,17 @@ def test_clean_pullback_stays_go_with_strong_score():
     assert plan.rr >= 2.0
     assert plan.score >= 70, f"score {plan.score} should be ≥70 on a clean setup"
     assert "enter" in plan.guidance.lower()
+
+
+def test_pullback_on_heavy_volume_is_not_go():
+    # Same clean pullback, but volume is NOT drying up (rvol ~1.0) → the setup-
+    # scoped gate withholds GO: a healthy pullback needs seller exhaustion.
+    dec, reports = _clean_pullback_reports(vol="flat")
+    plan = build_swing_plan(dec, UseCase.BUY, SwingPace.FAST, all_reports=reports,
+                            context={"investor_pct": 62})
+    assert plan.setup == "Pullback to 20-EMA"
+    assert plan.go is False
+    assert "drying up" in plan.guidance.lower()
 
 
 def test_clean_pullback_target_honest():

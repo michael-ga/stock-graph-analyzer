@@ -110,11 +110,31 @@ def losers() -> None:
             print(f"  {k}: {('--' if v is None else round(v, 4))}")
 
 
+def managed_ab() -> None:
+    _bar("4. MANAGED vs FIXED  (Gap-and-Go: does the smart exit beat fixed?)")
+    a = store.managed_vs_fixed()
+    if not a["n_pairs"]:
+        print("No matched Gap-and-Go pairs yet (need bot-gap-mgd + bot-gap-fixed "
+              "on the same idea, both closed).")
+        return
+    print(f"{a['n_pairs']} matched idea pair(s)  | mean Δ (mgd − fixed) = "
+          f"{a['mean_delta_pct']:+.2f}%  | win%  mgd={a['mgd_win_rate']} "
+          f"fixed={a['fixed_win_rate']}")
+    print(f"  avg stop moves={a['avg_stop_moves']}  mean MFE captured="
+          f"{a['mean_mfe_pct']:+.2f}%")
+    print("\nworst deltas first (where management hurt):")
+    for p in a["pairs"][:12]:
+        print(f"  Δ{p['delta_pct']:+6.2f}%  {p['ticker']:5s}  "
+              f"mgd={p['mgd_pnl_pct']:+.2f}% ({p['mgd_reason']}) vs "
+              f"fixed={p['fixed_pnl_pct']:+.2f}% ({p['fixed_reason']})")
+
+
 def main() -> None:
     print(f"DB: {store.DB_PATH}")
     per_bot()
     algorithm()
     losers()
+    managed_ab()
     print("\nReminder: at small n most sub-group splits are noise. See "
           "algolab/LEARNINGS.md for what has already been ruled out, and add a "
           "dated entry there for anything you change.")
