@@ -12,15 +12,22 @@
 git clone https://github.com/michael-ga/stock-graph-analyzer.git
 cd stock-graph-analyzer
 git switch docs/nuc-container-database-plan
-cp .env.example .env
-chmod 600 .env
+chmod 755 scripts/deploy_nuc.sh
+./scripts/deploy_nuc.sh
 ```
 
-Generate a hex-only password with `openssl rand -hex 32`, then edit `.env` and put
-that exact value in both `POSTGRES_PASSWORD` and the password component of
-`DATABASE_URL`. The values must match. API keys are optional; never commit `.env`.
+The helper checks Docker/Compose/Tailscale, generates a private database password,
+builds and starts the stack, waits for health, creates the administrator interactively,
+and configures private Tailscale Serve. API keys are optional and can be added to
+`.env` later; never commit `.env`.
+
+For a manual deployment, copy `.env.example`, generate a hex-only password with
+`openssl rand -hex 32`, and put the exact value in both `POSTGRES_PASSWORD` and the
+password component of `DATABASE_URL`:
 
 ```bash
+cp .env.example .env
+chmod 600 .env
 docker compose config
 docker compose build
 docker compose up -d
