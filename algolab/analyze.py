@@ -129,12 +129,27 @@ def managed_ab() -> None:
               f"fixed={p['fixed_pnl_pct']:+.2f}% ({p['fixed_reason']})")
 
 
+def bottom_line() -> None:
+    _bar("BOTTOM LINE  (paper dollars across all bots)")
+    rows = store.query_closed_trades()
+    if not rows:
+        print("No closed trades yet.")
+        return
+    won = sum(r["pnl_usd"] for r in rows if r["pnl_usd"] > 0)
+    lost = sum(r["pnl_usd"] for r in rows if r["pnl_usd"] <= 0)
+    print(f"Won   +${won:,.0f}")
+    print(f"Lost  -${abs(lost):,.0f}")
+    print(f"NET   ${won + lost:+,.0f}   over {len(rows)} closed trades "
+          f"($1,000 paper stake each)")
+
+
 def main() -> None:
     print(f"DB: {store.DB_PATH}")
     per_bot()
     algorithm()
     losers()
     managed_ab()
+    bottom_line()
     print("\nReminder: at small n most sub-group splits are noise. See "
           "algolab/LEARNINGS.md for what has already been ruled out, and add a "
           "dated entry there for anything you change.")
