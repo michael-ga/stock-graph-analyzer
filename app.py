@@ -1108,6 +1108,19 @@ def _portfolio_panel() -> None:
                 f"realized ${tot['total_pnl_usd']:+,.0f} · unrealized ${unreal:+,.0f} "
                 f"{pnl_color} · win rate {wr}")
         with st.expander(head, expanded=False):
+            # 💰 Bottom line — gross $ won, $ lost, and net, in plain dollars.
+            done = [p for p in book if p["status"] == "closed"
+                    and p.get("close_reason") != "cancelled"]
+            won = sum(p["pnl_usd"] for p in done if p["pnl_usd"] > 0)
+            lost = sum(p["pnl_usd"] for p in done if p["pnl_usd"] <= 0)   # ≤0, negative
+            net = won + lost
+            line = (f"### 💰 Bottom line: net **${net:+,.0f}**\n"
+                    f"Won **+${won:,.0f}** · Lost **−${abs(lost):,.0f}** "
+                    f"over **{len(done)}** closed trades")
+            if live:
+                line += f" · open unrealized **${unreal:+,.0f}**"
+            st.markdown(line)
+            st.divider()
             if live:
                 st.markdown("**Live positions** _($1,000 virtual stake each)_")
                 rows = []
@@ -2113,15 +2126,37 @@ _CHART_FRAMES = (Timeframe.D1, Timeframe.D5, Timeframe.M1, Timeframe.M6,
                  Timeframe.YTD, Timeframe.Y1, Timeframe.Y5)
 
 
-def _focus_right(fig, df, frac: float = 0.4) -> None:
+def _focus_right(fig, df, frac: float = 0.4, keep_prices=None) -> None:
     """Open the view zoomed onto the most recent `frac` of bars (latest ticks),
-    so freshly-added candles land in a focused right-hand window. uirevision keeps
-    any later user pan/zoom; this only sets the *initial* range."""
+    so freshly-added candles land in a focused right-hand window, and frame the
+    price y-axis to the candles ACTUALLY VISIBLE in that window (plus any nearby
+    keep_prices — live/entry/stop). uirevision keeps any later user pan/zoom; this
+    only sets the *initial* range."""
     n = len(df)
     if n < 8:
         return
-    start = df.index[int(n * (1 - frac))]
-    fig.update_xaxes(range=[start, df.index[-1]], row=1, col=1)
+    i0 = int(n * (1 - frac))
+    start = df.index[i0]
+    # The price panel's x-axis is a *follower* (shared_xaxes matches it to the
+    # bottom anchor axis), so setting the range on row=1 alone gets overridden by
+    # the anchor's autorange. Set every x-axis so the anchor takes the range too.
+    fig.update_xaxes(range=[start, df.index[-1]])
+
+    # Reframe the price y-axis to the visible candles so far-off overlays (a 25%-
+    # away target line, a steep projected trendline) can't squish the price band.
+    win = df.iloc[i0:]
+    if len(win):
+        lo, hi = float(win["low"].min()), float(win["high"].max())
+        if hi > lo:
+            span = hi - lo
+            # Pull in nearby reference prices, but never let a far one (e.g. a
+            # distant target) re-expand the scale — clamp to ~0.5×span beyond.
+            for p in (keep_prices or []):
+                if p and lo - 0.5 * span <= p <= hi + 0.5 * span:
+                    lo, hi = min(lo, p), max(hi, p)
+            pad = (hi - lo) * 0.08
+            fig.update_yaxes(range=[lo - pad, hi + pad], autorange=False,
+                             row=1, col=1)
 
 
 def _live_chart(ticker, d1, plan, key_level, live_price, snap, reports=None) -> None:
@@ -2157,25 +2192,51 @@ def _live_chart(ticker, d1, plan, key_level, live_price, snap, reports=None) -> 
     fig = candlestick_figure(rep, title=f"{ticker} — {suffix}")
 
     # Plan overlays + the live price line belong on the live intraday frame only;
-    # on the structural frames they'd be off-scale clutter.
+    # on the structural frames they'd be off-scale clutter. The plan levels (your
+    # trade) get left-edge pills; market structure + the live price stay on the
+    # right (drawn by the chart itself), so the two never fight for the same gutter.
     if is_live:
-        if plan is not None and plan.trigger:
-            fig.add_hline(y=plan.trigger, line=dict(color="#ff9800", width=1.6, dash="dot"),
-                          annotation_text=f"🚀 trigger {plan.trigger:.2f}",
-                          annotation_position="left", row=1, col=1)
+        # Risk/reward zones behind the candles: a green REWARD band (entry→target)
+        # and a red RISK band (entry→stop) — the trade's geometry at a glance.
+        if plan is not None and plan.entry:
+            if plan.target1 and plan.target1 != plan.entry:
+                fig.add_hrect(y0=plan.entry, y1=plan.target1,
+                              fillcolor="rgba(38,166,154,0.12)", line_width=0,
+                              layer="below", row=1, col=1)
+            if plan.stop and plan.stop != plan.entry:
+                fig.add_hrect(y0=plan.stop, y1=plan.entry,
+                              fillcolor="rgba(239,83,80,0.12)", line_width=0,
+                              layer="below", row=1, col=1)
+        plan_lines = []
         if plan is not None:
-            for y, c, label in ((plan.entry, "#42a5f5", "entry"),
-                                (plan.stop, "#ef5350", "stop"),
-                                (plan.target1, "#26a69a", "target")):
-                fig.add_hline(y=y, line=dict(color=c, width=1.2, dash="dash"),
-                              annotation_text=f"{label} {y:.2f}", annotation_position="left",
-                              row=1, col=1)
+            if plan.trigger:
+                plan_lines.append((plan.trigger, "#ff9800", "dot", f"🚀 {plan.trigger:.2f}"))
+            plan_lines += [
+                (plan.entry, "#42a5f5", "dash", f"entry {plan.entry:.2f}"),
+                (plan.stop, "#ef5350", "dash", f"stop {plan.stop:.2f}"),
+                (plan.target1, "#26a69a", "dash", f"target {plan.target1:.2f}"),
+            ]
+        for y, c, dash, text in plan_lines:
+            fig.add_hline(y=y, line=dict(color=c, width=1.3, dash=dash), row=1, col=1)
+            fig.add_annotation(
+                xref="x domain", x=0.0, xanchor="left", xshift=4,
+                yref="y", y=y, yanchor="middle", showarrow=False,
+                text=f" {text} ", font=dict(size=10.5, color="#0e1117"),
+                bgcolor=c, borderpad=1, row=1, col=1)
         if live_price:
-            fig.add_hline(y=live_price, line=dict(color="#ffeb3b", width=1.4),
-                          annotation_text=f"LIVE {live_price:.2f}", annotation_position="right",
-                          row=1, col=1)
+            fig.add_hline(y=live_price, line=dict(color="#ffeb3b", width=1.4), row=1, col=1)
+            fig.add_annotation(
+                xref="x domain", x=0.0, xanchor="left", xshift=4,
+                yref="y", y=live_price, yanchor="middle", showarrow=False,
+                text=f" ● LIVE {live_price:.2f} ", font=dict(size=11, color="#0e1117"),
+                bgcolor="#ffeb3b", borderpad=1, row=1, col=1)
 
-    _focus_right(fig, rep.df)
+    keep = None
+    if is_live:
+        keep = [live_price]
+        if plan is not None:
+            keep += [plan.entry, plan.stop]
+    _focus_right(fig, rep.df, keep_prices=keep)
     st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_CFG)
     if is_live and snap and len(snap.ticks) >= 2:
         _live_heartbeat(snap.ticks)
