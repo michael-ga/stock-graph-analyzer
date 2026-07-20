@@ -37,6 +37,15 @@ curl --fail http://127.0.0.1:8501/_stcore/health
 ```
 
 The administrator command prompts twice and never accepts a password argument.
+Create additional people as separate non-administrator users so all watchlists, trades,
+and history remain isolated:
+
+```bash
+docker compose exec app python -m scripts.create_user --username FRIEND_USERNAME
+```
+
+Each person should choose their own password of at least 12 characters; never share the
+administrator password.
 
 If this NUC already has legacy `trades.db` or JSON state, copy those source files
 into `./legacy/` and keep them read-only. Preview the import, then apply it to the
