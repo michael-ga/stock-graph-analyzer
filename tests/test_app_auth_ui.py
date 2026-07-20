@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 from streamlit.testing.v1 import AppTest
 
 from stockanalyzer.auth import AuthService
@@ -26,3 +29,22 @@ def test_login_gate_accepts_database_user_and_exposes_logout(tmp_path, monkeypat
     assert any(button.label == "Log out" for button in app.button)
     assert not app.error
     engine.dispose()
+
+
+def test_movers_radar_add_is_scoped_to_authenticated_user():
+    tree = ast.parse(Path("app.py").read_text())
+    movers_page = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_movers_page"
+    )
+    radar_add_calls = [
+        node for node in ast.walk(movers_page)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "swingwatch"
+        and node.func.attr == "add"
+    ]
+
+    assert len(radar_add_calls) == 1
+    assert any(keyword.arg == "user_id" for keyword in radar_add_calls[0].keywords)

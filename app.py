@@ -916,7 +916,7 @@ def _movers_page() -> None:
                                 use_container_width=True,
                                 help=f"Track {m.symbol} on the swing radar "
                                      "(60/70/80% alerts)"):
-                swingwatch.add(m.symbol)
+                swingwatch.add(m.symbol, user_id=st.session_state.auth_user_id)
                 st.toast(f"📡 {m.symbol} added to the swing radar", icon="➕")
                 st.rerun()
             if cols[6].button("🔎 Open", key=f"mv_open_{m.symbol}",
