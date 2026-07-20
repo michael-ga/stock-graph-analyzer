@@ -80,6 +80,20 @@ def test_paper_trade_duplicate_and_owner_isolation(database):
     assert repo.list(other.id) == []
 
 
+def test_paper_trade_legacy_source_ids_are_lossless_and_idempotent(database):
+    owner = AuthService().create_user("paper-import-owner", "correct horse battery staple")
+    repo = PaperTradeRepository()
+    older = {"source_id": "legacy-sqlite:1", "ts": 1000.0, "date": "old",
+             "ticker": "MSFT", "level": 70, "status": "closed"}
+    newer = {"source_id": "legacy-sqlite:2", "ts": 1000.0 + 7 * 86400,
+             "date": "new", "ticker": "MSFT", "level": 70, "status": "open"}
+    assert repo.insert(owner.id, newer)
+    assert repo.insert(owner.id, older)
+    assert not repo.insert(owner.id, newer)
+    assert {row["source_id"] for row in repo.list(owner.id)} == {
+        "legacy-sqlite:1", "legacy-sqlite:2"}
+
+
 def test_legacy_symbol_reader_is_normalized_and_source_unchanged(tmp_path):
     source = tmp_path / "watch.json"
     original = '[" msft ", "AAPL", "MSFT"]'
@@ -102,6 +116,13 @@ def test_csv_export_neutralizes_spreadsheet_formulas():
     exported = _safe_csv([{"ticker": "=HYPERLINK(\"bad\")", "note": "+cmd"}])
     assert "'=HYPERLINK" in exported
     assert "'+cmd" in exported
+
+
+def test_restore_failure_keeps_application_stopped():
+    script = Path("scripts/restore_db.sh").read_text()
+    assert 'restore_succeeded=false' in script
+    assert 'if [ "$restore_succeeded" = true ]' in script
+    assert "application remains stopped" in script
 
 
 def test_compose_has_private_database_and_loopback_only_application():

@@ -195,7 +195,9 @@ class TradeSwingCheck(Base):
 
 class PaperTrade(Base):
     __tablename__ = "paper_trades"
+    __table_args__ = (UniqueConstraint("user_id", "source_id", name="uq_paper_trade_source"),)
     id: Mapped[int] = mapped_column(ID, primary_key=True)
+    source_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
     ts: Mapped[float] = mapped_column(Float); date: Mapped[str] = mapped_column(String(32))
     ticker: Mapped[str] = mapped_column(String(32), index=True); level: Mapped[int] = mapped_column(Integer)

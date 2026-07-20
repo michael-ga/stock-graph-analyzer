@@ -9,8 +9,10 @@ RESTORE_CONFIRM=stockanalyzer ./scripts/restore_db.sh /opt/stock-analyzer/backup
 ```
 
 Restore is destructive to matching objects. The restore script requires an explicit
-confirmation value, stops the app, restores with `--exit-on-error`, cleans up the
-temporary dump, and restarts the app. Take a final dump and verify the selected file
+confirmation value, stops the app, restores with `--exit-on-error`, and cleans up the
+temporary dump. It restarts the app only after a successful restore and only if the app
+was running beforehand; failures leave the app stopped to avoid serving partial data.
+Take a final dump and verify the selected file
 before running it. Perform a quarterly drill into a fresh disposable Compose project
 and compare counts for users, analyses, trades, paper trades, watchlists, and
 swing-watch rows.

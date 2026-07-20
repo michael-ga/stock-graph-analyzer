@@ -66,8 +66,11 @@ def main() -> None:
         existing = {row["id"] for row in tr.list(user_id)}
         for row in trades:
             if row["id"] not in existing: tr.insert(user_id, row, row.get("snapshot"))
-        # Paper repository's 24h uniqueness makes reruns idempotent for source propositions.
-        for row in reversed(papers): pr.insert(user_id, row)
+        # Stable source IDs make reruns idempotent without dropping older records.
+        for row in papers:
+            imported = dict(row)
+            imported["source_id"] = f"legacy-sqlite:{row['id']}"
+            pr.insert(user_id, imported)
         wr = WatchlistRepository(); sr = SwingWatchRepository()
         for ticker in watch: wr.add(user_id, ticker)
         for ticker in swing: sr.add(user_id, ticker)

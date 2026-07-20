@@ -63,14 +63,20 @@ def render_history(user_id: str) -> None:
     )
     first, second, third = st.columns(3)
     ticker = first.text_input("Ticker").strip() or None
-    provider = second.text_input("Provider").strip() or None
-    timeframe = third.selectbox(
-        "Timeframe", ("", "1D", "5D", "1M", "6M", "YTD", "1Y", "5Y")
-    ) or None
-    fourth, fifth, sixth = st.columns(3)
-    strategy = fourth.text_input("Strategy").strip() or None
-    start_date = fifth.date_input("From", value=None)
-    end_date = sixth.date_input("To", value=None)
+    start_date = second.date_input("From", value=None)
+    end_date = third.date_input("To", value=None)
+    provider = timeframe = strategy = None
+    if result_type == "Completed analyses":
+        fourth, fifth, sixth = st.columns(3)
+        provider = fourth.text_input("Provider").strip() or None
+        timeframe = fifth.selectbox(
+            "Timeframe", ("", "1D", "5D", "1M", "6M", "YTD", "1Y", "5Y")
+        ) or None
+        strategy = sixth.text_input("Strategy").strip() or None
+    elif result_type == "Virtual trades":
+        timeframe = st.selectbox(
+            "Timeframe", ("", "1D", "5D", "1M", "6M", "YTD", "1Y", "5Y")
+        ) or None
     page = int(st.number_input("Page", min_value=1, value=1, step=1))
     start = datetime.combine(start_date, time.min, timezone.utc) if start_date else None
     end = datetime.combine(end_date, time.max, timezone.utc) if end_date else None

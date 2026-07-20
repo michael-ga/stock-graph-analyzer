@@ -87,6 +87,7 @@ def upgrade() -> None:
     op.create_index('ix_analysis_owner_ticker_completed', 'analysis_runs', ['user_id', 'ticker', 'completed_at'], unique=False)
     op.create_table('paper_trades',
     sa.Column('id', sa.BigInteger().with_variant(sa.Integer(), 'sqlite'), nullable=False),
+    sa.Column('source_id', sa.String(length=128), nullable=True),
     sa.Column('user_id', sa.String(length=36), nullable=False),
     sa.Column('ts', sa.Float(), nullable=False),
     sa.Column('date', sa.String(length=32), nullable=False),
@@ -96,7 +97,8 @@ def upgrade() -> None:
     sa.Column('status', sa.String(length=32), nullable=False),
     sa.Column('result_pct', sa.Float(), nullable=False),
     sa.ForeignKeyConstraint(['user_id'], ['users.id'], ),
-    sa.PrimaryKeyConstraint('id')
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('user_id', 'source_id', name='uq_paper_trade_source')
     )
     op.create_index(op.f('ix_paper_trades_ticker'), 'paper_trades', ['ticker'], unique=False)
     op.create_index(op.f('ix_paper_trades_user_id'), 'paper_trades', ['user_id'], unique=False)
