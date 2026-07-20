@@ -118,6 +118,23 @@ Then open the URL it prints (default http://localhost:8501).
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
+## Private NUC deployment
+
+The production path uses Docker Compose, PostgreSQL, database-backed Argon2 login,
+and host-level Tailscale Serve. Streamlit is published only on
+`127.0.0.1:8501`; PostgreSQL is not published. See:
+
+- [`docs/nuc-deployment.md`](docs/nuc-deployment.md) for first run and mobile access.
+- [`docs/backup-restore.md`](docs/backup-restore.md) for backups and retention.
+
+Create the first administrator explicitly; there is no public signup:
+
+```bash
+docker compose exec app python -m scripts.create_admin --username admin
+```
+
+The command prompts securely for the password.
+
 ## Layout
 
 ```

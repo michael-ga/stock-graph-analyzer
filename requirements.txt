@@ -18,6 +18,12 @@ vaderSentiment>=3.3
 # Headless build: no system GUI libs (libGL) needed — required for Linux/cloud hosts.
 opencv-python-headless>=4.9
 
+# PostgreSQL persistence, migrations, and Argon2 authentication
+SQLAlchemy>=2.0,<2.1
+alembic>=1.14,<2
+psycopg[binary]>=3.2,<4
+argon2-cffi>=23.1,<26
+
 # Phase 3 — info-panel OCR (heavy; install if you want to OCR stat panels).
 # PaddleOCR is the recommended backend; EasyOCR or Tesseract also work.
 # paddleocr>=2.7

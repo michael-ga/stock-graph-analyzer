@@ -1,78 +1,60 @@
-"""Swing radar — tickers tracked quietly for swing-setup alerts.
-
-The list persists to JSON (like the watchlist). The escalation ladder is pure
-and testable: a ticker's swing score crossing 60% fires the 1st notice, 70% the
-2nd, 80% the 3rd. A notice fires once per level (no spam); dropping back below a
-level re-arms it.
-"""
+"""Per-user swing radar state stored in PostgreSQL."""
 from __future__ import annotations
-
 import json
 from pathlib import Path
+from stockanalyzer.db.repositories.swingwatch import SwingWatchRepository
 
 _PATH = Path(__file__).resolve().parent.parent / ".swingwatch.json"
-
 LEVELS = (60, 70, 80)
 _ORDINAL = {60: "1st", 70: "2nd", 80: "3rd"}
+_repo = SwingWatchRepository()
 
 
-def _read(path: Path) -> list[str]:
+def _legacy_read(path: Path) -> list[str]:
     try:
         data = json.loads(path.read_text())
-        if isinstance(data, list):
-            return [str(t).upper() for t in data]
-    except Exception:
-        pass
-    return []
+        return [str(t).upper() for t in data] if isinstance(data, list) else []
+    except Exception: return []
 
 
-def _write(path: Path, tickers: list[str]) -> None:
-    try:
-        path.write_text(json.dumps(tickers))
-    except Exception:
-        pass
+def load(path: Path | None = None, *, user_id: str | None = None) -> list[str]:
+    if path is not None: return _legacy_read(path)
+    if not user_id: raise ValueError("user_id is required")
+    return _repo.list(user_id)
 
 
-def load(path: Path = _PATH) -> list[str]:
-    return _read(path)
+def add(ticker: str, path: Path | None = None, *, user_id: str | None = None) -> list[str]:
+    if path is not None:
+        ticker=ticker.strip().upper(); items=_legacy_read(path)
+        if ticker and ticker not in items: items.append(ticker); path.write_text(json.dumps(items))
+        return items
+    if not user_id: raise ValueError("user_id is required")
+    return _repo.add(user_id, ticker)
 
 
-def add(ticker: str, path: Path = _PATH) -> list[str]:
-    ticker = ticker.strip().upper()
-    tickers = _read(path)
-    if ticker and ticker not in tickers:
-        tickers.append(ticker)
-        _write(path, tickers)
-    return tickers
+def remove(ticker: str, path: Path | None = None, *, user_id: str | None = None) -> list[str]:
+    if path is not None:
+        items=[t for t in _legacy_read(path) if t != ticker.strip().upper()]; path.write_text(json.dumps(items)); return items
+    if not user_id: raise ValueError("user_id is required")
+    return _repo.remove(user_id, ticker)
 
 
-def remove(ticker: str, path: Path = _PATH) -> list[str]:
-    ticker = ticker.strip().upper()
-    tickers = [t for t in _read(path) if t != ticker]
-    _write(path, tickers)
-    return tickers
+def is_tracked(ticker: str, path: Path | None = None, *, user_id: str | None = None) -> bool:
+    return ticker.strip().upper() in load(path, user_id=user_id)
 
 
-def is_tracked(ticker: str, path: Path = _PATH) -> bool:
-    return ticker.strip().upper() in _read(path)
+def get_notice_level(ticker: str, *, user_id: str) -> int:
+    return _repo.get_notice_level(user_id, ticker)
 
 
-# --------------------------------------------------------------------------- #
-# Escalation ladder (pure).
-# --------------------------------------------------------------------------- #
+def set_notice_level(ticker: str, level: int, *, user_id: str) -> None:
+    _repo.set_notice_level(user_id, ticker, level)
+
+
 def notice_level(score: int | float) -> int:
-    """Highest alert level the score has reached (0 if below the first rung)."""
     return max((lv for lv in LEVELS if score >= lv), default=0)
 
 
 def new_notice(prev_level: int, score: int | float) -> tuple[int, str] | None:
-    """(new_level, label) when the score climbs onto a higher rung, else None.
-
-    prev_level is the last level already notified for this ticker (0 = none).
-    Dropping below a rung simply lowers the stored level — the next climb
-    re-fires it.
-    """
-    level = notice_level(score)
-    if level > prev_level:
-        return level, f"{_ORDINAL[level]} notice — swing score reached {level}%+"
-    return None
+    level=notice_level(score)
+    return (level, f"{_ORDINAL[level]} notice — swing score reached {level}%+") if level > prev_level else None

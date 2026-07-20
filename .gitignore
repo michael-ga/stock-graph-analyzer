@@ -17,6 +17,9 @@ trades.db
 trades.db-wal
 trades.db-shm
 trades.db.bak-*
+backups/
+legacy/
+.last-deploy
 # Editor/agent config and the copyrighted source PDF (rules are encoded in code)
 .claude/
 *.pdf
