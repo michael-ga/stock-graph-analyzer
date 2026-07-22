@@ -21,21 +21,26 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
+import pandas as pd
 import plotly.graph_objects as go
 from dotenv import load_dotenv
 
 import streamlit as st
 
-from stockanalyzer import papertrade, swingwatch, virtualbook, watchlist
+from stockanalyzer import papertrade, session, swingwatch, virtualbook, watchlist
 from stockanalyzer.auth import AuthError, AuthService
 from stockanalyzer.config import ConfigurationError, Settings
 from stockanalyzer.db.repositories.analysis_history import AnalysisHistoryRepository
 from stockanalyzer.db.session import configure_engine
+from stockanalyzer.analysis import reversal
+from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
 from stockanalyzer.analysis.engine import CATEGORY_WEIGHTS, analyze_timeframe
 from stockanalyzer.explain.swing import _MIN_RR, build_swing_plan
+from stockanalyzer.manage import _SPREAD_PER_SHARE
 from stockanalyzer.analysis.signals import Direction
 from stockanalyzer.charting import candlestick_figure
 from stockanalyzer.data.realtime import RealtimeStream, summarize, ticks_to_candles
+from stockanalyzer.data.resample import available_intervals, resample_ohlcv
 from stockanalyzer.data.schema import Timeframe
 from stockanalyzer.explain import UseCase, build_recommendation, timeframe_caption
 from stockanalyzer.explain.glossary import explain_signal
@@ -211,6 +216,18 @@ def _save_analysis_history(result, verdict, strategy, pace, usecase) -> None:
         st.caption(f"ℹ️ Analysis shown, but history could not be saved ({type(exc).__name__}).")
 
 
+@st.cache_data(show_spinner=False, ttl=60)
+def _run_fast(ticker: str, prefer: str | None):
+    """Fast partial load: short timeframes only, no fundamentals. Powers the price
+    header + day-trader card so they paint in ~1 fetch while the full
+    multi-timeframe analysis (charts, fundamentals, sentiment) loads after. The
+    short frames it fetches warm the on-disk cache, so the later full `_run`
+    only pays for the longer ranges + Finnhub."""
+    return analyze_ticker(
+        ticker, timeframes=[Timeframe.D1, Timeframe.D5, Timeframe.M1],
+        prefer=prefer, include_fundamentals=False)
+
+
 def _badge(direction: Direction) -> str:
     return f"{_DIR_EMOJI[direction]} {direction.value}"
 
@@ -280,24 +297,40 @@ def main() -> None:
         return
 
     ticker = ss.ticker
-    with st.spinner(f"Analyzing {ticker}…"):
-        result = _run(ticker, None if prefer == "auto" else prefer)
+    prefer_arg = None if prefer == "auto" else prefer
 
-    if not result.reports:
-        st.error(f"Couldn't find data for '{ticker}'. Check the symbol. ({result.errors})")
+    # --- Fast path: short frames only, no fundamentals → the price header and
+    #     day-trader card paint immediately (Streamlit streams elements as they're
+    #     created), so the user gets an actionable snapshot before the heavy
+    #     multi-timeframe + fundamentals load finishes below.
+    with st.spinner(f"Loading {ticker} snapshot…"):
+        fast = _run_fast(ticker, prefer_arg)
+
+    if not fast.reports:
+        st.error(f"Couldn't find data for '{ticker}'. Check the symbol. ({fast.errors})")
         return
 
-    if prefer == "twelvedata" and result.provider != "twelvedata":
+    if prefer == "twelvedata" and fast.provider != "twelvedata":
         st.info("ℹ️ TWELVEDATA_KEY isn't set — using free yfinance data instead. "
                 "(Add the key to .env to use Twelve Data.)")
 
-    # Live mode takes over the whole page with a 1-second real-time dashboard.
+    _price_header(fast)
+    _extended_alert(fast)
+    _day_trader_card(fast)
+
+    # Live mode renders the real-time dashboard *below* the card. It needs the full
+    # context (sentiment, company, multi-timeframe verdict), so load that, then hand off.
     if live_on and RealtimeStream(ticker).available:
+        with st.spinner("Loading analysis context…"):
+            result = _run(ticker, prefer_arg)
         _live_dashboard(ticker, prefer, usecase, strategy, pace, buy_price, result)
         return
 
-    _price_header(result)
-    _extended_alert(result)
+    # --- Full path: every timeframe + fundamentals → recommendation, company,
+    #     signals, charts. Loads after the snapshot above is already on screen.
+    with st.spinner(f"Loading full analysis for {ticker}…"):
+        result = _run(ticker, prefer_arg)
+
     # Recompute the verdict for the chosen strategy (swing weights short timeframes).
     sent = result.sentiment.score if (result.sentiment and result.sentiment.available) else None
     verdict = build_verdict(result.reports, sent, strategy, pace)
@@ -423,6 +456,11 @@ def _sidebar():
                                  "price, plan/stop/target & P&L recomputed every second, "
                                  "signals re-run ~45s, with flip alerts. Needs FINNHUB_KEY. "
                                  "Turn off for the full static multi-timeframe view.")
+        st.toggle("⏱ Show frame timings", value=False, key="show_perf",
+                  help="Measure how long each live-mode redraw takes (p50/p95 per "
+                       "fragment). Use it to tune the refresh cadences: any "
+                       "fragment whose p95 exceeds its interval is the reason the "
+                       "UI feels stuck.")
         uploaded = None
         if mode == "Image fallback":
             uploaded = st.file_uploader("Screenshot", type=["png", "jpg", "jpeg"])
@@ -483,9 +521,11 @@ def _plan_snapshot(plan, reports=None, verdict=None, rec=None) -> dict:
     return snap
 
 
-def _quiet_price(tk: str) -> float | None:
+def _price_of(res) -> float | None:
+    """Last price from an already-loaded AnalysisResult."""
+    if res is None:
+        return None
     try:
-        res = _run_quiet(tk)
         if res.quote:
             return float(res.quote.price)
         for tf in (Timeframe.D1, Timeframe.D5, Timeframe.M1):
@@ -495,6 +535,13 @@ def _quiet_price(tk: str) -> float | None:
     except Exception:
         pass
     return None
+
+
+def _quiet_price(tk: str) -> float | None:
+    try:
+        return _price_of(_run_quiet(tk))
+    except Exception:
+        return None
 
 
 def _virtual_buy_button(plan, ticker: str, key_suffix: str = "",
@@ -564,6 +611,135 @@ def _is_extended(p) -> bool:
     return bool(es and (es.extended or "distribution_risk" in es.flags))
 
 
+# --------------------------------------------------------------------------- #
+# Gap-and-Go (opening-range breakout) — Carter-style intraday rules.
+# The decision logic lives in stockanalyzer.analysis.orb (pure + testable); this
+# module keeps the Streamlit/session wiring and delegates the rules to it, so the
+# live radar and daytrade_backtest.py share one code path.
+# --------------------------------------------------------------------------- #
+from stockanalyzer.analysis import orb as _orb  # noqa: E402
+
+_GAP_MIN_PCT       = _orb.GAP_MIN_PCT
+_OPENING_RANGE_MIN = _orb.OPENING_RANGE_MIN
+_MIN_BREAKOUT_RVOL = _orb.MIN_BREAKOUT_RVOL
+_ORB_STOP_BUFFER   = _orb.ORB_STOP_BUFFER
+_ORB_TARGET_R      = _orb.ORB_TARGET_R
+
+# Radar tiers → recompute cadence (seconds). Base fragment tick = 5s, so a far
+# buildup recomputes ~1/12 as often as a hot name — CPU spent where it matters.
+_RADAR_TIERS = {"HOT": 5, "WATCH_CLOSE": 10, "BUILDUP": 25, "PAUSED": 10, "FAR": 60}
+
+
+def _radar_tier(plan, price, has_open: bool, phase: str, orange, orb_window: bool) -> str:
+    """Cadence + state for one radar ticker. Gap-and-Go aware:
+       opening_range -> PAUSED (range forming, NO entries); a GAP-UP inside the
+       9:45–11:30 window -> escalate toward the OR-High breakout; everything else
+       -> standard swing-score tiering."""
+    if has_open:
+        return "HOT"                              # always babysit an open position
+    if phase in ("premarket", "closed"):
+        return "FAR"
+    if phase == "opening_range":
+        return "PAUSED"                           # 9:30–9:45 ET: no entries
+    # --- ORB branch: ONLY for a real gap-up, ONLY in the morning window ---
+    if (orb_window and orange and orange.get("gap_up")
+            and price and plan is not None):
+        or_high = orange["high"]
+        band = max(0.015, 0.6 * (plan.daily_atr_pct / 100.0))
+        dist = or_high / price - 1                # >0 = still below the breakout
+        if price >= or_high:
+            return "HOT"                          # broke OR-High (entry still needs vol)
+        if 0 <= dist <= band:
+            return "WATCH_CLOSE"
+        if 0 <= dist <= 2 * band:
+            return "BUILDUP"
+        return "FAR"
+    # --- fallback: standard swing-score tiering (non-gappers / afternoon) ---
+    if plan is None:
+        return "FAR"
+    if plan.go:
+        return "HOT"
+    band = max(0.015, 0.6 * (plan.daily_atr_pct / 100.0))
+    trig_near = (plan.kind == "breakout_wait" and plan.trigger and price
+                 and 0 <= plan.trigger / price - 1 <= band)
+    near_rung = any(0 < (lv - plan.score) <= 3 for lv in swingwatch.LEVELS)
+    if trig_near or near_rung:
+        return "WATCH_CLOSE"
+    if plan.light == "forming" or plan.kind == "breakout_wait":
+        return "BUILDUP"
+    return "FAR"
+
+
+def _opening_range(tk: str, res) -> dict | None:
+    """Cache the first-15-min High/Low + gap for a ticker, once per trading day.
+
+    Returns ``None`` until the opening range is complete (or when there's no
+    intraday data). Keyed by ET date in ``ss.opening_range`` so it resets daily.
+    """
+    if res is None:
+        return None
+    ss = st.session_state
+    ss.setdefault("opening_range", {})
+    ts = session.now_et()
+    day = ts.strftime("%Y-%m-%d")
+    cur = ss.opening_range.get(tk)
+    if cur and cur.get("day") == day:
+        return cur
+    df = _intraday_frame(getattr(res, "reports", None))
+    prev_close = res.quote.prev_close if (res.quote and res.quote.prev_close) else None
+    try:
+        rng = _orb.opening_range(df, prev_close, ts)
+    except Exception:
+        return None
+    if rng is None:
+        return None
+    stored = rng.as_dict()
+    ss.opening_range[tk] = stored
+    return stored
+
+
+def _gap_snapshot(tk: str, orange: dict, rvol: float | None,
+                  entry: float, stop: float, target: float) -> dict:
+    """Minimal decision snapshot for a Gap-and-Go trade. The shared setup/kind +
+    identical entry/stop/target make ``bot-gap-mgd`` and ``bot-gap-fixed`` collapse
+    to one ``cohort_id`` (the A/B pairing)."""
+    rr = round((target - entry) / (entry - stop), 1) if entry > stop else _ORB_TARGET_R
+    return dict(
+        setup="gap_and_go_orb", kind="immediate", score=None, label="Gap-and-Go",
+        rr=rr, daily_atr_pct=None,
+        guidance=(f"ORB break of ${orange['high']:.2f} on "
+                  f"{(rvol or 0):.1f}×vol — hard stop below OR-low ${orange['low']:.2f}, "
+                  f"target ${target:.2f} (2R)."))
+
+
+def _run_gap_bots(tk: str, reports, orange: dict | None, price: float | None) -> None:
+    """Open the Gap-and-Go pair when the ORB rules line up: a real gap-up, inside
+    the 9:45–11:30 window, price breaking the opening-range HIGH on >1.5× volume.
+    Hard stop sits just below the opening-range LOW (Carter's ORB rule)."""
+    if not (orange and orange.get("gap_up") and price and reports):
+        return
+    df = _intraday_frame(reports)
+    dec = _orb.gap_and_go_signal(_orb.OpeningRange(**orange), df,
+                                 float(price), session.now_et())
+    if not dec.fired:
+        return
+    entry, init_stop, target, rvol = dec.entry, dec.stop, dec.target, dec.rvol
+    snap = _gap_snapshot(tk, orange, rvol, entry, init_stop, target)
+    for trader, managed in (("bot-gap-fixed", False), ("bot-gap-mgd", True)):
+        try:
+            if not virtualbook.has_open(
+                    tk, trader, user_id=st.session_state.auth_user_id):
+                virtualbook.open_position(
+                    ticker=tk, trader=trader, entry=entry, stop=init_stop,
+                    target=target, kind="immediate", horizon_days=1,
+                    managed=managed, entry_rvol=rvol, init_stop=init_stop,
+                    snapshot=snap, user_id=st.session_state.auth_user_id)
+                st.toast(f"🚀 {trader} opened Gap-and-Go {tk} @ ${entry:.2f} "
+                         f"(stop ${init_stop:.2f}, {(rvol or 0):.1f}×vol)", icon="🚀")
+        except Exception:
+            pass
+
+
 _BOTS = (
     # (name, condition, uses pending trigger)  — contrasting strategies so the
     # data shows which rules actually make money.
@@ -576,14 +752,21 @@ _BOTS = (
 )
 
 
-def _run_bots(ticker: str, plan, reports=None, verdict=None, rec=None) -> None:
+def _run_bots(ticker: str, plan, reports=None, verdict=None, rec=None,
+              orange=None, price=None, phase=None) -> None:
     """Auto virtual-traders: each bot opens (at most one) position per ticker
     when its rule matches the current plan.
 
-    Every bot is gated on the plan's own verdict: a non-actionable plan, an
+    Every swing bot is gated on the plan's own verdict: a non-actionable plan, an
     extended/distribution emerging read — these are watch-only and never become
     a position. This is the chokepoint that stops the radar from buying the very
-    setups the engine flagged as bad (the SPCX/INTC/NOK class)."""
+    setups the engine flagged as bad (the SPCX/INTC/NOK class).
+
+    The Gap-and-Go bots have their own ORB entry logic (gap + window + OR-High
+    break + volume). No bot opens during the opening-range freeze (first 15 min)."""
+    if phase == "opening_range":
+        return                                    # 15-min freeze: no entries
+    _run_gap_bots(ticker, reports, orange, price)
     if not getattr(plan, "actionable", True) or _is_extended(plan):
         return
     for name, cond, _pending in _BOTS:
@@ -599,6 +782,60 @@ def _run_bots(ticker: str, plan, reports=None, verdict=None, rec=None) -> None:
                          f"(score {plan.score}%)", icon="🤖")
         except Exception:
             pass
+
+
+def _reversal_snapshot(dec) -> dict:
+    """Minimal decision snapshot for a reversal-at-support day trade — one row per
+    variant so each risk profile is its own cohort in the trade book."""
+    return dict(
+        setup="reversal_support", kind="immediate", score=None,
+        label=f"Reversal @ support ({dec.variant})", rr=dec.rr, daily_atr_pct=None,
+        guidance=(f"{dec.variant}: {dec.reason} — hard stop ${dec.stop:.2f}, "
+                  f"target ${dec.target:.2f}."))
+
+
+def _run_reversal_bots(tk: str, res, price: float | None, phase=None) -> None:
+    """Fast reversal-at-support day-trade family. Each variant fires its own bot
+    (own cohort) so the trade book proves which risk profile wins — nothing is
+    re-weighted here. Shares the ORB freeze: no entries in the first 15 min. The
+    fired decisions are stashed for the radar card to surface."""
+    fired: list = []
+    if phase != "opening_range" and res is not None and price:
+        reports = res.reports
+        card = build_day_card(reports, price)
+        if card is not None:
+            higher_trend = None
+            for tf in (Timeframe.M1, Timeframe.D5, Timeframe.M6):
+                rep = reports.get(tf)
+                if rep is not None:
+                    higher_trend = rep.trend.direction
+                    break
+            prev_close = res.quote.prev_close if (res.quote and res.quote.prev_close) else None
+            idf = _intraday_frame(reports)
+            now = session.now_et()
+            for cfg in reversal.REVERSAL_VARIANTS:
+                try:
+                    dec = reversal.reversal_signal(card, idf, float(price),
+                                                   higher_trend, prev_close, now, cfg)
+                except Exception:
+                    continue
+                if not dec.fired:
+                    continue
+                fired.append(dec)
+                try:
+                    if not virtualbook.has_open(
+                            tk, dec.variant, user_id=st.session_state.auth_user_id):
+                        virtualbook.open_position(
+                            ticker=tk, trader=dec.variant, entry=dec.entry,
+                            stop=dec.stop, target=dec.target, kind="immediate",
+                            horizon_days=1, snapshot=_reversal_snapshot(dec),
+                            user_id=st.session_state.auth_user_id)
+                        st.toast(f"🔄 {dec.variant} opened reversal {tk} "
+                                 f"@ ${dec.entry:.2f} (stop ${dec.stop:.2f}, "
+                                 f"tgt ${dec.target:.2f})", icon="🔄")
+                except Exception:
+                    pass
+    st.session_state.setdefault("radar_reversals", {})[tk] = fired
 
 
 # --------------------------------------------------------------------------- #
@@ -673,7 +910,11 @@ def _plan_brief(plan) -> tuple[str, str, str]:
     return ("#546e7a", "⚪ NO SETUP", "no clean setup right now")
 
 
-def _radar_card(tk: str, plan, res=None) -> None:
+_TIER_BADGE = {"HOT": "🔥 live", "WATCH_CLOSE": "👁 watch", "BUILDUP": "… building",
+               "PAUSED": "⏸ paused", "FAR": "💤 idle"}
+
+
+def _radar_card(tk: str, plan, res=None, tier: str | None = None) -> None:
     """One glance = one decision: ticker + live price/change on top, the state
     pill + score next, then trend / signal-ratio / volatility, then the action."""
     color, state, instr = _plan_brief(plan)
@@ -684,11 +925,14 @@ def _radar_card(tk: str, plan, res=None) -> None:
     if res is not None:
         q = res.quote
         if q is not None:
-            up = q.change_pct >= 0
-            c, arrow = ("#1b9e3e", "▲") if up else ("#e53935", "▼")
+            # Lead with the day move (regular_close vs prior close) — the same
+            # headline number the detail header shows — not the extended wiggle.
+            c, arrow = _chg_style(q.day_change_pct)
+            moon = " 🌙" if q.session == "after-hours" else (" 🌅" if q.session == "pre-market" else "")
             px_html = (f"<span style='font-weight:700'>${q.price:,.2f}</span> "
                        f"<span style='color:{c};font-size:0.85em;font-weight:600'>"
-                       f"{arrow}{q.change_pct:+.1f}%</span>")
+                       f"{arrow}{q.day_change_pct:+.1f}%</span>"
+                       f"<span style='font-size:0.8em'>{moon}</span>")
         dec = _radar_decision_rep(res)
         m1 = res.reports.get(Timeframe.M1)
         trend_bits = []
@@ -705,6 +949,20 @@ def _radar_card(tk: str, plan, res=None) -> None:
                        if s.name != "trend" and s.direction == Direction.BEAR)
             info_bits.append(f"signals 🟢{bull}·🔴{bear}")
     info_bits.append(f"vol {plan.daily_atr_pct:.1f}%/d")
+    if tier:
+        info_bits.append(_TIER_BADGE.get(tier, tier))
+
+    revs = st.session_state.get("radar_reversals", {}).get(tk) or []
+    rev_html = ""
+    if revs:
+        d = revs[0]
+        names = ", ".join(r.variant for r in revs)
+        rev_html = (
+            f"<div style='font-size:0.8em;margin-top:3px;color:#00897b;"
+            f"font-weight:600'>🔄 Reversal @ support ${d.support:.2f} — "
+            f"enter ${d.entry:.2f} · stop ${d.stop:.2f} · tgt ${d.target:.2f} · "
+            f"R:R {d.rr:.1f} <span style='color:#8a93a0;font-weight:400'>"
+            f"({names})</span></div>")
 
     st.markdown(
         f"<div style='background:{color}26;border:1px solid {color};border-radius:10px;"
@@ -717,41 +975,83 @@ def _radar_card(tk: str, plan, res=None) -> None:
         f"font-weight:700;font-size:0.82em;white-space:nowrap'>{state}</span>"
         f"<span style='color:{color};font-weight:700'>{plan.score}% {bells}</span></div>"
         f"<div style='font-size:0.78em;color:#8a93a0'>{' · '.join(info_bits)}</div>"
-        f"<div style='font-size:0.8em;margin-top:2px'>{instr}</div></div>",
+        f"<div style='font-size:0.8em;margin-top:2px'>{instr}</div>{rev_html}</div>",
         unsafe_allow_html=True)
     if st.button(f"🔎 Open {tk}", key=f"radar_open_{tk}", use_container_width=True):
         st.session_state._pending_ticker = tk   # applied at top of main()
         st.rerun(scope="app")
 
 
-def _radar_panel(tracked: list[str]) -> None:
-    @st.fragment(run_every="10s")
-    def _radar():
-        head_l, head_r = st.columns([3, 1])
-        head_l.markdown("#### 📡 Swing radar — fast 1–3 day swings")
-        sort_pct = head_r.toggle("Sort by %", value=True, key="radar_sort",
-                                 help="Highest swing score first. Off = the order "
-                                      "you added them.")
+_RADAR_REFRESH_S = 5
 
-        items: list[tuple[str, object, object]] = []
-        for tk in tracked:
+
+def _radar_panel(tracked: list[str]) -> None:
+    @st.fragment(run_every=f"{_RADAR_REFRESH_S}s")
+    def _radar():
+        with _timed("radar", _RADAR_REFRESH_S):
+            _radar_body(tracked)
+
+    _radar()
+    _journal_panel()
+    st.divider()
+
+
+def _radar_body(tracked: list[str]) -> None:
+    ss = st.session_state
+    ss.setdefault("radar_cache", {})     # tk -> {res, plan, orange, tier}
+    ss.setdefault("radar_due", {})        # tk -> next recompute epoch
+    now = time.time()
+    ts_et = session.now_et()
+    phase = session.market_phase(ts_et)
+    orb_window = session.is_orb_window(ts_et)
+
+    # Drop state for tickers no longer tracked (keep the dicts bounded).
+    for k in list(ss.radar_cache):
+        if k not in tracked:
+            ss.radar_cache.pop(k, None)
+            ss.radar_due.pop(k, None)
+
+    head_l, head_r = st.columns([3, 1])
+    head_l.markdown("#### 📡 Swing radar — adaptive (Gap-and-Go aware)")
+    sort_pct = head_r.toggle("Sort by %", value=True, key="radar_sort",
+                             help="Highest swing score first. Off = the order "
+                                  "you added them.")
+
+    items: list[tuple] = []
+    for tk in tracked:
+        has_open = virtualbook.has_any_open(
+            tk, user_id=st.session_state.auth_user_id)
+        due = ss.radar_due.get(tk, 0) <= now
+        if due:                          # only recompute the heavy analysis when due
             try:
                 res = _run_quiet(tk)
                 plan = (_radar_plan(res, _quiet_sentiment(tk))
                         if res.reports else None)
             except Exception:
                 res, plan = None, None
-            items.append((tk, res, plan))
-        if sort_pct:
-            items.sort(key=lambda it: it[2].score if it[2] is not None else -1,
-                       reverse=True)
+            orange = _opening_range(tk, res) if res is not None else None
+            price = res.quote.price if (res is not None and res.quote) else None
+            tier = _radar_tier(plan, price, has_open, phase, orange, orb_window)
+            ss.radar_cache[tk] = {"res": res, "plan": plan,
+                                  "orange": orange, "tier": tier}
+            ss.radar_due[tk] = now + _RADAR_TIERS.get(tier, 60)
+        cached = ss.radar_cache.get(tk) or {}
+        items.append((tk, cached.get("res"), cached.get("plan"),
+                      cached.get("tier", "FAR"), cached.get("orange"),
+                      has_open, due))
+    if sort_pct:
+        items.sort(key=lambda it: it[2].score if it[2] is not None else -1,
+                   reverse=True)
 
-        cols = st.columns(min(4, max(1, len(tracked))))
-        for i, (tk, res, plan) in enumerate(items):
-            with cols[i % len(cols)]:
-                if plan is None:
-                    st.caption(f"{tk}: no data")
-                    continue
+    cols = st.columns(min(4, max(1, len(tracked))))
+    for i, (tk, res, plan, tier, orange, has_open, due) in enumerate(items):
+        with cols[i % len(cols)]:
+            if plan is None:
+                st.caption(f"{tk}: no data")
+                continue
+            # Notices + trading only when we recomputed this tick, or when we
+            # already hold a position (babysit it every tick, any tier).
+            if due or has_open:
                 previous_level = swingwatch.get_notice_level(
                     tk, user_id=st.session_state.auth_user_id)
                 fired = swingwatch.new_notice(previous_level, plan.score)
@@ -770,11 +1070,22 @@ def _radar_panel(tracked: list[str]) -> None:
                         user_id=st.session_state.auth_user_id)
                     note = " · 📒 recorded for paper trading" if stored else ""
                     st.toast(f"📡 {tk}: {fired[1]} — {plan.guidance[:80]}{note}", icon="🔔")
-                # Virtual trading: bots act on the scan; positions mark to price.
-                _run_bots(tk, plan, reports=res.reports)
-                px = _quiet_price(tk)
+                # `res` is already in hand — going back through _quiet_price
+                # would re-enter st.cache_data and pay a full unpickle of a
+                # seven-timeframe AnalysisResult just to read one float.
+                px = _price_of(res)
+                reports = res.reports if res is not None else None
+                _run_bots(tk, plan, reports=reports, orange=orange,
+                          price=px, phase=phase)
+                _run_reversal_bots(tk, res, px, phase)
                 if px:
-                    for chg in virtualbook.mark(tk, px, user_id=st.session_state.auth_user_id):
+                    dec = _radar_decision_rep(res) if res is not None else None
+                    tc = getattr(dec, "trend_change", None)
+                    virtualbook.manage(
+                        tk, px, reports, tc,
+                        user_id=st.session_state.auth_user_id)   # before mark
+                    for chg in virtualbook.mark(
+                            tk, px, user_id=st.session_state.auth_user_id):
                         if chg["status"] == "closed":
                             st.toast(f"💼 {chg['trader']} closed {tk}: "
                                      f"{chg['close_reason']} ({chg['pnl_pct']:+.1f}%)",
@@ -782,16 +1093,11 @@ def _radar_panel(tracked: list[str]) -> None:
                         else:
                             st.toast(f"💼 {chg['trader']}'s breakout order filled in {tk}",
                                      icon="🚀")
-                _radar_card(tk, plan, res)
-        st.caption("States, weakest → strongest: ⚪ NO SETUP → 🟡 BUILDUP (setup forming) "
-                   "→ 👀 WATCH CLOSE (buildup seen — wait for a close past the trigger) "
-                   "→ 🟢 GO (enter per the plan) · scans every ~2½ min, fast 1–3 day pace · "
-                   "🔔 = score reached 60 / 70 / 80%, toasted **and recorded as a "
-                   "paper-trade proposition** below.")
-
-    _radar()
-    _journal_panel()
-    st.divider()
+            _radar_card(tk, plan, res, tier=tier)
+    st.caption("Adaptive scan — imminent setups refresh ~5–10s, far buildups ~60s "
+               "(saves CPU). First 15 min after the open = ⏸ PAUSED, no entries. "
+               "States: ⚪ NO SETUP → 🟡 BUILDUP → 👀 WATCH CLOSE → 🟢 GO · "
+               "🔔 = score reached 60 / 70 / 80%.")
 
 
 # --------------------------------------------------------------------------- #
@@ -949,7 +1255,6 @@ def _movers_page() -> None:
 
 def _pnl_style(df, pct_cols=(), usd_cols=(), price_cols=()):
     """Return a pandas Styler: green for gains, red for losses on P&L columns."""
-    import pandas as pd
 
     def _bg(v):
         try:
@@ -997,7 +1302,6 @@ def _portfolio_panel() -> None:
 
     @st.fragment(run_every="30s")
     def _folio():
-        import pandas as pd
 
         book = virtualbook.load(user_id=st.session_state.auth_user_id)
         live = [p for p in book if p["status"] in ("open", "pending")]
@@ -1023,6 +1327,19 @@ def _portfolio_panel() -> None:
                 f"realized ${tot['total_pnl_usd']:+,.0f} · unrealized ${unreal:+,.0f} "
                 f"{pnl_color} · win rate {wr}")
         with st.expander(head, expanded=False):
+            # 💰 Bottom line — gross $ won, $ lost, and net, in plain dollars.
+            done = [p for p in book if p["status"] == "closed"
+                    and p.get("close_reason") != "cancelled"]
+            won = sum(p["pnl_usd"] for p in done if p["pnl_usd"] > 0)
+            lost = sum(p["pnl_usd"] for p in done if p["pnl_usd"] <= 0)   # ≤0, negative
+            net = won + lost
+            line = (f"### 💰 Bottom line: net **${net:+,.0f}**\n"
+                    f"Won **+${won:,.0f}** · Lost **−${abs(lost):,.0f}** "
+                    f"over **{len(done)}** closed trades")
+            if live:
+                line += f" · open unrealized **${unreal:+,.0f}**"
+            st.markdown(line)
+            st.divider()
             if live:
                 st.markdown("**Live positions** _($1,000 virtual stake each)_")
                 rows = []
@@ -1134,6 +1451,28 @@ def _portfolio_panel() -> None:
                 except Exception:
                     pass
 
+                # Managed vs fixed — is the Gap-and-Go bot SMARTER? Paired on the
+                # same ORB entry (shared cohort_id), so this isolates the exit
+                # policy: breakeven/EMA8-trail/test-don't-dump vs fixed stop/target.
+                try:
+                    ab = virtualbook.managed_vs_fixed(
+                        user_id=st.session_state.auth_user_id)
+                    if ab["n_pairs"]:
+                        delta = ab["mean_delta_pct"]
+                        st.markdown(
+                            f"**🤖 Managed vs fixed (Gap-and-Go)** — {ab['n_pairs']} "
+                            f"matched pair(s) · mean Δ **{delta:+.2f}%** "
+                            f"(managed − fixed) · win% mgd **{ab['mgd_win_rate']}%** "
+                            f"vs fixed **{ab['fixed_win_rate']}%** · avg "
+                            f"{ab['avg_stop_moves']} stop-moves · mean MFE "
+                            f"{ab['mean_mfe_pct']:+.2f}%")
+                        verdict = ("smarter ✅" if delta > 0 else
+                                   "not yet better ⚠️" if delta < 0 else "even")
+                        st.caption(f"Management looks **{verdict}** on this sample. "
+                                   "Small n — collect more before concluding "
+                                   "(see algolab/LEARNINGS.md H5).")
+                except Exception:
+                    pass
 
                 hist = [p for p in book if p["status"] == "closed"]
                 st.markdown(f"**Trade history ({len(hist)})**")
@@ -1220,6 +1559,68 @@ def _journal_panel() -> None:
                    "props don't beat ≥60% ones, the score needs recalibration.")
 
 
+def _chg_style(chg: float) -> tuple[str, str]:
+    """(color, arrow) for a signed change — one place so every surface agrees."""
+    up = chg >= 0
+    return ("#1b9e3e" if up else "#e53935"), ("▲" if up else "▼")
+
+
+_SESSION_BADGE = {
+    "pre-market": "<span style='background:#5b3a86;color:#fff;padding:2px 8px;"
+                  "border-radius:6px;font-size:0.7em'>🌅 PRE-MARKET</span>",
+    "after-hours": "<span style='background:#2b4a86;color:#fff;padding:2px 8px;"
+                   "border-radius:6px;font-size:0.7em'>🌙 AFTER-HOURS</span>",
+}
+
+
+def _quote_header_html(title: str, q, current_price: float | None = None,
+                       status_html: str = "") -> str:
+    """The one price-header renderer, shared by the fast and live headers.
+
+    Everything displayed derives from the ``Quote`` (the root of trust). The only
+    per-surface input is ``current_price`` — the fast header passes the quote's
+    latest print, the live header passes the streaming tick — so the two never
+    disagree about what a move means. During pre/after-hours it renders two lines
+    (regular-session day move on top, extended-hours print below, Yahoo-style);
+    otherwise a single line of the current price vs the prior close.
+    """
+    price = q.price if current_price is None else current_price
+    reg, prev = q.regular_close, q.prev_close
+
+    if q.is_extended and reg is not None and prev is not None:
+        dcolor, darrow = _chg_style(q.day_change)
+        ext_chg = (price - reg) if price is not None else 0.0
+        ext_pct = (ext_chg / reg * 100) if reg else 0.0
+        ecolor, earrow = _chg_style(ext_chg)
+        badge = _SESSION_BADGE.get(q.session, "")
+        return (
+            "<div style='display:flex;align-items:baseline;gap:16px;flex-wrap:wrap'>"
+            f"<span style='font-size:1.4em;font-weight:600'>{title}</span>"
+            f"<span style='font-size:2.0em;font-weight:700'>${reg:,.2f}</span>"
+            f"<span style='font-size:1.2em;color:{dcolor};font-weight:600'>"
+            f"{darrow} {q.day_change:+,.2f} ({q.day_change_pct:+.2f}%)</span>"
+            "<span style='color:#888;font-size:0.9em'>at close</span>"
+            f"{status_html}</div>"
+            "<div style='display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-top:2px'>"
+            f"{badge}"
+            f"<span style='font-size:1.1em;font-weight:600'>${price:,.2f}</span>"
+            f"<span style='color:{ecolor};font-weight:600'>"
+            f"{earrow} {ext_chg:+,.2f} ({ext_pct:+.2f}%) vs close</span></div>"
+        )
+
+    # Regular session (or no close reference): current price vs the prior close.
+    chg = (price - prev) if (price is not None and prev is not None) else q.day_change
+    pct = q.pct_from_prev(price)
+    color, arrow = _chg_style(chg)
+    return (
+        "<div style='display:flex;align-items:baseline;gap:16px;flex-wrap:wrap'>"
+        f"<span style='font-size:1.4em;font-weight:600'>{title}</span>"
+        f"<span style='font-size:2.0em;font-weight:700'>${price:,.2f}</span>"
+        f"<span style='font-size:1.2em;color:{color};font-weight:600'>"
+        f"{arrow} {chg:+,.2f} ({pct:+.2f}%)</span>{status_html}</div>"
+    )
+
+
 def _price_header(result) -> None:
     q = result.quote
     name = result.company.fundamentals.name if (result.company and result.company.available) else ""
@@ -1227,24 +1628,7 @@ def _price_header(result) -> None:
     if q is None:
         st.subheader(title)
         return
-    up = q.change >= 0
-    color = "#1b9e3e" if up else "#e53935"
-    arrow = "▲" if up else "▼"
-    badge = ""
-    if q.session == "pre-market":
-        badge = "<span style='background:#5b3a86;color:#fff;padding:2px 8px;border-radius:6px;font-size:0.7em'>🌅 PRE-MARKET</span>"
-    elif q.session == "after-hours":
-        badge = "<span style='background:#2b4a86;color:#fff;padding:2px 8px;border-radius:6px;font-size:0.7em'>🌙 AFTER-HOURS</span>"
-    change_label = "vs prior close" if q.session != "regular" else ""
-    st.markdown(
-        f"<div style='display:flex;align-items:baseline;gap:16px;flex-wrap:wrap'>"
-        f"<span style='font-size:1.4em;font-weight:600'>{title}</span>"
-        f"<span style='font-size:2.0em;font-weight:700'>${q.price:,.2f}</span>"
-        f"<span style='font-size:1.2em;color:{color};font-weight:600'>"
-        f"{arrow} {q.change:+,.2f} ({q.change_pct:+.2f}%) {change_label}</span>"
-        f"{badge}</div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown(_quote_header_html(title, q), unsafe_allow_html=True)
     st.caption(f"Source: {q.source} · provider: {result.provider}")
 
 
@@ -1260,6 +1644,121 @@ def _extended_alert(result) -> None:
                 f"{icon} **Extended-hours move:** {s.evidence} "
                 "_(watch the open — may shift the near-term trend.)_")
             return
+
+
+def _day_trader_card(result) -> None:
+    """⚡ Focused day-trader snapshot for a quick action decision: today's range,
+    buyer/seller battle zones, the intraday bull/bear split, and the nearest
+    resistance target. Built from frames already fetched, so it renders instantly."""
+    price = result.quote.price if result.quote else None
+    card = build_day_card(result.reports, price)
+    if card is None:
+        return
+
+    with st.container(border=True):
+        head_l, head_r = st.columns([3, 1.5])
+        head_l.markdown("### ⚡ Day-trader card")
+        if card.day_change_pct is not None:
+            up = card.day_change_pct >= 0
+            c, arrow = ("#1b9e3e", "▲") if up else ("#e53935", "▼")
+            head_r.markdown(
+                f"<div style='text-align:right'>"
+                f"<span style='font-size:1.4em;font-weight:700'>${card.current_price:,.2f}</span><br>"
+                f"<span style='color:{c};font-weight:600'>{arrow} {card.day_change_pct:+.2f}% "
+                f"<span style='color:gray;font-size:0.8em'>since open</span></span></div>",
+                unsafe_allow_html=True)
+        else:
+            head_r.markdown(f"<div style='text-align:right;font-size:1.4em;font-weight:700'>"
+                            f"${card.current_price:,.2f}</div>", unsafe_allow_html=True)
+
+        # Buyers-vs-sellers split: who controlled the session's volume.
+        if card.bull_pct is not None:
+            bull, bear = card.bull_pct, card.bear_pct
+            bull_lbl = f"{bull:.0f}% buyers" if bull >= 18 else ""
+            bear_lbl = f"{bear:.0f}% sellers" if bear >= 18 else ""
+            st.markdown(
+                "<div style='display:flex;height:24px;border-radius:6px;overflow:hidden;"
+                "font-size:0.74em;font-weight:700;color:#fff;margin:2px 0 8px'>"
+                f"<div style='width:{bull}%;background:#1b9e3e;display:flex;align-items:center;"
+                f"justify-content:center'>{bull_lbl}</div>"
+                f"<div style='width:{bear}%;background:#e53935;display:flex;align-items:center;"
+                f"justify-content:center'>{bear_lbl}</div></div>",
+                unsafe_allow_html=True)
+
+        # Compact metric grid — custom HTML (not st.metric, whose oversized value
+        # font truncates dollar prices in a narrow column).
+        def _cell(label: str, value: str, sub: str, value_color: str = "") -> str:
+            vc = f"color:{value_color};" if value_color else ""
+            return (f"<div style='flex:1 1 120px;min-width:108px'>"
+                    f"<div style='font-size:0.76em;color:#8a93a0'>{label}</div>"
+                    f"<div style='font-size:1.08em;font-weight:700;{vc}white-space:nowrap'>{value}</div>"
+                    f"<div style='font-size:0.76em;color:#8a93a0'>{sub}</div></div>")
+
+        if card.session_low is not None and card.session_high is not None:
+            span = (f"{card.session_range_pct:.1f}% span"
+                    if card.session_range_pct is not None else "today")
+            range_cell = _cell("Today's range",
+                               f"${card.session_low:,.2f} – ${card.session_high:,.2f}", span)
+        else:
+            range_cell = _cell("Today's range", "—", "")
+
+        if card.next_target is not None:
+            tgt_cell = _cell("🎯 Next target", f"${card.next_target:,.2f}",
+                             f"{card.next_target_pct:+.1f}% to resistance", "#1b9e3e")
+        else:
+            tgt_cell = _cell("🎯 Next target", "—", "clear air above")
+
+        if card.next_support is not None:
+            sup_cell = _cell("🛡️ Support", f"${card.next_support:,.2f}",
+                             f"{card.next_support_pct:+.1f}% to floor", "#e53935")
+        else:
+            sup_cell = _cell("🛡️ Support", "—", "no floor on range")
+
+        bias_color = {"Bullish": "#1b9e3e", "Bearish": "#e53935"}.get(card.bias_label, "#8a93a0")
+        bias_sub = (f"{card.bull_pct:.0f}% buy / {card.bear_pct:.0f}% sell"
+                    if card.bull_pct is not None else "—")
+        bias_cell = _cell("Day bias", card.bias_label, bias_sub, bias_color)
+
+        st.markdown(
+            "<div style='display:flex;gap:14px;flex-wrap:wrap;margin:2px 0 4px'>"
+            + range_cell + tgt_cell + sup_cell + bias_cell + "</div>",
+            unsafe_allow_html=True)
+
+        # Where price sits in today's range — the day trader's "am I near the
+        # high (breakout watch) or the low (bounce watch)?" glance.
+        if card.range_position_pct is not None:
+            pos = card.range_position_pct
+            near = ("near the high — breakout watch" if pos >= 75
+                    else "near the low — bounce watch" if pos <= 25
+                    else "mid-range")
+            st.markdown(
+                f"<div style='margin:8px 0 2px;font-size:0.82em'>Position in today's range: "
+                f"<b>{pos:.0f}%</b> <span style='color:#8a93a0'>· {near}</span></div>"
+                "<div style='position:relative;height:10px;border-radius:5px;"
+                "background:linear-gradient(90deg,#e5393544,#9e9e9e22,#1b9e3e44)'>"
+                f"<div style='position:absolute;left:{pos}%;top:-4px;width:4px;height:18px;"
+                "background:#ff9800;border-radius:2px;transform:translateX(-50%)'></div></div>",
+                unsafe_allow_html=True)
+
+        if card.battle_zones:
+            chips = "".join(
+                f"<span style='background:#8e44ad22;border:1px solid #8e44ad;"
+                f"border-radius:5px;padding:2px 8px;margin-right:6px;font-size:0.92em'>"
+                f"${z.price:,.2f} · {z.volume_pct:.0f}% vol</span>"
+                for z in card.battle_zones)
+            st.markdown(
+                "<div style='margin-top:6px'><b>🥊 Battle zones</b> "
+                "<span style='color:gray;font-size:0.85em'>"
+                "(where buyers &amp; sellers fought hardest — heaviest traded prices):</span><br>"
+                f"<div style='margin-top:4px'>{chips}</div></div>",
+                unsafe_allow_html=True)
+
+        sup_s = " · ".join(f"${p:,.2f}" for p in card.supports) or "—"
+        res_s = " · ".join(f"${p:,.2f}" for p in card.resistances) or "—"
+        bars_note = (f"{card.n_session_bars} session bars" if card.intraday
+                     else "daily data (intraday unavailable)")
+        st.caption(f"🟩 **Support below:** {sup_s}  　🟥 **Resistance above:** {res_s}  ·  "
+                   f"levels from history + today · {bars_note} · for quick reads, **not advice**")
 
 
 def _gauge(go_score: int, color: str, title: str) -> go.Figure:
@@ -1309,12 +1808,15 @@ def _recommendation_section(result, rec, usecase: UseCase) -> None:
 
 
 def _cost_basis_block(buy_price: float, current: float,
-                       stop: float, target: float) -> None:
-    """Show P&L at current price, at stop, and at target — all relative to buy price."""
-    pnl_now  = (current - buy_price) / buy_price * 100
-    pnl_stop = (stop    - buy_price) / buy_price * 100
-    pnl_tgt  = (target  - buy_price) / buy_price * 100
-    locked   = stop >= buy_price           # stop is above cost → worst case = still profitable
+                       stop: float, target: float,
+                       spread: float = _SPREAD_PER_SHARE) -> None:
+    """Show P&L at current price, at stop, and at target — all relative to buy
+    price and NET of the flat $/share spread, so 'break-even' is honest."""
+    sp = spread / buy_price * 100 if buy_price else 0.0   # $/share fee as % of cost
+    pnl_now  = (current - buy_price) / buy_price * 100 - sp
+    pnl_stop = (stop    - buy_price) / buy_price * 100 - sp
+    pnl_tgt  = (target  - buy_price) / buy_price * 100 - sp
+    locked   = stop >= buy_price + spread   # stop covers cost + spread → real profit
 
     st.markdown("---")
     st.markdown("**📌 Your position — adjusted to your buy price**")
@@ -1340,7 +1842,7 @@ def _cost_basis_block(buy_price: float, current: float,
         else:
             msg = (f"🟡 Up **{pnl_now:.1f}%** but your stop (${stop:.2f}) is still below "
                    f"your ${buy_price:.2f} cost. Tip: raise the stop to "
-                   f"~${buy_price * 1.002:.2f} to make this trade risk-free.")
+                   f"~${buy_price + spread:.2f} (cost + spread) to make this trade risk-free.")
     elif pnl_now >= -3:
         msg = (f"🟡 Near break-even ({pnl_now:+.1f}%). "
                f"Stop at ${stop:.2f} limits downside to **{pnl_stop:.1f}%** from what you paid.")
@@ -1620,6 +2122,72 @@ _ENGINE_REFRESH_S = 45          # re-run the signal engine at most this often
 _SEV_RANK = {"bad": 3, "good": 3, "warn": 2, "info": 1}
 _SEV_COLOR = {"good": "#1b9e3e", "bad": "#e53935", "warn": "#f9a825", "info": "#90a4ae"}
 
+# Live mode runs as three sibling fragments, each redrawing only as fast as its
+# contents actually change. The old single 1s fragment rebuilt everything —
+# including two full plotly figures — every second, which is more work than one
+# second of wall clock, so ticks queued and the chart appeared frozen.
+#
+#   FAST (1s)  price header. Pure HTML, no figures — this is what must feel live.
+#   MID  (3s)  heartbeat figure, bot marking, flip detection, event feed.
+#   SLOW (15s) plan, orders guide, the main candlestick chart, signal chips.
+#
+# A 5-minute candle does not need redrawing every second; the price above it does.
+_LIVE_FAST_S = 1
+_LIVE_MID_S = 3
+_LIVE_SLOW_S = 15
+
+
+class _timed:
+    """Record how long a fragment body took, so the cadences above can be tuned
+    from evidence instead of guesswork.
+
+    Keeps the last 40 samples per section in session state; `_perf_panel` renders
+    p50/p95. A fragment whose p95 exceeds its own run_every is the thing to fix —
+    that is precisely the condition that makes redraws queue up and the UI stall.
+    """
+
+    def __init__(self, name: str, budget_s: float | None = None):
+        self.name, self.budget_s = name, budget_s
+
+    def __enter__(self):
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        ms = (time.perf_counter() - self._t0) * 1000
+        ss = st.session_state
+        ss.setdefault("_perf", {})
+        rec = ss._perf.setdefault(self.name, {"ms": [], "budget_s": self.budget_s})
+        rec["ms"] = (rec["ms"] + [ms])[-40:]
+        return False
+
+
+def _perf_panel() -> None:
+    """Opt-in timing readout for live mode (sidebar toggle)."""
+    perf = st.session_state.get("_perf") or {}
+    if not perf:
+        st.caption("No timings yet — let live mode run for a few seconds.")
+        return
+    # Plain markdown, not st.dataframe: this is a four-row table, and the grid
+    # widget renders to a canvas that can't be read off the page (or copied out
+    # of a bug report).
+    lines = ["| fragment | n | p50 ms | p95 ms | budget ms | |",
+             "|---|--:|--:|--:|--:|---|"]
+    for name, rec in perf.items():
+        s = sorted(rec["ms"])
+        if not s:
+            continue
+        p50 = s[len(s) // 2]
+        p95 = s[min(len(s) - 1, int(len(s) * 0.95))]
+        budget_ms = (rec["budget_s"] or 0) * 1000
+        over = budget_ms and p95 > budget_ms
+        lines.append(f"| {name} | {len(s)} | {p50:.0f} | {p95:.0f} | "
+                     f"{budget_ms:.0f} | {'⚠️ over' if over else '✅ ok'} |")
+    st.markdown("\n".join(lines))
+    st.caption("A fragment whose **p95 exceeds its budget** cannot finish before "
+               "its next scheduled run — that backlog is what makes the UI feel "
+               "stuck. Lower its cadence or move work out of it.")
+
 
 def _live_dashboard(ticker, prefer, usecase, strategy, pace, buy_price, result) -> None:
     ss = st.session_state
@@ -1645,21 +2213,51 @@ def _live_dashboard(ticker, prefer, usecase, strategy, pace, buy_price, result) 
         ss.live_engine = None
         ss.live_prev_state = None
         ss.live_events = []
+        ss.live_shared = None
+        # Chart view caches are per-ticker; drop them so a new symbol reframes
+        # rather than inheriting the previous one's viewport.
+        ss._chart_focus = {}
+        ss._resample_memo = {}
 
     sent = result.sentiment.score if (result.sentiment and result.sentiment.available) else None
     ctx = dict(ticker=ticker, prefer=prefer, usecase=usecase, strategy=strategy, pace=pace,
                buy_price=buy_price, sent=sent, result=result, max_secs=max_secs)
 
-    @st.fragment(run_every="1s")
-    def _frame():
-        _live_frame(ctx)
+    # Seed the shared state before any fragment runs, so the fast header never
+    # paints against a half-built dashboard on the very first frame.
+    if ss.get("live_shared") is None:
+        _refresh_live_shared(ctx)
 
-    _frame()
+    @st.fragment(run_every=f"{_LIVE_FAST_S}s")
+    def _fast():
+        with _timed("fast · price header", _LIVE_FAST_S):
+            _live_fast_frame(ctx)
+
+    @st.fragment(run_every=f"{_LIVE_MID_S}s")
+    def _mid():
+        with _timed("mid · pulse/bots/feed", _LIVE_MID_S):
+            _live_mid_frame(ctx)
+
+    @st.fragment(run_every=f"{_LIVE_SLOW_S}s")
+    def _slow():
+        with _timed("slow · chart/plan", _LIVE_SLOW_S):
+            _live_slow_frame(ctx)
+
+    _fast()
+    _mid()
+    _slow()
+    if ss.get("show_perf"):
+        with st.expander("⏱ Live-mode frame timings", expanded=False):
+            _perf_panel()
 
 
-def _live_frame(ctx: dict) -> None:
+def _live_pulse(ctx: dict) -> dict:
+    """Everything derivable from the tick stream alone — no engine, no network.
+
+    Cheap enough to run at 1s: read the ring buffer, take the last price, note
+    whether the session has hit its auto-stop.
+    """
     ss = st.session_state
-    ticker = ctx["ticker"]
     stream = ss.get("rt_stream")
     now = time.time()
     elapsed = now - ss.get("rt_started_at", now)
@@ -1667,11 +2265,37 @@ def _live_frame(ctx: dict) -> None:
     if ended and stream is not None:
         stream.stop()
 
-    # --- engine refresh (~45s): re-run the signal engine on a fresh 1D frame ---
+    snap = stream.snapshot() if stream is not None else None
+    shared = ss.get("live_shared") or {}
+    live_price = None
+    if snap and snap.ticks:
+        live_price = snap.ticks[-1].price
+    if live_price is None and ctx["result"].quote:
+        live_price = ctx["result"].quote.price
+    if live_price is None and shared.get("d1") is not None:
+        live_price = shared["d1"].meta.get("last_close")
+    return {"snap": snap, "live_price": live_price, "elapsed": elapsed,
+            "ended": ended, "now": now}
+
+
+def _refresh_live_shared(ctx: dict, pulse: dict | None = None) -> dict:
+    """Re-run the engine and rebuild both recommendation framings.
+
+    This is the expensive half of live mode — `analyze_ticker` is a blocking
+    network fetch — so it is confined to the SLOW fragment and gated to
+    `_ENGINE_REFRESH_S`. The result lands in `ss.live_shared`, which the faster
+    fragments read without ever touching the network themselves.
+    """
+    ss = st.session_state
+    ticker = ctx["ticker"]
+    now = time.time()
+    pulse = pulse or {}
+    live_price = pulse.get("live_price")
+
     eng = ss.get("live_engine")
     if eng is None:
         ss.live_engine = eng = {"reports": dict(ctx["result"].reports), "ts": now}
-    elif now - eng["ts"] > _ENGINE_REFRESH_S and not ended:
+    elif now - eng["ts"] > _ENGINE_REFRESH_S and not pulse.get("ended"):
         try:
             res = analyze_ticker(ticker, timeframes=[Timeframe.D1],
                                  prefer=None if ctx["prefer"] == "auto" else ctx["prefer"],
@@ -1684,19 +2308,10 @@ def _live_frame(ctx: dict) -> None:
         eng["ts"] = now
     reports = eng["reports"]
     d1 = reports.get(Timeframe.D1)
-    engine_age = int(now - eng["ts"])
 
-    # --- live price: latest tick → quote → engine close ---
-    snap = stream.snapshot() if stream is not None else None
-    live_price = None
-    if snap and snap.ticks:
-        live_price = snap.ticks[-1].price
-    if live_price is None and ctx["result"].quote:
-        live_price = ctx["result"].quote.price
     if live_price is None and d1 is not None:
         live_price = d1.meta.get("last_close")
 
-    # --- recompute BOTH framings at the live price (cheap: cached reports) ---
     reco_ctx = _reco_context(ctx["result"])
     swing_verdict = build_verdict(reports, ctx["sent"], Strategy.SWING, ctx["pace"])
     swing_rec = build_recommendation(
@@ -1707,22 +2322,46 @@ def _live_frame(ctx: dict) -> None:
         ticker, build_verdict(reports, ctx["sent"], Strategy.INVESTOR),
         reports, ctx["usecase"], Strategy.INVESTOR, price_override=live_price,
         context=reco_ctx)
-    plan = swing_rec.swing
-    primary = swing_rec if ctx["strategy"] == Strategy.SWING else inv_rec
-    key_level = _key_level(primary, ctx["usecase"])
-    stats = summarize(snap.ticks) if (snap and snap.ticks) else None
-    live_momentum = stats.momentum if stats else None
 
-    # --- render ---
-    _live_header(ctx, snap, live_price, elapsed, engine_age, ended)
-    _live_decision_strip(swing_rec, inv_rec, d1, ctx["pace"])
-    if plan is not None:
-        _swing_score_block(plan)
-        _orders_guide(plan, ctx["usecase"], live_momentum=live_momentum,
-                      reports=reports, verdict=swing_verdict, rec=swing_rec)
+    primary = swing_rec if ctx["strategy"] == Strategy.SWING else inv_rec
+    shared = {
+        "reports": reports, "d1": d1, "eng_ts": eng["ts"],
+        "swing_verdict": swing_verdict, "swing_rec": swing_rec, "inv_rec": inv_rec,
+        "plan": swing_rec.swing, "key_level": _key_level(primary, ctx["usecase"]),
+    }
+    ss.live_shared = shared
+    return shared
+
+
+# --------------------------------------------------------------------------- #
+# FAST (1s) — the price, and nothing but the price.
+# --------------------------------------------------------------------------- #
+def _live_fast_frame(ctx: dict) -> None:
+    p = _live_pulse(ctx)
+    engine_age = int(time.time() - (st.session_state.get("live_shared") or {}).get(
+        "eng_ts", time.time()))
+    _live_header(ctx, p["snap"], p["live_price"], p["elapsed"], engine_age, p["ended"])
+
+
+# --------------------------------------------------------------------------- #
+# MID (3s) — the live pulse: heartbeat, bots, flips, feed.
+# --------------------------------------------------------------------------- #
+def _live_mid_frame(ctx: dict) -> None:
+    ss = st.session_state
+    shared = ss.get("live_shared")
+    if not shared:
+        return
+    p = _live_pulse(ctx)
+    snap, live_price, now = p["snap"], p["live_price"], p["now"]
+    ticker = ctx["ticker"]
+    plan, d1 = shared["plan"], shared["d1"]
+
+    if snap and len(snap.ticks) >= 2:
+        _live_heartbeat(snap.ticks)
 
     # Flip detection → toast + event feed.
-    cur = _build_live_state(swing_rec, inv_rec, d1, live_price, plan, key_level)
+    cur = _build_live_state(shared["swing_rec"], shared["inv_rec"], d1, live_price,
+                            plan, shared["key_level"])
     events = diff_states(ss.get("live_prev_state"), cur)
     ss.live_prev_state = cur
     if events:
@@ -1733,50 +2372,79 @@ def _live_frame(ctx: dict) -> None:
         top_ev = max(events, key=lambda e: _SEV_RANK.get(e.severity, 0))
         st.toast(top_ev.text, icon="⚡")
 
-    # Virtual book: bots act on the analyzed ticker too; mark holdings ~10s.
-    if plan is not None and live_price and now - ss.get("vb_last_mark", 0) > 10:
+    # Virtual book: bots act on the analyzed ticker too. Mark every ~2s when we
+    # hold a position (ASAP stop/target/trend reaction) else ~10s; manage runs
+    # BEFORE mark so a freshly-tightened stop can close on the same tick.
+    mark_gap = 2 if virtualbook.has_any_open(
+        ticker, user_id=st.session_state.auth_user_id) else 10
+    if plan is not None and live_price and now - ss.get("vb_last_mark", 0) > mark_gap:
         ss.vb_last_mark = now
-        _run_bots(ticker, plan, reports=reports, verdict=swing_verdict, rec=swing_rec)
-        for chg in virtualbook.mark(ticker, live_price, user_id=st.session_state.auth_user_id):
+        phase = session.market_phase()
+        orange = _opening_range(ticker, ctx["result"])
+        _run_bots(ticker, plan, reports=shared["reports"], verdict=shared["swing_verdict"],
+                  rec=shared["swing_rec"], orange=orange, price=live_price, phase=phase)
+        tc = d1.trend_change if d1 is not None else None
+        virtualbook.manage(
+            ticker, live_price, shared["reports"], tc,
+            user_id=st.session_state.auth_user_id)
+        for chg in virtualbook.mark(
+                ticker, live_price, user_id=st.session_state.auth_user_id):
             if chg["status"] == "closed":
                 st.toast(f"💼 {chg['trader']} closed {ticker}: {chg['close_reason']} "
                          f"({chg['pnl_pct']:+.1f}%)", icon="💼")
             else:
                 st.toast(f"💼 {chg['trader']}'s breakout order filled in {ticker}", icon="🚀")
 
-    _live_chart(ticker, d1, plan, key_level, live_price, snap, reports=reports)
-    _live_signal_chips(d1)
     if ctx["buy_price"] and plan is not None and live_price:
         _cost_basis_block(ctx["buy_price"], live_price, plan.stop, plan.target1)
     _live_event_feed()
-    st.caption("Price updates ~1s · signals re-run ~45s · plan/levels/P&L recomputed at "
-               "the live price · the multi-timeframe verdict is structural · "
-               "**not financial advice.**")
+
+
+# --------------------------------------------------------------------------- #
+# SLOW (15s) — structure: the plan, the orders guide, the candlestick chart.
+# --------------------------------------------------------------------------- #
+def _live_slow_frame(ctx: dict) -> None:
+    p = _live_pulse(ctx)
+    shared = _refresh_live_shared(ctx, pulse=p)
+    snap, live_price = p["snap"], p["live_price"]
+    plan, d1 = shared["plan"], shared["d1"]
+    stats = summarize(snap.ticks) if (snap and snap.ticks) else None
+
+    _live_decision_strip(shared["swing_rec"], shared["inv_rec"], d1, ctx["pace"])
+    if plan is not None:
+        _swing_score_block(plan)
+        _orders_guide(plan, ctx["usecase"],
+                      live_momentum=(stats.momentum if stats else None),
+                      reports=shared["reports"], verdict=shared["swing_verdict"],
+                      rec=shared["swing_rec"])
+    _live_chart(ctx["ticker"], d1, plan, shared["key_level"], live_price, snap,
+                reports=shared["reports"])
+    _live_signal_chips(d1)
+    st.caption(f"Price updates ~{_LIVE_FAST_S}s · pulse/bots ~{_LIVE_MID_S}s · "
+               f"chart & plan ~{_LIVE_SLOW_S}s · signals re-run ~{_ENGINE_REFRESH_S}s · "
+               "the multi-timeframe verdict is structural · **not financial advice.**")
 
 
 def _live_header(ctx, snap, live_price, elapsed, engine_age, ended) -> None:
     result = ctx["result"]
+    q = result.quote
     name = result.company.fundamentals.name if (result.company and result.company.available) else ""
     title = ctx["ticker"] + (f" — {name}" if name else "")
-    prev_close = result.quote.prev_close if (result.quote and result.quote.prev_close) else None
-    change = change_pct = 0.0
-    if prev_close and live_price:
-        change = live_price - prev_close
-        change_pct = change / prev_close * 100 if prev_close else 0.0
-    up = change >= 0
-    color = "#1b9e3e" if up else "#e53935"
-    arrow = "▲" if up else "▼"
     connected = snap.connected if snap else False
     dot = "🟢 LIVE" if connected and not ended else ("⏹ stopped" if ended else "🟡 connecting…")
-    price_txt = f"${live_price:,.2f}" if live_price else "—"
-    st.markdown(
-        f"<div style='display:flex;align-items:baseline;gap:16px;flex-wrap:wrap'>"
-        f"<span style='font-size:1.3em;font-weight:600'>{title}</span>"
-        f"<span style='font-size:2.1em;font-weight:700'>{price_txt}</span>"
-        f"<span style='font-size:1.2em;color:{color};font-weight:600'>"
-        f"{arrow} {change:+,.2f} ({change_pct:+.2f}%) vs prior close</span>"
-        f"<span style='font-size:0.9em;color:#888'>{dot}</span></div>",
-        unsafe_allow_html=True)
+    status_html = f"<span style='font-size:0.9em;color:#888'>{dot}</span>"
+    # Same root of trust as the fast header — the live tick is just the current
+    # price fed in, so the day / extended split is computed identically.
+    if q is None:
+        price_txt = f"${live_price:,.2f}" if live_price else "—"
+        st.markdown(
+            "<div style='display:flex;align-items:baseline;gap:16px;flex-wrap:wrap'>"
+            f"<span style='font-size:1.4em;font-weight:600'>{title}</span>"
+            f"<span style='font-size:2.0em;font-weight:700'>{price_txt}</span>{status_html}</div>",
+            unsafe_allow_html=True)
+    else:
+        st.markdown(_quote_header_html(title, q, current_price=live_price,
+                                       status_html=status_html), unsafe_allow_html=True)
 
     stats = summarize(snap.ticks) if (snap and snap.ticks) else None
     remain = "" if ctx["max_secs"] is None else f" · {max(0, int(ctx['max_secs'] - elapsed))}s left"
@@ -1870,15 +2538,118 @@ _CHART_FRAMES = (Timeframe.D1, Timeframe.D5, Timeframe.M1, Timeframe.M6,
                  Timeframe.YTD, Timeframe.Y1, Timeframe.Y5)
 
 
-def _focus_right(fig, df, frac: float = 0.4) -> None:
-    """Open the view zoomed onto the most recent `frac` of bars (latest ticks),
-    so freshly-added candles land in a focused right-hand window. uirevision keeps
-    any later user pan/zoom; this only sets the *initial* range."""
+def _compute_focus(df, frac: float = 0.4, keep_prices=None):
+    """The initial viewport: the most recent `frac` of bars, with the price
+    y-axis framed to the candles ACTUALLY VISIBLE in that window (plus any nearby
+    keep_prices — live/entry/stop). Returns (x0, x1, y0, y1) or None.
+
+    Pure: it reads the frame and returns numbers, so the caller can cache the
+    result and re-apply the *same* viewport on every redraw."""
     n = len(df)
     if n < 8:
+        return None
+    i0 = int(n * (1 - frac))
+    x0, x1 = df.index[i0], df.index[-1]
+
+    win = df.iloc[i0:]
+    if not len(win):
+        return None
+    lo, hi = float(win["low"].min()), float(win["high"].max())
+    if hi <= lo:
+        return None
+    span = hi - lo
+    # Pull in nearby reference prices, but never let a far one (e.g. a distant
+    # target) re-expand the scale — clamp to ~0.5×span beyond.
+    for p in (keep_prices or []):
+        if p and lo - 0.5 * span <= p <= hi + 0.5 * span:
+            lo, hi = min(lo, p), max(hi, p)
+    pad = (hi - lo) * 0.08
+    return x0, x1, lo - pad, hi + pad
+
+
+def _apply_focus(fig, focus) -> None:
+    if focus is None:
         return
-    start = df.index[int(n * (1 - frac))]
-    fig.update_xaxes(range=[start, df.index[-1]], row=1, col=1)
+    x0, x1, y0, y1 = focus
+    # The price panel's x-axis is a *follower* (shared_xaxes matches it to the
+    # bottom anchor axis), so setting the range on row=1 alone gets overridden by
+    # the anchor's autorange. Set every x-axis so the anchor takes the range too.
+    fig.update_xaxes(range=[x0, x1])
+    fig.update_yaxes(range=[y0, y1], autorange=False, row=1, col=1)
+
+
+def _stable_focus(view_key: str, df, keep_prices=None):
+    """`_compute_focus`, but computed once per view and then held constant.
+
+    Recomputing the window on every redraw was the chart's worst live habit: the
+    range is derived from the last 40% of bars, so it crept on every new bar and
+    the whole plot visibly drifted underneath the user. Pinning it per
+    (ticker, timeframe, interval) means redraws are visually still, and plotly's
+    uirevision can keep any pan/zoom the user applied on top."""
+    ss = st.session_state
+    ss.setdefault("_chart_focus", {})
+    hit = ss._chart_focus.get(view_key)
+    if hit is None:
+        hit = _compute_focus(df, keep_prices=keep_prices)
+        ss._chart_focus[view_key] = hit
+    return hit
+
+
+def _resampled_report(ticker, rep, tf, minutes):
+    """Re-run the engine on rolled-up candles, memoized per (ticker, frame,
+    interval, last bar).
+
+    The roll-up itself is cheap, but `analyze_timeframe` recomputes every
+    indicator — so without the memo a 15m view would re-derive RSI/MACD/levels on
+    every redraw even when no new bar had printed. `ticker` belongs in the key:
+    two symbols can easily share a bar count and a last timestamp, and without it
+    one would be served the other's candles."""
+    ss = st.session_state
+    ss.setdefault("_resample_memo", {})
+    df = rep.df
+    key = f"{ticker}|{tf.value}"
+    sig = (minutes, len(df), df.index[-1])
+    hit = ss._resample_memo.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    try:
+        out = analyze_timeframe(resample_ohlcv(df, minutes))
+    except Exception:
+        return rep              # a view option must never break the chart
+    ss._resample_memo[key] = (sig, out)
+    return out
+
+
+def _chart_interval(ticker, rep, tf):
+    """Candle-size picker for intraday frames. Returns (report, minutes).
+
+    Coarser candles are exact integer roll-ups of the frame we already fetched
+    (see data/resample.py), so switching interval costs no network call and no
+    rate-limit budget."""
+    ss = st.session_state
+    choices = available_intervals(rep.df)
+    if len(choices) < 2:
+        return rep, (choices[0] if choices else None)
+
+    native = choices[0]
+    ss.setdefault("live_chart_interval", native)
+    if ss.live_chart_interval not in choices:
+        ss.live_chart_interval = native
+    labels = [f"{m}m" for m in choices]
+    cur = f"{ss.live_chart_interval}m"
+    picker = getattr(st, "segmented_control", None) or getattr(st, "pills", None)
+    if picker is not None:
+        chosen = picker("Candle size", labels, default=cur,
+                        key="live_chart_interval_pick", label_visibility="collapsed")
+    else:
+        chosen = st.radio("Candle size", labels, index=labels.index(cur),
+                          horizontal=True, key="live_chart_interval_pick",
+                          label_visibility="collapsed")
+    minutes = choices[labels.index(chosen)] if chosen in labels else native
+    ss.live_chart_interval = minutes
+    if minutes == native:
+        return rep, minutes
+    return _resampled_report(ticker, rep, tf, minutes), minutes
 
 
 def _live_chart(ticker, d1, plan, key_level, live_price, snap, reports=None) -> None:
@@ -1909,33 +2680,68 @@ def _live_chart(ticker, d1, plan, key_level, live_price, snap, reports=None) -> 
     ss.live_chart_tf = tf
 
     rep = reports.get(tf, d1)
+    ivl_col, reset_col = st.columns([5, 1])
+    with ivl_col:
+        rep, minutes = _chart_interval(ticker, rep, tf)
     is_live = tf == Timeframe.D1
-    suffix = "live (1D · 5-min)" if is_live else tf.value
+    ivl_txt = f"{minutes}-min" if minutes else "daily"
+    suffix = f"live (1D · {ivl_txt})" if is_live else f"{tf.value} · {ivl_txt}"
+    # The title doubles as plotly's uirevision key, so it must change when the
+    # view changes (interval/timeframe switch = fresh framing) and stay constant
+    # otherwise (redraw = keep the user's pan/zoom).
     fig = candlestick_figure(rep, title=f"{ticker} — {suffix}")
 
     # Plan overlays + the live price line belong on the live intraday frame only;
-    # on the structural frames they'd be off-scale clutter.
+    # on the structural frames they'd be off-scale clutter. The plan levels (your
+    # trade) get left-edge pills; market structure + the live price stay on the
+    # right (drawn by the chart itself), so the two never fight for the same gutter.
     if is_live:
-        if plan is not None and plan.trigger:
-            fig.add_hline(y=plan.trigger, line=dict(color="#ff9800", width=1.6, dash="dot"),
-                          annotation_text=f"🚀 trigger {plan.trigger:.2f}",
-                          annotation_position="left", row=1, col=1)
+        # Risk/reward zones behind the candles: a green REWARD band (entry→target)
+        # and a red RISK band (entry→stop) — the trade's geometry at a glance.
+        if plan is not None and plan.entry:
+            if plan.target1 and plan.target1 != plan.entry:
+                fig.add_hrect(y0=plan.entry, y1=plan.target1,
+                              fillcolor="rgba(38,166,154,0.12)", line_width=0,
+                              layer="below", row=1, col=1)
+            if plan.stop and plan.stop != plan.entry:
+                fig.add_hrect(y0=plan.stop, y1=plan.entry,
+                              fillcolor="rgba(239,83,80,0.12)", line_width=0,
+                              layer="below", row=1, col=1)
+        plan_lines = []
         if plan is not None:
-            for y, c, label in ((plan.entry, "#42a5f5", "entry"),
-                                (plan.stop, "#ef5350", "stop"),
-                                (plan.target1, "#26a69a", "target")):
-                fig.add_hline(y=y, line=dict(color=c, width=1.2, dash="dash"),
-                              annotation_text=f"{label} {y:.2f}", annotation_position="left",
-                              row=1, col=1)
+            if plan.trigger:
+                plan_lines.append((plan.trigger, "#ff9800", "dot", f"🚀 {plan.trigger:.2f}"))
+            plan_lines += [
+                (plan.entry, "#42a5f5", "dash", f"entry {plan.entry:.2f}"),
+                (plan.stop, "#ef5350", "dash", f"stop {plan.stop:.2f}"),
+                (plan.target1, "#26a69a", "dash", f"target {plan.target1:.2f}"),
+            ]
+        for y, c, dash, text in plan_lines:
+            fig.add_hline(y=y, line=dict(color=c, width=1.3, dash=dash), row=1, col=1)
+            fig.add_annotation(
+                xref="x domain", x=0.0, xanchor="left", xshift=4,
+                yref="y", y=y, yanchor="middle", showarrow=False,
+                text=f" {text} ", font=dict(size=10.5, color="#0e1117"),
+                bgcolor=c, borderpad=1, row=1, col=1)
         if live_price:
-            fig.add_hline(y=live_price, line=dict(color="#ffeb3b", width=1.4),
-                          annotation_text=f"LIVE {live_price:.2f}", annotation_position="right",
-                          row=1, col=1)
+            fig.add_hline(y=live_price, line=dict(color="#ffeb3b", width=1.4), row=1, col=1)
+            fig.add_annotation(
+                xref="x domain", x=0.0, xanchor="left", xshift=4,
+                yref="y", y=live_price, yanchor="middle", showarrow=False,
+                text=f" ● LIVE {live_price:.2f} ", font=dict(size=11, color="#0e1117"),
+                bgcolor="#ffeb3b", borderpad=1, row=1, col=1)
 
-    _focus_right(fig, rep.df)
+    keep = None
+    if is_live:
+        keep = [live_price]
+        if plan is not None:
+            keep += [plan.entry, plan.stop]
+    view_key = f"{ticker}|{tf.value}|{minutes}"
+    if reset_col.button("⤢", key="chart_reset_view", help="Re-frame the chart on "
+                        "the latest candles", use_container_width=True):
+        st.session_state.get("_chart_focus", {}).pop(view_key, None)
+    _apply_focus(fig, _stable_focus(view_key, rep.df, keep_prices=keep))
     st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_CFG)
-    if is_live and snap and len(snap.ticks) >= 2:
-        _live_heartbeat(snap.ticks)
 
 
 def _live_heartbeat(ticks) -> None:

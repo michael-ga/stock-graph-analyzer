@@ -61,6 +61,15 @@ again without materially more data:**
   only 13 swing-checked trades across 7 tickers. The lone nominally-significant
   one ("Engine bias agrees", p≈0.035, and *anti*-predictive) does not survive
   multiple-comparison correction. Treat all as hypotheses, not facts.
+- ❌ **"Speed up the radar by fetching fewer timeframes."** Tempting every time
+  the UI feels slow — and it is an *algorithm* change wearing a performance
+  costume. `build_verdict` normalizes by the weight of the timeframes actually
+  **present** (`aggregate.py`, `weighted_sum / weight_total`), so dropping 6M/YTD/
+  1Y/5Y silently re-weights the investor score, which flows into
+  `_radar_plan` → `context={"investor_pct": …}` → plan score → bot entries → the
+  book. Any "perf fix" that changes which timeframes reach `build_verdict` must be
+  treated as a scoring change and measured as one. (The long frames are cached on
+  disk for 6–24h anyway, so they are rarely the actual cost — measure first.)
 
 ---
 
@@ -72,6 +81,7 @@ again without materially more data:**
 | H2 | **The high-conviction layer is mis-calibrated (inverted).** 80+ score, high R:R, "engine bias agrees", "A-grade confluence" clustered on losers; snap_rr anti-predictive (winners R:R 1.38 vs losers 1.72; the 1.5–2.0 R:R band was worst). | Consistent across cuts, none significant. | **Watch only.** Do NOT re-weight yet. | When n≥100 ideas, split win-rate by score band and by R:R band; re-weight only if the inversion holds. |
 | H3 | **"Support test (uptrend)" is the real edge; with-trend > counter-trend.** | Support-test 6/6; Breakout(volume) 6/8; counter-trend Pullback/Momentum poor. | Watch only (n too small). | Track idea-level win-rate per setup over time. |
 | H4 | **The throwback/breakout model doesn't beat immediate entries.** | breakout_wait 9/15 (60%) vs immediate 8/13 (62%), but immediate captured ~2× profit/trade. | Watch only. | Compare idea-level avg_pnl breakout_wait vs immediate at larger n. |
+| H5 | **Active exit management beats a fixed stop/target** on identical Gap-and-Go entries. | None yet — instrumentation shipped 2026-06-21. | **Collecting.** Do NOT conclude until pairs accumulate. | `store.managed_vs_fixed()`: pair `bot-gap-mgd` vs `bot-gap-fixed` by `cohort_id`; positive mean Δ at n≥~30 pairs = management earns its place. |
 
 ---
 
@@ -129,3 +139,152 @@ guardrails that would be overfitting. Those wait for H2/H3 to accumulate data.
 **Next session, start here:** run `analyze.py`; if idea count has grown
 meaningfully (say ≥60), begin testing H2 (score/R:R calibration). Otherwise just
 keep logging and confirm the MACD veto (H1) isn't over-suppressing GOs.
+
+### 2026-06-21 — Gap-and-Go day-trade engine + adaptive radar + managed exits (H5)
+
+**What changed (code), all additive — baseline preserved:**
+1. **Adaptive radar CPU** (`app.py` `_radar_tier`/`_radar_panel`): the radar
+   fragment ticks every 5s but each ticker recomputes only when its tier is due
+   (HOT 5s · WATCH_CLOSE 10s · BUILDUP 25s · FAR 60s), so far-away buildups stop
+   burning CPU. Far buildups now cost ~1/12 of a hot name. No trade-logic change.
+2. **Gap-and-Go (Carter ORB) intraday rules:**
+   - New `stockanalyzer/session.py` ET clock: opening-range freeze (first 15 min,
+     **no entries**), the 9:45–11:30 entry window, the Friday flatten cutoff.
+   - Radar escalates to WATCH_CLOSE/HOT toward the opening-range HIGH **only** for
+     a real **gap-up** (open > prev close +2%) **inside the morning window**;
+     non-gappers/afternoon fall back to swing tiering.
+   - **Volume confirmation**: `swing.py` `go` now requires RVOL > **1.5** for
+     *breakout* setups (scoped so it doesn't suppress quiet pullback/support buys
+     — preserves the H1 buy-the-dip lesson). Gap-and-Go entry needs RVOL > 1.5 too.
+3. **Managed exits, MEASURED (H5):** two new bots take the *same* ORB entry
+   (hard stop just below the opening-range LOW, 2R target, shared `cohort_id`):
+   - `bot-gap-fixed` — fixed stop/target control.
+   - `bot-gap-mgd` — (a) cautious protective stop: spread-adjusted breakeven at
+     +1R then trail the tighter of 3×ATR chandelier and 5-min EMA8, **ratchet-only**;
+     (b) smart trend-flip: a flip (conf ≥0.6) or a 5-min close below EMA8 *tightens*
+     the stop to test the move (never market-dumps a winner on one noisy bar);
+     plus a Friday weekend-flat. Applied in `store.manage_trades` (managed rows
+     only) — `mark_trades` and the existing bots are untouched.
+4. **Risk realism:** `_SPREAD_PER_SHARE = 0.02` (flat $/share) — breakeven =
+   entry + $0.02; managed closes and `_cost_basis_block` deduct the flat per-share
+   spread (baseline `_close_row` default `spread=0.0`, byte-identical).
+5. **Schema v5**: `init_stop, mfe_pct, mae_pct, stop_moves, managed, entry_rvol,
+   hold_weekend` + `trade_events`. `algorithm_correctness` now filters `managed=0`
+   so the idea-level baseline is unchanged. `store.managed_vs_fixed()` + an
+   `analyze.py` section + an app panel surface the paired comparison.
+
+**Assumption challenged:** the naive "plan.go needs RVOL>1.5" would have suppressed
+textbook low-volume pullback buys (pullbacks trade quiet) — re-derives the H1
+mistake in volume form. The volume gate is now **scoped by setup type**, not blanket:
+breakout / gap-and-go / momentum-gap need a **surge** (rvol > 1.5); pullbacks need
+**drying** volume (rvol < 1.0 = seller exhaustion, a *low*-volume pass, never blocked
+for being quiet); all other setups get no volume veto. Guards:
+`test_pullback_on_heavy_volume_is_not_go` + `test_clean_pullback_stays_go_with_strong_score`.
+
+**Measurement honesty:** the shared ORB entry rules reset the historical baseline,
+so pre/post comparisons across this change are invalid. The **only** clean read is
+the paired `managed_vs_fixed` (same entry, two exits). At today's n that is **zero
+pairs** — H5 is *collecting*, not concluded. No score re-weighting was done.
+
+**Next session, start here:** run `analyze.py` view 4 (MANAGED vs FIXED). If pairs
+≥~30 with a positive mean Δ, the management earns its place; if negative, inspect
+which rule (over-tight trail? premature trend-test?) is bleeding the edge before
+touching thresholds in `manage.py`.
+
+---
+
+### 2026-07-21 — live-mode responsiveness (no algorithm change)
+
+**Nothing in this entry touches scoring, entries, exits, or the book.** It is
+recorded here only because the first plan for it *would* have — see the new
+"speed up the radar by fetching fewer timeframes" item under **Ruled out**.
+
+**Problem:** live mode felt stuck and the chart froze. Cause was structural, not
+algorithmic: a single `@st.fragment(run_every="1s")` rebuilt the *entire*
+dashboard every second, including two full Plotly figures, while the 5s radar and
+30s portfolio fragments competed for the same per-session script lock.
+
+**Changed:**
+1. Live mode split into three sibling fragments by how fast the content actually
+   changes — FAST 1s (price header, HTML only), MID 3s (heartbeat, bots, flip
+   detection, event feed), SLOW 15s (plan, orders guide, candlestick chart,
+   chips). Shared engine/plan state moved to `ss.live_shared`, rebuilt only in the
+   slow frame, so the fast frames never touch the network.
+2. Chart viewport (`_stable_focus`) computed **once per (ticker, timeframe,
+   interval)** instead of on every redraw. It was derived from the last 40% of
+   bars, so it crept with each new bar and the plot drifted under the user.
+3. Candle-size picker (5m / 15m / 30m) via local roll-up — `data/resample.py`,
+   pure + unit-tested. Coarser candles are exact integer multiples of the fetched
+   5m bars, so switching costs **no** network call and no rate-limit budget. The
+   engine is re-run on the rolled-up frame (indicator columns are deliberately
+   dropped — RSI on 5m ≠ RSI on 15m) and memoized per last-bar.
+4. Radar: reuse the `AnalysisResult` already in hand instead of re-entering
+   `st.cache_data` via `_quiet_price` purely to read one float (that path pays a
+   full unpickle of a seven-timeframe result). Behaviour identical.
+5. Added an opt-in frame-timing panel (sidebar → "⏱ Show frame timings").
+
+**How we know it worked — measured, after hours, 2026-07-21:**
+
+| fragment | p50 | p95 | budget |
+|---|--:|--:|--:|
+| fast · price header | 1 ms | 2 ms | 1000 ms |
+| mid · pulse/bots/feed | 1 ms | 1 ms | 3000 ms |
+| slow · chart/plan | 407 ms | 448 ms | 15000 ms |
+| radar | 9 ms | **4386 ms** | 5000 ms |
+
+The 407 ms chart rebuild used to run **every second** against a 1000 ms budget —
+~40% duty cycle before the radar took its share, which is exactly the backlog that
+made the UI feel frozen. It is now ~2.7%.
+
+**Next session, start here:** radar p95 is **4386 ms against a 5000 ms budget** —
+it only passes because most tickers are idle-tiered after hours, and it will blow
+the budget during RTH. That is the next thing to fix, and the fix is *not* fewer
+timeframes (see Ruled out): move `_run_quiet` + `virtualbook` marking onto a
+background worker thread (the `RealtimeStream` pattern in `data/realtime.py`) and
+let the fragment read a snapshot. Re-measure with the timing panel during market
+hours before and after.
+
+---
+
+### 2026-07-22 — reversal-at-support day-trade family (H6, collecting)
+
+**Why:** the swing setups aren't built for day trading — they target multi-day
+walls on a volatility budget, so a quick intraday dip-buy at support never
+surfaces. Added a *family* of fast reversal-at-support setups, built the same way
+as the Gap-and-Go engine (H5): one pure as-of function the live radar and
+`daytrade_backtest.py` share verbatim (no drift), driven by a config list.
+
+**What changed (code), all additive — nothing re-weighted, no schema change:**
+1. New `stockanalyzer/analysis/reversal.py` — `reversal_signal(card, intraday_df,
+   price, higher_trend, prev_close, asof_ts, cfg)`. Guard order: at support in the
+   lower 35% of the day's range → trend/strength gate → reversal print (confirmed
+   mode) → non-degenerate geometry → the **~3% go/no-go aim** (capped just under
+   the nearest resistance; skip if < 2.5%). Stop is hard, just below support. It
+   consumes `build_day_card` (session low, mapped supports, **volume battle-zones**
+   as support confidence) — no new data path.
+2. `REVERSAL_VARIANTS` — the starter matrix over two risk axes: entry
+   `touch` (aggressive, first tag) vs `confirmed` (bullish reclaim); trend
+   `with_trend` (dip-buy only when the daily trend is up, stands aside on a
+   gap-down ≤ −2%) vs `strong_support` (any trend, but the level needs ≥2
+   confirmations). Four bots: `rev-trend-touch/-confirm`, `rev-strong-touch/-confirm`.
+3. `app.py` `_run_reversal_bots` opens one bot per fired variant (`horizon_days=1`,
+   own `cohort_id`) and surfaces a `🔄 Reversal @ support` line on the radar card.
+   Shares the ORB opening-range freeze.
+4. `daytrade_backtest.py --variants` now prints a reversal `fires/wins/WR/expR`
+   sweep next to the ORB one, replaying the **same** `reversal_signal` bar-by-bar
+   (as-of, no lookahead); per-day contexts are built once and reused across
+   variants.
+
+**Pre-registered hypotheses (test as data accumulates — do NOT cull on one
+session):** (a) does `confirmed` entry beat `touch` on expectancy, or does the
+worse fill eat the higher hit-rate? (b) does `strong_support` (battle-zone-backed)
+justify taking counter-trend reversals, or is `with_trend` strictly better? Judge
+at the **idea level** (`algorithm_correctness` by `cohort_id`), ~100+ independent
+closed ideas before any per-variant claim — same guardrail as H5. Each variant is
+a genuinely distinct idea (different entry/stop), so they get distinct cohorts, not
+one plan copied across bots.
+
+**How we'll know:** run `daytrade_backtest.py <tickers> --variants` for the
+counterfactual fire/WR/expR ranking now; let the live bots accrue paired closed
+ideas for the real read. No baseline was reset (all additive), so existing swing
+and Gap-and-Go measurements are unaffected.

@@ -8,7 +8,7 @@ from collections import defaultdict
 from sqlalchemy import select
 
 from stockanalyzer.db.models import (
-    Trade, TradeIndicator, TradeSignal, TradeSwingCheck, TradeVerdict,
+    Trade, TradeEvent, TradeIndicator, TradeSignal, TradeSwingCheck, TradeVerdict,
 )
 from stockanalyzer.db.session import session_scope
 
@@ -36,6 +36,10 @@ def _dict(row: Trade) -> dict:
         "closed_ts": row.closed_ts, "closed": row.closed, "pnl_pct": row.pnl_pct,
         "pnl_usd": row.pnl_usd, "snapshot": row.snapshot or {},
         "cohort_id": row.cohort_id,
+        "init_stop": row.init_stop, "mfe_pct": row.mfe_pct,
+        "mae_pct": row.mae_pct, "stop_moves": row.stop_moves,
+        "managed": row.managed, "entry_rvol": row.entry_rvol,
+        "hold_weekend": row.hold_weekend,
     }
 
 
@@ -73,6 +77,13 @@ class TradeRepository:
                 Trade.trader == trader, Trade.status.in_(("open", "pending")),
             ).limit(1)) is not None
 
+    def has_any_open(self, user_id: str, ticker: str) -> bool:
+        with session_scope() as session:
+            return session.scalar(select(Trade.id).where(
+                Trade.user_id == user_id, Trade.ticker == ticker.upper(),
+                Trade.status.in_(("open", "pending")),
+            ).limit(1)) is not None
+
     def insert(self, user_id: str, trade: dict, context: dict | None = None) -> dict:
         snapshot = context or trade.get("snapshot") or {}
         with session_scope() as session:
@@ -89,6 +100,13 @@ class TradeRepository:
                 pnl_pct=trade.get("pnl_pct", 0.0) or 0.0,
                 pnl_usd=trade.get("pnl_usd", 0.0) or 0.0,
                 snapshot=snapshot, cohort_id=trade.get("cohort_id") or _cohort_id(trade, snapshot),
+                init_stop=float(trade.get("init_stop") or trade["stop"]),
+                mfe_pct=float(trade.get("mfe_pct", 0.0) or 0.0),
+                mae_pct=float(trade.get("mae_pct", 0.0) or 0.0),
+                stop_moves=int(trade.get("stop_moves", 0) or 0),
+                managed=bool(trade.get("managed", False)),
+                entry_rvol=trade.get("entry_rvol"),
+                hold_weekend=bool(trade.get("hold_weekend", False)),
             )
             session.add(row)
             for timeframe, info in (snapshot.get("timeframes") or {}).items():
@@ -134,13 +152,15 @@ class TradeRepository:
             return _dict(row)
 
     @staticmethod
-    def _finish(row: Trade, exit_price: float | None, reason: str, now: float) -> None:
+    def _finish(row: Trade, exit_price: float | None, reason: str, now: float,
+                spread: float = 0.0) -> None:
         row.status = "closed"; row.close_reason = reason; row.closed_ts = now
         row.closed = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
         if exit_price is not None:
-            row.exit_price = round(float(exit_price), 4)
-            row.pnl_pct = round((exit_price / row.entry - 1) * 100, 2)
-            row.pnl_usd = round((exit_price - row.entry) * row.shares, 2)
+            adjusted = float(exit_price) - spread
+            row.exit_price = round(adjusted, 4)
+            row.pnl_pct = round((adjusted / row.entry - 1) * 100, 2)
+            row.pnl_usd = round((adjusted - row.entry) * row.shares, 2)
 
     def mark(self, user_id: str, ticker: str, price: float,
              now: float | None = None) -> list[dict]:
@@ -179,6 +199,66 @@ class TradeRepository:
                     self._finish(row, price, "expired", now); changed.append(_dict(row))
         return changed
 
+    def manage(self, user_id: str, ticker: str, price: float, reports=None,
+               trend_change=None, now: float | None = None,
+               friday_flat: bool | None = None) -> list[dict]:
+        """Apply adaptive exit management to this user's managed positions."""
+        if not price or price <= 0:
+            return []
+        now = now or time.time()
+        if friday_flat is None:
+            try:
+                import pandas as pd
+                from stockanalyzer import session as market_session
+                friday_flat = market_session.is_friday_flat(
+                    pd.Timestamp(now, unit="s", tz="UTC"))
+            except Exception:
+                friday_flat = False
+
+        from stockanalyzer.manage import (
+            _SPREAD_PER_SHARE, assess_position, intraday_readout,
+        )
+        ema8, intraday_close = intraday_readout(reports)
+        changed: list[dict] = []
+        with session_scope() as session:
+            rows = session.scalars(select(Trade).where(
+                Trade.user_id == user_id, Trade.ticker == ticker.upper(),
+                Trade.status == "open", Trade.managed.is_(True),
+            ).with_for_update()).all()
+            for row in rows:
+                excursion = round((price / row.entry - 1) * 100, 2)
+                row.mfe_pct = max(row.mfe_pct or 0.0, excursion)
+                row.mae_pct = min(row.mae_pct or 0.0, excursion)
+                actions = assess_position(
+                    _dict(row), price, reports, None, trend_change, now,
+                    ema8_5m=ema8, intraday_close=intraday_close,
+                    is_friday_flat=bool(friday_flat),
+                    hold_weekend=bool(row.hold_weekend),
+                )
+                for action in actions:
+                    old_stop = row.stop
+                    if action.kind == "weekend_flat":
+                        self._finish(
+                            row, price, "weekend_flat", now,
+                            spread=_SPREAD_PER_SHARE)
+                        session.add(TradeEvent(
+                            trade_id=row.id, ts=now, kind=action.kind,
+                            detail=action.reason, price=price, old_stop=old_stop,
+                            new_stop=None, fraction=action.fraction,
+                        ))
+                        changed.append(_dict(row))
+                        break
+                    if action.new_stop is not None and action.new_stop > row.stop:
+                        row.stop = round(action.new_stop, 4)
+                        row.stop_moves = (row.stop_moves or 0) + 1
+                        session.add(TradeEvent(
+                            trade_id=row.id, ts=now, kind=action.kind,
+                            detail=action.reason, price=price, old_stop=old_stop,
+                            new_stop=row.stop, fraction=None,
+                        ))
+                        changed.append(_dict(row))
+        return changed
+
     def stats(self, user_id: str) -> dict:
         closed = [p for p in self.list(user_id)
                   if p["status"] == "closed" and p.get("close_reason") != "cancelled"]
@@ -195,7 +275,8 @@ class TradeRepository:
 
     def algorithm_correctness(self, user_id: str) -> dict:
         closed = [p for p in self.list(user_id)
-                  if p["status"] == "closed" and p.get("close_reason") != "cancelled"]
+                  if p["status"] == "closed" and p.get("close_reason") != "cancelled"
+                  and not p.get("managed")]
         cohorts: dict[str, list[dict]] = defaultdict(list)
         for trade in closed:
             cohorts[trade.get("cohort_id") or trade["id"]].append(trade)
@@ -222,3 +303,45 @@ class TradeRepository:
                 "setups": {k: aggregate(v) for k, v in sorted(setups.items())},
                 "bands": {k: aggregate(v) for k, v in sorted(bands.items())},
                 "ideas": sorted(ideas, key=lambda item: item["idea_pnl_pct"])}
+
+    def managed_vs_fixed(self, user_id: str) -> dict:
+        """Compare matched managed/fixed Gap-and-Go positions for one user."""
+        closed = [
+            trade for trade in self.list(user_id)
+            if trade["status"] == "closed"
+            and trade.get("close_reason") != "cancelled"
+            and trade["trader"] in ("bot-gap-mgd", "bot-gap-fixed")
+        ]
+        by_cohort: dict[str, dict[str, dict]] = defaultdict(dict)
+        for trade in closed:
+            by_cohort[trade.get("cohort_id") or trade["id"]][trade["trader"]] = trade
+        pairs = []
+        for cohort_id, grouped in by_cohort.items():
+            managed = grouped.get("bot-gap-mgd")
+            fixed = grouped.get("bot-gap-fixed")
+            if not (managed and fixed):
+                continue
+            pairs.append({
+                "cohort_id": cohort_id, "ticker": managed["ticker"],
+                "mgd_pnl_pct": managed["pnl_pct"],
+                "fixed_pnl_pct": fixed["pnl_pct"],
+                "delta_pct": round(managed["pnl_pct"] - fixed["pnl_pct"], 2),
+                "stop_moves": managed.get("stop_moves") or 0,
+                "mfe_pct": managed.get("mfe_pct") or 0.0,
+                "mgd_reason": managed.get("close_reason"),
+                "fixed_reason": fixed.get("close_reason"),
+            })
+        n = len(pairs)
+        if not n:
+            return {"n_pairs": 0, "mean_delta_pct": None, "mgd_win_rate": None,
+                    "fixed_win_rate": None, "avg_stop_moves": None,
+                    "mean_mfe_pct": None, "pairs": []}
+        return {
+            "n_pairs": n,
+            "mean_delta_pct": round(sum(p["delta_pct"] for p in pairs) / n, 2),
+            "mgd_win_rate": round(sum(p["mgd_pnl_pct"] > 0 for p in pairs) / n * 100),
+            "fixed_win_rate": round(sum(p["fixed_pnl_pct"] > 0 for p in pairs) / n * 100),
+            "avg_stop_moves": round(sum(p["stop_moves"] for p in pairs) / n, 2),
+            "mean_mfe_pct": round(sum(p["mfe_pct"] for p in pairs) / n, 2),
+            "pairs": sorted(pairs, key=lambda p: p["delta_pct"]),
+        }

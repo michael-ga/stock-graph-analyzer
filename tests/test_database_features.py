@@ -7,14 +7,15 @@ import pandas as pd
 import pytest
 
 from stockanalyzer.auth import AuthError, AuthService
-from stockanalyzer.db.models import Base
+from stockanalyzer.db.models import Base, TradeEvent
 from stockanalyzer.db.repositories.analysis_history import AnalysisHistoryRepository
 from stockanalyzer.db.repositories.api_cache import ApiCacheRepository
 from stockanalyzer.db.repositories.ohlcv import OhlcvRepository
 from stockanalyzer.db.repositories.rate_limits import RateLimitRepository
 from stockanalyzer.db.repositories.swingwatch import SwingWatchRepository
+from stockanalyzer.db.repositories.trades import TradeRepository
 from stockanalyzer.db.repositories.watchlist import WatchlistRepository
-from stockanalyzer.db.session import configure_engine
+from stockanalyzer.db.session import configure_engine, session_scope
 
 
 @pytest.fixture()
@@ -111,3 +112,58 @@ def test_analysis_history_filters_by_owner_and_exports_safe_csv(db):
     exported = repo.to_csv(rows)
     assert "password" not in exported.lower()
     assert "MSFT" in exported and "AAPL" not in exported
+
+
+def _managed_trade(trade_id: str, ticker: str = "AAA", trader: str = "bot-gap-mgd",
+                   managed: bool = True) -> dict:
+    return {
+        "id": trade_id, "ticker": ticker, "trader": trader,
+        "status": "open", "kind": "immediate", "opened_ts": 1_000_000.0,
+        "opened": "1970-01-12 13:46", "activated_ts": 1_000_000.0,
+        "entry": 100.0, "stop": 98.0, "target": 104.0, "trigger": None,
+        "stake": 1000.0, "shares": 10.0, "horizon_days": 1,
+        "managed": managed, "init_stop": 98.0, "entry_rvol": 2.0,
+        "hold_weekend": False, "snapshot": {"setup": "gap_and_go_orb"},
+        "pnl_pct": 0.0, "pnl_usd": 0.0,
+    }
+
+
+def test_managed_trade_repository_is_user_scoped_and_logs_stop_moves(db):
+    auth = AuthService()
+    owner = auth.create_user("managed-owner", "managed owner password")
+    other = auth.create_user("managed-other", "managed other password")
+    repo = TradeRepository()
+    repo.insert(owner.id, _managed_trade("managed-owner-trade"))
+    repo.insert(other.id, _managed_trade("managed-other-trade"))
+
+    assert repo.has_any_open(owner.id, "aaa")
+    changed = repo.manage(
+        owner.id, "AAA", 102.0, now=1_000_100.0, friday_flat=False)
+
+    assert len(changed) == 1
+    assert changed[0]["stop"] == 100.02
+    assert changed[0]["stop_moves"] == 1
+    assert repo.list(other.id)[0]["stop"] == 98.0
+    with session_scope() as session:
+        events = session.query(TradeEvent).all()
+        assert len(events) == 1
+        assert events[0].trade_id == "managed-owner-trade"
+        assert events[0].kind == "move_stop_breakeven"
+
+
+def test_managed_vs_fixed_repository_and_algorithm_correctness(db):
+    owner = AuthService().create_user("ab-owner", "ab owner password")
+    repo = TradeRepository()
+    fixed = _managed_trade("fixed", ticker="DDD", trader="bot-gap-fixed", managed=False)
+    managed = _managed_trade("managed", ticker="DDD", trader="bot-gap-mgd", managed=True)
+    repo.insert(owner.id, fixed)
+    repo.insert(owner.id, managed)
+    repo.close(owner.id, "fixed", 99.0, "manual", 1_000_100.0)
+    repo.close(owner.id, "managed", 104.0, "manual", 1_000_100.0)
+
+    comparison = repo.managed_vs_fixed(owner.id)
+    assert comparison["n_pairs"] == 1
+    assert comparison["pairs"][0]["delta_pct"] == 5.0
+    correctness = repo.algorithm_correctness(owner.id)
+    assert correctness["totals"]["n_trades"] == 1
+    assert correctness["ideas"][0]["traders"] == ["bot-gap-fixed"]

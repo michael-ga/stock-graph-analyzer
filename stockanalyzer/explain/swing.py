@@ -25,6 +25,7 @@ import math
 from dataclasses import dataclass, field
 
 from ..analysis.engine import TimeframeReport
+from ..analysis.indicators import relative_volume
 from ..analysis.signals import Direction
 from ..data.schema import Timeframe
 from ..strategy import SWING_PACE, PaceTuning, SwingPace
@@ -35,6 +36,8 @@ from .usecase import UseCase
 # judged plans win ~60-68% (120-point backtest), where 1.5:1 already carries
 # +0.5R expectancy. The sweep (rr 1.4-1.8 all positive) brackets this choice.
 _MIN_RR = 1.5
+_MIN_BREAKOUT_RVOL = 1.5    # a breakout is invalid unless volume > 1.5× average
+_PULLBACK_MAX_RVOL = 1.0    # a pullback is healthy only when selling is drying up
 _BREAKOUT_ROOM_FACTOR = 0.75   # breakout leg may be slightly under min_move (trigger-confirmed)
 _TRIGGER_NEAR_PCT = 0.015      # armed breakout orders only when price is coiled at the wall
 _CHASE_PCT = 5.0               # a ≥5% daily move in the last 3 daily bars = chase risk
@@ -326,7 +329,6 @@ def _long_geometry(price, walls, supports, atr_abs, budget_atr_abs,
     # stops run on the live ATR (must survive today's actual noise).
     budget = budget_atr_abs / price * math.sqrt(tuning.budget_days)  # fraction
     cap = min(tuning.target_cap, budget)
-    buffer = max(0.001 * price, 0.02 * atr_abs)
     s1 = supports[0] if supports else None
 
     def _stop_for(entry: float, wall_below: float | None) -> float:
@@ -411,7 +413,6 @@ def _short_geometry(price, walls, supports, atr_abs, budget_atr_abs,
                     leg_spent: bool = False) -> _Geometry:
     budget = budget_atr_abs / price * math.sqrt(tuning.budget_days)
     cap = min(tuning.target_cap, budget)
-    buffer = max(0.001 * price, 0.02 * atr_abs)
     r1 = walls[0] if walls else None                     # resistance above (stop side)
 
     def _stop_for(entry: float, wall_above: float | None) -> float:
@@ -992,11 +993,25 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
               (tuning.budget_days <= 3)     # fast pace may scalp first-wall bounces
     edays = context.get("earnings_days")
     earnings_block = edays is not None and edays <= tuning.earnings_guard_days
+    # Volume confirmation, scoped by setup TYPE. A blanket high-volume rule would
+    # wrongly veto pullbacks — which are healthy precisely when selling DRIES UP:
+    #   • breakout / gap-and-go / momentum-gap → need a surge      (rvol > 1.5)
+    #   • pullback                             → need drying volume (rvol < 1.0)
+    #   • everything else                      → neutral, no volume veto
+    # rvol is None (thin/no volume history) never blocks — visible honesty, not a veto.
+    rvol = relative_volume(df)
+    _setup = setup or ""
+    if _setup == "gap_and_go_orb" or "Breakout" in _setup or "Momentum" in _setup:
+        vol_ok = (rvol is None) or (rvol > _MIN_BREAKOUT_RVOL)
+    elif "Pullback" in _setup:
+        vol_ok = (rvol is None) or (rvol < _PULLBACK_MAX_RVOL)
+    else:
+        vol_ok = True
     # Famous-indicator vetoes (overext / adverse_trend computed above): a 2σ
     # Bollinger blowoff (don't chase) or a strong ADX trend running against the
     # entry (don't catch the knife) is never a GO.
     go = (geom.kind == "immediate" and setup_present and tier_ok
-          and rr >= _MIN_RR and aim >= tuning.min_move
+          and rr >= _MIN_RR and aim >= tuning.min_move and vol_ok
           and not strong_downtrend and not earnings_block and not crash_block
           and not overext and not adverse_trend and not macd_against)
     light = "go" if go else ("forming" if (setup_present or geom.kind == "breakout_wait")
@@ -1012,6 +1027,13 @@ def _build_side(report, price, df, names, fast, tuning: PaceTuning, all_reports,
           and geom.kind == "immediate"):
         guidance = ("Setup is there, but a key indicator says don't enter here: "
                     + "; ".join(veto_notes) + ". Wait for it to reset.")
+    elif setup_present and not vol_ok and geom.kind == "immediate":
+        if "Pullback" in _setup:
+            guidance = (f"Pullback setup, but volume isn't drying up ({rvol:.1f}× average) "
+                        "— wait for sellers to exhaust (sub-average volume) before entering.")
+        else:
+            guidance = (f"Breakout needs volume confirmation — only {rvol:.1f}× average "
+                        f"(need > {_MIN_BREAKOUT_RVOL:g}×). Wait for the volume surge.")
     elif geom.kind == "breakout_wait":
         guidance = (f"No room to the next {'floor' if short else 'ceiling'} — "
                     f"{geom.note}, then target ${target1:.2f} "
