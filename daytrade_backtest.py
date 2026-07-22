@@ -28,7 +28,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from stockanalyzer.analysis import orb
+from stockanalyzer.analysis import orb, reversal
+from stockanalyzer.analysis.daycard import build_day_card
 from stockanalyzer.analysis.engine import analyze_timeframe
 from stockanalyzer.analysis.indicators import relative_volume
 from stockanalyzer.data.providers import get_provider
@@ -446,6 +447,98 @@ def run_variants(tickers, per_ticker_data) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Reversal-at-support variants — same pure engine the live radar calls.
+# --------------------------------------------------------------------------- #
+def _higher_trend(reports: dict):
+    """The prevailing (daily) trend direction the reversal engine gates on."""
+    for tf in (Timeframe.M1, Timeframe.D5, Timeframe.M6):
+        rep = reports.get(tf)
+        if rep is not None:
+            return rep.trend.direction
+    return None
+
+
+def _reversal_contexts(i5, i30, daily, prev_close, day):
+    """Per-bar (t, price, card, higher_trend, intraday_df) for bars sitting in a
+    candidate reversal zone (near the running session low). The heavy as-of
+    reconstruction runs once per day; every variant then reuses these contexts."""
+    sess = _day_bars(i5, day).between_time(_REG_START, _REG_END, inclusive="left")
+    if sess.empty:
+        return sess, []
+    or_end = pd.Timestamp(_OR_END).time()
+    ctx: list[tuple] = []
+    run_low = None
+    for t, row in sess.iterrows():
+        low = float(row["low"])
+        run_low = low if run_low is None else min(run_low, low)
+        if t.time() < or_end or run_low <= 0:
+            continue
+        price = float(row["close"])
+        if price > run_low * 1.02:                 # cheap pre-filter: near the low only
+            continue
+        reports = _asof_reports(i5, i30, daily, day, t)
+        card = build_day_card(reports, price)
+        if card is None:
+            continue
+        d1 = reports.get(Timeframe.D1)
+        ctx.append((t, price, card, _higher_trend(reports),
+                    d1.df if d1 is not None else None))
+    return sess, ctx
+
+
+def _reversal_trade(cfg, sess, contexts, prev_close) -> dict | None:
+    """First bar where ``cfg`` fires wins; judge over the rest of the session."""
+    for t, price, card, htrend, idf in contexts:
+        dec = reversal.reversal_signal(card, idf, price, htrend, prev_close, t, cfg)
+        if not dec.fired:
+            continue
+        rest = sess[sess.index > t]
+        status, r = _judge_intraday(rest, dec.entry, dec.stop, dec.target, dec.rr)
+        return {"t": t.strftime("%H:%M"), "entry": dec.entry, "stop": dec.stop,
+                "target": round(dec.target, 2), "rr": dec.rr, "status": status,
+                "r": r, "conf": dec.support_conf}
+    return None
+
+
+def run_reversal_variants(tickers, per_ticker_data) -> None:
+    print("\n" + "=" * 74)
+    print("REVERSAL-AT-SUPPORT VARIANTS — ~3% aim, hard stop below support")
+    print("=" * 74)
+    # Precompute the (heavy) per-day contexts once; the variants reuse them so the
+    # sweep pays the as-of reconstruction a single time, not once per variant.
+    ctx_by: dict = {}
+    for tk in tickers:
+        d = per_ticker_data[tk]
+        for day in d["days"]:
+            pc = d["prev_close"].get(day)
+            ctx_by[(tk, day)] = (*_reversal_contexts(d["i5"], d["i30"], d["daily"],
+                                                     pc, day), pc)
+
+    hdr = f"{'variant':<20}{'fires':>6}{'wins':>6}{'WR':>6}{'expR':>7}"
+    print(hdr + "   detail")
+    print("-" * len(hdr))
+    for cfg in reversal.REVERSAL_VARIANTS:
+        trades, detail = [], []
+        for tk in tickers:
+            for day in per_ticker_data[tk]["days"]:
+                sess, contexts, pc = ctx_by[(tk, day)]
+                tr = _reversal_trade(cfg, sess, contexts, pc)
+                if tr:
+                    trades.append(tr)
+                    detail.append(f"{tk} {tr['status']} {tr['r']:+.1f}R")
+        done = [t for t in trades if t["status"] in ("target", "stop", "eod")]
+        wins = [t for t in done if t["r"] > 0]
+        wr = f"{len(wins) / len(done) * 100:.0f}%" if done else "n/a"
+        exp = f"{np.mean([t['r'] for t in done]):+.2f}" if done else "n/a"
+        print(f"{cfg.name:<20}{len(trades):>6}{len(wins):>6}{wr:>6}{exp:>7}   "
+              + " · ".join(detail[:4]))
+    print("\nEntry = reversal at support; stop = support×(1−0.2%); target = ~3% "
+          "capped under the nearest resistance. touch = first tag of support; "
+          "confirmed = a bullish reclaim. strong_support takes any daily trend when "
+          "the level is proven (≥2 confirmations).")
+
+
+# --------------------------------------------------------------------------- #
 def _load(ticker: str, provider) -> dict:
     i5 = _yf_intraday(ticker, "5m", "1mo")
     i30 = _yf_intraday(ticker, "30m", "1mo")
@@ -498,7 +591,9 @@ def main() -> None:
         run_day(tk, d["i5"], d["i30"], d["daily"], day, args.verbose)
 
     if args.variants:
-        run_variants([t for t in tickers if t in per_ticker], per_ticker)
+        avail = [t for t in tickers if t in per_ticker]
+        run_variants(avail, per_ticker)
+        run_reversal_variants(avail, per_ticker)
 
 
 if __name__ == "__main__":

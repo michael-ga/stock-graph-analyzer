@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 import streamlit as st
 
 from stockanalyzer import papertrade, session, swingwatch, virtualbook, watchlist
+from stockanalyzer.analysis import reversal
 from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
 from stockanalyzer.analysis.engine import CATEGORY_WEIGHTS, analyze_timeframe
 from stockanalyzer.explain.swing import _MIN_RR, build_swing_plan
@@ -653,6 +654,58 @@ def _run_bots(ticker: str, plan, reports=None, verdict=None, rec=None,
             pass
 
 
+def _reversal_snapshot(dec) -> dict:
+    """Minimal decision snapshot for a reversal-at-support day trade — one row per
+    variant so each risk profile is its own cohort in the trade book."""
+    return dict(
+        setup="reversal_support", kind="immediate", score=None,
+        label=f"Reversal @ support ({dec.variant})", rr=dec.rr, daily_atr_pct=None,
+        guidance=(f"{dec.variant}: {dec.reason} — hard stop ${dec.stop:.2f}, "
+                  f"target ${dec.target:.2f}."))
+
+
+def _run_reversal_bots(tk: str, res, price: float | None, phase=None) -> None:
+    """Fast reversal-at-support day-trade family. Each variant fires its own bot
+    (own cohort) so the trade book proves which risk profile wins — nothing is
+    re-weighted here. Shares the ORB freeze: no entries in the first 15 min. The
+    fired decisions are stashed for the radar card to surface."""
+    fired: list = []
+    if phase != "opening_range" and res is not None and price:
+        reports = res.reports
+        card = build_day_card(reports, price)
+        if card is not None:
+            higher_trend = None
+            for tf in (Timeframe.M1, Timeframe.D5, Timeframe.M6):
+                rep = reports.get(tf)
+                if rep is not None:
+                    higher_trend = rep.trend.direction
+                    break
+            prev_close = res.quote.prev_close if (res.quote and res.quote.prev_close) else None
+            idf = _intraday_frame(reports)
+            now = session.now_et()
+            for cfg in reversal.REVERSAL_VARIANTS:
+                try:
+                    dec = reversal.reversal_signal(card, idf, float(price),
+                                                   higher_trend, prev_close, now, cfg)
+                except Exception:
+                    continue
+                if not dec.fired:
+                    continue
+                fired.append(dec)
+                try:
+                    if not virtualbook.has_open(tk, dec.variant):
+                        virtualbook.open_position(
+                            ticker=tk, trader=dec.variant, entry=dec.entry,
+                            stop=dec.stop, target=dec.target, kind="immediate",
+                            horizon_days=1, snapshot=_reversal_snapshot(dec))
+                        st.toast(f"🔄 {dec.variant} opened reversal {tk} "
+                                 f"@ ${dec.entry:.2f} (stop ${dec.stop:.2f}, "
+                                 f"tgt ${dec.target:.2f})", icon="🔄")
+                except Exception:
+                    pass
+    st.session_state.setdefault("radar_reversals", {})[tk] = fired
+
+
 # --------------------------------------------------------------------------- #
 # Swing radar — quiet tracking with escalating notices (60 / 70 / 80%).
 # --------------------------------------------------------------------------- #
@@ -766,6 +819,18 @@ def _radar_card(tk: str, plan, res=None, tier: str | None = None) -> None:
     if tier:
         info_bits.append(_TIER_BADGE.get(tier, tier))
 
+    revs = st.session_state.get("radar_reversals", {}).get(tk) or []
+    rev_html = ""
+    if revs:
+        d = revs[0]
+        names = ", ".join(r.variant for r in revs)
+        rev_html = (
+            f"<div style='font-size:0.8em;margin-top:3px;color:#00897b;"
+            f"font-weight:600'>🔄 Reversal @ support ${d.support:.2f} — "
+            f"enter ${d.entry:.2f} · stop ${d.stop:.2f} · tgt ${d.target:.2f} · "
+            f"R:R {d.rr:.1f} <span style='color:#8a93a0;font-weight:400'>"
+            f"({names})</span></div>")
+
     st.markdown(
         f"<div style='background:{color}26;border:1px solid {color};border-radius:10px;"
         f"padding:8px 10px;margin:2px 0'>"
@@ -777,7 +842,7 @@ def _radar_card(tk: str, plan, res=None, tier: str | None = None) -> None:
         f"font-weight:700;font-size:0.82em;white-space:nowrap'>{state}</span>"
         f"<span style='color:{color};font-weight:700'>{plan.score}% {bells}</span></div>"
         f"<div style='font-size:0.78em;color:#8a93a0'>{' · '.join(info_bits)}</div>"
-        f"<div style='font-size:0.8em;margin-top:2px'>{instr}</div></div>",
+        f"<div style='font-size:0.8em;margin-top:2px'>{instr}</div>{rev_html}</div>",
         unsafe_allow_html=True)
     if st.button(f"🔎 Open {tk}", key=f"radar_open_{tk}", use_container_width=True):
         st.session_state._pending_ticker = tk   # applied at top of main()
@@ -873,6 +938,7 @@ def _radar_body(tracked: list[str]) -> None:
                 reports = res.reports if res is not None else None
                 _run_bots(tk, plan, reports=reports, orange=orange,
                           price=px, phase=phase)
+                _run_reversal_bots(tk, res, px, phase)
                 if px:
                     dec = _radar_decision_rep(res) if res is not None else None
                     tc = getattr(dec, "trend_change", None)

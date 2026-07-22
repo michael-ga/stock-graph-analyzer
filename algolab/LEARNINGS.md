@@ -243,3 +243,48 @@ timeframes (see Ruled out): move `_run_quiet` + `virtualbook` marking onto a
 background worker thread (the `RealtimeStream` pattern in `data/realtime.py`) and
 let the fragment read a snapshot. Re-measure with the timing panel during market
 hours before and after.
+
+---
+
+### 2026-07-22 — reversal-at-support day-trade family (H6, collecting)
+
+**Why:** the swing setups aren't built for day trading — they target multi-day
+walls on a volatility budget, so a quick intraday dip-buy at support never
+surfaces. Added a *family* of fast reversal-at-support setups, built the same way
+as the Gap-and-Go engine (H5): one pure as-of function the live radar and
+`daytrade_backtest.py` share verbatim (no drift), driven by a config list.
+
+**What changed (code), all additive — nothing re-weighted, no schema change:**
+1. New `stockanalyzer/analysis/reversal.py` — `reversal_signal(card, intraday_df,
+   price, higher_trend, prev_close, asof_ts, cfg)`. Guard order: at support in the
+   lower 35% of the day's range → trend/strength gate → reversal print (confirmed
+   mode) → non-degenerate geometry → the **~3% go/no-go aim** (capped just under
+   the nearest resistance; skip if < 2.5%). Stop is hard, just below support. It
+   consumes `build_day_card` (session low, mapped supports, **volume battle-zones**
+   as support confidence) — no new data path.
+2. `REVERSAL_VARIANTS` — the starter matrix over two risk axes: entry
+   `touch` (aggressive, first tag) vs `confirmed` (bullish reclaim); trend
+   `with_trend` (dip-buy only when the daily trend is up, stands aside on a
+   gap-down ≤ −2%) vs `strong_support` (any trend, but the level needs ≥2
+   confirmations). Four bots: `rev-trend-touch/-confirm`, `rev-strong-touch/-confirm`.
+3. `app.py` `_run_reversal_bots` opens one bot per fired variant (`horizon_days=1`,
+   own `cohort_id`) and surfaces a `🔄 Reversal @ support` line on the radar card.
+   Shares the ORB opening-range freeze.
+4. `daytrade_backtest.py --variants` now prints a reversal `fires/wins/WR/expR`
+   sweep next to the ORB one, replaying the **same** `reversal_signal` bar-by-bar
+   (as-of, no lookahead); per-day contexts are built once and reused across
+   variants.
+
+**Pre-registered hypotheses (test as data accumulates — do NOT cull on one
+session):** (a) does `confirmed` entry beat `touch` on expectancy, or does the
+worse fill eat the higher hit-rate? (b) does `strong_support` (battle-zone-backed)
+justify taking counter-trend reversals, or is `with_trend` strictly better? Judge
+at the **idea level** (`algorithm_correctness` by `cohort_id`), ~100+ independent
+closed ideas before any per-variant claim — same guardrail as H5. Each variant is
+a genuinely distinct idea (different entry/stop), so they get distinct cohorts, not
+one plan copied across bots.
+
+**How we'll know:** run `daytrade_backtest.py <tickers> --variants` for the
+counterfactual fire/WR/expR ranking now; let the live bots accrue paired closed
+ideas for the real read. No baseline was reset (all additive), so existing swing
+and Gap-and-Go measurements are unaffected.
