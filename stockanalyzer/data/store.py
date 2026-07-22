@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -23,21 +24,42 @@ DB_PATH = (Path(os.environ["STOCKANALYZER_DB"])
            if os.environ.get("STOCKANALYZER_DB") else _DEFAULT_DB_PATH)
 SCHEMA_VERSION = 5
 
-_connections: dict[str, sqlite3.Connection] = {}
+# A single sqlite3.Connection is NOT safe to share across threads — concurrent
+# execute()/commit() on one connection corrupts cursor state ("bad parameter or
+# other API misuse", partial rows). Streamlit runs each `run_every` fragment (the
+# swing radar, the live panels) on its own ScriptRunner thread, so the store is
+# hit from several threads at once. We therefore give each thread its OWN
+# connection (thread-local); WAL mode lets many such connections read/write the
+# same file concurrently, and busy_timeout makes a write wait for the lock rather
+# than raise "database is locked". Schema init/migration is guarded to run exactly
+# once per file, since concurrent migrations would race.
+_local = threading.local()
+_schema_lock = threading.Lock()
+_schema_ready: set[str] = set()
 
 
 # ── connection ────────────────────────────────────────────────────────────── #
 
 def _conn(db_path: Path = DB_PATH) -> sqlite3.Connection:
     key = str(db_path)
-    if key not in _connections:
+    cache = getattr(_local, "connections", None)
+    if cache is None:
+        cache = _local.connections = {}
+    conn = cache.get(key)
+    if conn is None:
         conn = sqlite3.connect(str(db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        _ensure_schema(conn, db_path)
-        _connections[key] = conn
-    return _connections[key]
+        conn.execute("PRAGMA busy_timeout=5000")   # wait up to 5s for a write lock
+        # Create tables / run migrations once per file; other threads just reuse
+        # the schema already on disk.
+        with _schema_lock:
+            if key not in _schema_ready:
+                _ensure_schema(conn, db_path)
+                _schema_ready.add(key)
+        cache[key] = conn
+    return conn
 
 
 # ── schema ────────────────────────────────────────────────────────────────── #

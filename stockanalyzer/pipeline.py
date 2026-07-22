@@ -33,24 +33,36 @@ class AnalysisResult:
 def _fallback_quote(reports: dict[Timeframe, TimeframeReport]) -> Quote | None:
     """Derive a quote from data already fetched when no Finnhub key is set.
 
-    Session-aware: if the latest intraday (1D) bar is pre/after-hours, use that
-    extended price and measure change vs the prior REGULAR close; otherwise use
-    the latest daily close vs the previous daily close.
-    """
-    from .data.market_session import Session, classify, is_intraday, last_regular_close
+    Populates the structural facts on ``Quote`` (latest price, today's regular
+    close, prior close, session); all the % moves are derived on the Quote itself,
+    so this stays the single source every surface reads from.
 
-    # Extended-hours path off the 1D frame.
+    The daily frame is the authority for the two closes. During pre/after-hours
+    the 1D frame supplies the extended-hours ``price``; the regular close it is
+    measured against still comes from the daily series.
+    """
+    from .data.market_session import classify, is_intraday, last_regular_close
+
+    daily = reports.get(Timeframe.M1) or reports.get(Timeframe.M6)
+    reg_close = prev_close = None
+    if daily is not None and len(daily.df) >= 2:
+        closes = daily.df["close"]
+        reg_close = float(closes.iloc[-1])   # today's regular close (prior session's, pre-open)
+        prev_close = float(closes.iloc[-2])
+
+    # Extended-hours path: the latest 1D bar is pre/after-hours.
     intraday = reports.get(Timeframe.D1)
     if intraday is not None and is_intraday(intraday.df):
         sess = classify(intraday.df.index[-1])
         if sess.is_extended:
-            ref = last_regular_close(intraday.df)
             price = float(intraday.df["close"].iloc[-1])
-            if ref:
-                change = price - ref
-                return Quote(price, round(change, 2), round(change / ref * 100, 2),
-                             ref, source="derived", session=sess.value)
+            # Fall back to the intraday regular close if the daily frame is missing.
+            reg = reg_close if reg_close is not None else last_regular_close(intraday.df)
+            if reg is not None:
+                return Quote(price, regular_close=reg, prev_close=prev_close,
+                             source="derived", session=sess.value)
 
+    # Regular-session path: latest close of the shortest available timeframe.
     price = None
     for tf in Timeframe:
         if tf in reports:
@@ -58,16 +70,8 @@ def _fallback_quote(reports: dict[Timeframe, TimeframeReport]) -> Quote | None:
             break
     if price is None:
         return None
-
-    change = change_pct = 0.0
-    prev = None
-    daily = reports.get(Timeframe.M1) or reports.get(Timeframe.M6)
-    if daily is not None and len(daily.df) >= 2:
-        closes = daily.df["close"]
-        prev = float(closes.iloc[-2])
-        change = float(closes.iloc[-1]) - prev
-        change_pct = (change / prev * 100) if prev else 0.0
-    return Quote(float(price), round(change, 2), round(change_pct, 2), prev, source="derived")
+    return Quote(float(price), regular_close=reg_close if reg_close is not None else float(price),
+                 prev_close=prev_close, source="derived")
 
 
 def analyze_ticker(

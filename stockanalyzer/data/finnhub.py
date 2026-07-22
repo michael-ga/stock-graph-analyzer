@@ -56,12 +56,80 @@ class NewsItem:
 
 @dataclass
 class Quote:
+    """The single source of truth for a ticker's price and change.
+
+    Every price surface (main header, live header, swing radar, day card) reads
+    from one of these, and every displayed delta is *derived* here rather than
+    recomputed per surface — so the numbers can't drift apart. Callers set only
+    the three structural facts; the moves are properties:
+
+    - ``price``          — the latest print: the extended-hours price during
+                           pre/after-hours, otherwise the regular-session price.
+    - ``regular_close``  — today's regular-session close (the "day" price). During
+                           pre-market this is the prior session's close, which is
+                           what a pre-market move is measured against.
+    - ``prev_close``     — the close of the trading day *before* ``regular_close``;
+                           the base for the day's percentage move.
+
+    The day move (``day_change`` / ``day_change_pct``) is regular_close vs
+    prev_close — the headline number every surface leads with. The extended move
+    (``ext_change`` / ``ext_change_pct``) is price vs regular_close, shown only as
+    a secondary line during pre/after-hours.
+    """
     price: float
-    change: float = 0.0
-    change_pct: float = 0.0
+    regular_close: float | None = None
     prev_close: float | None = None
     source: str = ""
     session: str = "regular"   # regular / pre-market / after-hours
+
+    @property
+    def is_extended(self) -> bool:
+        return self.session in ("pre-market", "after-hours")
+
+    @property
+    def day_change(self) -> float:
+        if self.regular_close is None or self.prev_close is None:
+            return 0.0
+        return round(self.regular_close - self.prev_close, 2)
+
+    @property
+    def day_change_pct(self) -> float:
+        if not self.prev_close or self.regular_close is None:
+            return 0.0
+        return round((self.regular_close - self.prev_close) / self.prev_close * 100, 2)
+
+    @property
+    def ext_change(self) -> float:
+        if not self.is_extended or self.regular_close is None:
+            return 0.0
+        return round(self.price - self.regular_close, 2)
+
+    @property
+    def ext_change_pct(self) -> float:
+        if not self.is_extended or not self.regular_close:
+            return 0.0
+        return round((self.price - self.regular_close) / self.regular_close * 100, 2)
+
+    def pct_from_prev(self, price: float | None = None) -> float:
+        """Percent move of ``price`` (default: the latest print) vs prev_close.
+
+        The one formula surfaces use for a live 'today vs yesterday' read, so a
+        header showing the streaming tick and the radar showing the last print
+        agree by construction.
+        """
+        p = self.price if price is None else price
+        if not self.prev_close or p is None:
+            return 0.0
+        return round((p - self.prev_close) / self.prev_close * 100, 2)
+
+    # Back-compat: the headline change is the day move.
+    @property
+    def change(self) -> float:
+        return self.day_change
+
+    @property
+    def change_pct(self) -> float:
+        return self.day_change_pct
 
 
 @dataclass
@@ -112,10 +180,11 @@ class FinnhubClient:
         d = self._get("quote", symbol=ticker.upper())
         if not d or not d.get("c"):
             return None
+        # Finnhub's free quote is regular-session only: `c` is the current/last
+        # regular price, `pc` the prior close. day_change then equals Finnhub's d/dp.
         return Quote(
             price=float(d["c"]),
-            change=float(d.get("d") or 0.0),
-            change_pct=float(d.get("dp") or 0.0),
+            regular_close=float(d["c"]),
             prev_close=float(d["pc"]) if d.get("pc") else None,
             source="finnhub",
         )
