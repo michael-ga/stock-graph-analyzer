@@ -15,6 +15,7 @@ def test_login_gate_accepts_database_user_and_exposes_logout(tmp_path, monkeypat
     database_url = f"sqlite:///{tmp_path / 'ui-auth.db'}"
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("APP_VERSION", "47f3fd9e56b560eba2804b99db348d883f1abdf3")
     engine = configure_engine(database_url)
     Base.metadata.create_all(engine)
     user = AuthService().create_user("mobile-owner", "correct horse battery staple")
@@ -28,6 +29,7 @@ def test_login_gate_accepts_database_user_and_exposes_logout(tmp_path, monkeypat
 
     assert app.session_state["auth_user_id"] == user.id
     assert any(button.label == "Log out" for button in app.button)
+    assert any(caption.value == "Engineering version: eng-47f3fd9e56b5" for caption in app.caption)
     assert not any(button.label == "👥 Users" for button in app.button)
     assert not app.error
     engine.dispose()

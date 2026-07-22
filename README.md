@@ -135,6 +135,32 @@ docker compose exec app python -m scripts.create_admin --username admin
 
 The command prompts securely for the password.
 
+After merging the change that first introduces engineering-version checks, update and
+verify the NUC with this one-time bootstrap command. Passing the fetched target SHA
+ensures the pre-versioning copy of `update.sh` builds the new image with the correct
+identity:
+
+```bash
+cd /home/shambik/stock-graph-analyzer
+git switch dev
+git fetch origin
+APP_VERSION="$(git rev-parse origin/dev)" ./scripts/update.sh
+./scripts/healthcheck.sh
+```
+
+After that first deployment, future merged changes only require:
+
+```bash
+cd /home/shambik/stock-graph-analyzer
+git switch dev
+./scripts/update.sh
+```
+
+The updated script fetches and pulls the branch, then automatically bakes the resulting
+full Git SHA into both containers. The authenticated sidebar shows
+`eng-<first 12 characters of the deployed Git SHA>`. The healthcheck confirms that the
+host, app, and radar worker all report the same full SHA.
+
 ## Layout
 
 ```

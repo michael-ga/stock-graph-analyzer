@@ -15,6 +15,7 @@ import hashlib
 import json
 import locale
 import os
+import re
 import threading
 import time
 from dataclasses import asdict, is_dataclass
@@ -90,6 +91,16 @@ _bridge_cloud_secrets()
 st.set_page_config(page_title="Stock Graph Analyzer", layout="wide")
 
 
+def _engineering_version() -> str:
+    """Format the immutable image revision for authenticated UI display."""
+    version = os.environ.get("APP_VERSION", "development")
+    if re.fullmatch(r"[0-9a-f]{40}", version):
+        return f"eng-{version[:12]}"
+    if version in {"development", "unknown"}:
+        return version
+    return "unknown"
+
+
 def _require_login() -> bool:
     """Render the only public UI and return True for an active DB session."""
     try:
@@ -118,6 +129,7 @@ def _require_login() -> bool:
         st.session_state["auth_must_change_password"] = bool(current_user.must_change_password)
         with st.sidebar:
             st.caption(f"Signed in as **{st.session_state.get('auth_username', 'user')}**")
+            st.caption(f"Engineering version: {_engineering_version()}")
             if st.button("Log out", use_container_width=True):
                 for key in list(st.session_state):
                     if key.startswith("auth_"):

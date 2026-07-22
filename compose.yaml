@@ -19,7 +19,10 @@ services:
       - no-new-privileges:true
 
   app:
-    build: .
+    build:
+      context: .
+      args:
+        APP_VERSION: ${APP_VERSION:-development}
     image: stock-graph-analyzer:local
     restart: unless-stopped
     depends_on:
