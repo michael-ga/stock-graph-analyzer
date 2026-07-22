@@ -7,9 +7,12 @@ COPY requirements.txt requirements.lock ./
 RUN pip install --upgrade pip && pip install -r requirements.lock
 
 FROM python:3.12.11-slim-bookworm
+ARG APP_VERSION=unknown
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH=/opt/venv/bin:$PATH \
     STREAMLIT_SERVER_ADDRESS=0.0.0.0 STREAMLIT_SERVER_PORT=8501 \
-    STREAMLIT_SERVER_HEADLESS=true STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+    STREAMLIT_SERVER_HEADLESS=true STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    APP_VERSION=$APP_VERSION
+LABEL org.opencontainers.image.revision=$APP_VERSION
 RUN groupadd --gid 10001 stockapp && useradd --uid 10001 --gid stockapp --create-home stockapp
 COPY --from=builder /opt/venv /opt/venv
 WORKDIR /app

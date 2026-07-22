@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import pytest
 
+from stockanalyzer import swingwatch
 from stockanalyzer.auth import AuthError, AuthService
 from stockanalyzer.db.models import Base, TradeEvent
 from stockanalyzer.db.repositories.analysis_history import AnalysisHistoryRepository
@@ -51,6 +52,58 @@ def test_watchlist_and_swingwatch_are_unique_and_user_isolated(db):
     swing.set_notice_level(first.id, "AAPL", 70)
     assert swing.list(first.id) == ["AAPL"]
     assert swing.get_notice_level(first.id, "AAPL") == 70
+
+
+def test_swingwatch_assignments_include_active_owners_without_login_sessions(db):
+    auth = AuthService()
+    first = auth.create_user("worker-first", "worker first password")
+    second = auth.create_user("worker-second", "worker second password")
+    disabled = auth.create_user("worker-disabled", "worker disabled password")
+    swing = SwingWatchRepository()
+    swing.add(first.id, "aapl")
+    swing.add(second.id, "aapl")
+    swing.add(second.id, "msft")
+    swing.add(disabled.id, "tsla")
+    with session_scope() as session:
+        session.get(type(disabled), disabled.id).is_active = False
+
+    assert swing.list_assignments() == [
+        (first.id, "AAPL"),
+        (second.id, "AAPL"),
+        (second.id, "MSFT"),
+    ]
+
+
+def test_notice_claim_is_atomic_and_user_scoped(db):
+    auth = AuthService()
+    owner = auth.create_user("notice-owner", "notice owner password")
+    other = auth.create_user("notice-other", "notice other password")
+    swingwatch.add("AAPL", user_id=owner.id)
+    swingwatch.add("AAPL", user_id=other.id)
+
+    assert swingwatch.claim_notice("AAPL", 70, user_id=owner.id) == (
+        70, "2nd notice — swing score reached 70%+"
+    )
+    assert swingwatch.claim_notice("AAPL", 70, user_id=owner.id) is None
+    assert swingwatch.get_notice_level("AAPL", user_id=other.id) == 0
+
+
+def test_worker_notice_claim_and_journal_insert_roll_back_together(db, monkeypatch):
+    from stockanalyzer import radar_worker
+    from stockanalyzer.db.repositories.paper_trades import PaperTradeRepository
+
+    owner = AuthService().create_user("atomic-owner", "atomic owner password")
+    swingwatch.add("AAPL", user_id=owner.id)
+    monkeypatch.setattr(
+        PaperTradeRepository, "insert",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("journal failed")),
+    )
+    with pytest.raises(RuntimeError, match="journal failed"):
+        radar_worker.claim_notice_and_record(
+            owner.id, "AAPL", 70,
+            {"ticker": "AAPL", "level": 70, "ts": 1.0, "date": "today"},
+        )
+    assert swingwatch.get_notice_level("AAPL", user_id=owner.id) == 0
 
 
 def test_rate_limit_increment_is_bounded(db):

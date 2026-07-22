@@ -64,9 +64,13 @@ def session_scope() -> Iterator[Session]:
 
 
 @contextmanager
-def transaction_scope() -> Iterator[Session]:
+def transaction_scope(*, join_existing: bool = False) -> Iterator[Session]:
     """Make repository operations in this context commit atomically."""
-    if _ambient_session.get() is not None:
+    ambient = _ambient_session.get()
+    if ambient is not None and join_existing:
+        yield ambient
+        return
+    if ambient is not None:
         raise RuntimeError("Nested transaction_scope is not supported")
     session = get_session_factory()()
     token = _ambient_session.set(session)

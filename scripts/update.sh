@@ -14,6 +14,8 @@ if [ -z "$branch" ]; then
   exit 2
 fi
 git pull --ff-only origin "$branch"
+APP_VERSION=$(git rev-parse HEAD)
+export APP_VERSION
 docker compose build --pull app
 docker compose up -d
 ./scripts/healthcheck.sh

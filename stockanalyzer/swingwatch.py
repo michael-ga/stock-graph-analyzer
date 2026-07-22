@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from stockanalyzer.db.repositories.swingwatch import SwingWatchRepository
+from stockanalyzer.auth import AuthService
 
 _PATH = Path(__file__).resolve().parent.parent / ".swingwatch.json"
 LEVELS = (60, 70, 80)
@@ -43,12 +44,30 @@ def is_tracked(ticker: str, path: Path | None = None, *, user_id: str | None = N
     return ticker.strip().upper() in load(path, user_id=user_id)
 
 
+def assignment_is_active(ticker: str, *, user_id: str) -> bool:
+    """Revalidate both ownership membership and active-user status."""
+    return AuthService().session_user(user_id) is not None and is_tracked(
+        ticker, user_id=user_id
+    )
+
+
+def lock_active_assignment(session, ticker: str, *, user_id: str) -> bool:
+    return _repo.lock_active_assignment(session, user_id, ticker)
+
+
 def get_notice_level(ticker: str, *, user_id: str) -> int:
     return _repo.get_notice_level(user_id, ticker)
 
 
 def set_notice_level(ticker: str, level: int, *, user_id: str) -> None:
     _repo.set_notice_level(user_id, ticker, level)
+
+
+def claim_notice(ticker: str, score: int | float, *, user_id: str) -> tuple[int, str] | None:
+    """Atomically update the saved level and claim any newly crossed notice."""
+    level = notice_level(score)
+    previous = _repo.claim_notice_level(user_id, ticker, level)
+    return None if previous is None else new_notice(previous, score)
 
 
 def notice_level(score: int | float) -> int:

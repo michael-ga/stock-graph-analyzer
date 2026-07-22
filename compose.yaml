@@ -19,7 +19,10 @@ services:
       - no-new-privileges:true
 
   app:
-    build: .
+    build:
+      context: .
+      args:
+        APP_VERSION: ${APP_VERSION:-development}
     image: stock-graph-analyzer:local
     restart: unless-stopped
     depends_on:
@@ -48,6 +51,41 @@ services:
     networks:
       - database
       - egress
+
+  radar-worker:
+    image: stock-graph-analyzer:local
+    restart: unless-stopped
+    command: ["python", "-m", "stockanalyzer.radar_worker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    environment:
+      APP_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      FINNHUB_KEY: ${FINNHUB_KEY:-}
+      TWELVEDATA_KEY: ${TWELVEDATA_KEY:-}
+      RADAR_WORKER_INTERVAL_SECONDS: ${RADAR_WORKER_INTERVAL_SECONDS:-30}
+      RADAR_WORKER_HEARTBEAT: /tmp/radar-worker-heartbeat
+    volumes:
+      - ./legacy:/legacy:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - database
+      - egress
+    healthcheck:
+      test: ["CMD", "python", "-m", "stockanalyzer.radar_worker", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
 
 networks:
   database:

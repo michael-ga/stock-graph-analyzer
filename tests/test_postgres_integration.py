@@ -12,6 +12,7 @@ from stockanalyzer.db.repositories.rate_limits import RateLimitRepository
 from stockanalyzer.db.repositories.trades import TradeRepository
 from stockanalyzer.db.repositories.watchlist import WatchlistRepository
 from stockanalyzer.db.session import configure_engine
+from stockanalyzer.user_management import UserManagementService
 
 _POSTGRES_URL = os.getenv("POSTGRES_TEST_URL", "")
 pytestmark = pytest.mark.skipif(
@@ -85,3 +86,23 @@ def test_postgres_daily_counter_is_atomic(postgres_database):
     consumed = sorted(value for value in values if value is not None)
     assert consumed == list(range(1, 21))
     assert repository.remaining("finnhub", limit=20) == 0
+
+
+def test_postgres_concurrent_admin_disables_cannot_remove_all_admins(postgres_database):
+    auth = AuthService()
+    first = auth.create_user("first-admin", "correct horse battery staple", is_admin=True)
+    second = auth.create_user("second-admin", "another sufficiently long password", is_admin=True)
+
+    def disable(pair):
+        actor, target = pair
+        try:
+            UserManagementService().set_active(actor.id, target.id, False)
+            return True
+        except (ValueError, PermissionError):
+            return False
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(disable, ((first, second), (second, first))))
+
+    assert sorted(outcomes) == [False, True]
+    assert sum(bool(auth.session_user(user.id)) for user in (first, second)) == 1
