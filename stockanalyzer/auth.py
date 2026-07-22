@@ -35,10 +35,42 @@ class AuthService:
             session.flush()
             return user
 
-    def session_user(self, user_id: str) -> User | None:
+    def session_user(self, user_id: str, session_revision: int | None = None) -> User | None:
+        """Return an active user, optionally checking a revision for non-browser callers."""
         with session_scope() as session:
             user = session.get(User, user_id)
-            return user if user is not None and user.is_active else None
+            if user is None or not user.is_active:
+                return None
+            if session_revision is not None and user.session_revision != session_revision:
+                return None
+            return user
+
+    def browser_session_user(self, user_id: str, session_revision: object) -> User | None:
+        """Validate a browser session fail-closed against its integer revision."""
+        if type(session_revision) is not int:
+            return None
+        return self.session_user(user_id, session_revision)
+
+    def change_password(self, user_id: str, current_password: str, new_password: str) -> User:
+        if len(new_password) < 12:
+            raise ValueError("Password must be at least 12 characters")
+        with session_scope() as session:
+            user = session.get(User, user_id, with_for_update=True)
+            if user is None or not user.is_active:
+                raise AuthError(_GENERIC)
+            try:
+                valid = self.hasher.verify(user.password_hash, current_password)
+            except (VerifyMismatchError, InvalidHashError):
+                valid = False
+            if not valid:
+                raise AuthError(_GENERIC)
+            user.password_hash = self.hasher.hash(new_password)
+            user.must_change_password = False
+            user.failed_login_count = 0
+            user.locked_until = None
+            user.session_revision += 1
+            user.updated_at = datetime.now(timezone.utc)
+            return user
 
     def authenticate(self, username: str, password: str) -> User:
         now = datetime.now(timezone.utc)

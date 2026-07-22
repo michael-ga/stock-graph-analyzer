@@ -6,7 +6,8 @@ from datetime import date, datetime, timezone
 
 from sqlalchemy import (JSON, BigInteger, Boolean, Date, DateTime, Float, ForeignKey,
                         Index, Integer, String, Text, UniqueConstraint, text)
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy import event
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
 
 def utcnow() -> datetime:
@@ -27,11 +28,29 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    session_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     failed_login_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
+class AdminAuditEvent(Base):
+    __tablename__ = "admin_audit_events"
+    id: Mapped[int] = mapped_column(ID, primary_key=True, autoincrement=True)
+    actor_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    target_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+@event.listens_for(Session, "before_flush")
+def _admin_audit_events_are_append_only(session, _flush_context, _instances) -> None:
+    if any(isinstance(item, AdminAuditEvent) for item in session.dirty | session.deleted):
+        raise ValueError("Admin audit events are append-only")
 
 
 class WatchlistItem(Base):

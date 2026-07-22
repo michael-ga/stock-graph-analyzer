@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 import yaml
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import DatabaseError
 
 from stockanalyzer.auth import AuthService
 from stockanalyzer.db.models import Base
@@ -112,6 +116,15 @@ def test_repository_batch_transaction_rolls_back_atomically(database):
     assert repository.list(owner.id) == []
 
 
+def test_nested_transaction_behavior_is_explicit(database):
+    with transaction_scope() as outer:
+        with pytest.raises(RuntimeError, match="Nested transaction_scope"):
+            with transaction_scope():
+                pass
+        with transaction_scope(join_existing=True) as inner:
+            assert inner is outer
+
+
 def test_csv_export_neutralizes_spreadsheet_formulas():
     exported = _safe_csv([{"ticker": "=HYPERLINK(\"bad\")", "note": "+cmd"}])
     assert "'=HYPERLINK" in exported
@@ -125,6 +138,52 @@ def test_restore_failure_keeps_application_stopped():
     assert "application remains stopped" in script
 
 
+def test_admin_audit_migration_rejects_direct_update_and_delete_on_sqlite(tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'audit-migration.db'}"
+    environment = {**os.environ, "DATABASE_URL": database_url}
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        check=True, env=environment, capture_output=True, text=True,
+    )
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO users "
+            "(id, username, password_hash, is_active, is_admin, failed_login_count, "
+            "created_at, updated_at, session_revision, must_change_password) VALUES "
+            "('actor', 'actor', 'hash', 1, 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0, 0), "
+            "('target', 'target', 'hash', 1, 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0, 0)"
+        ))
+        connection.execute(text(
+            "INSERT INTO admin_audit_events "
+            "(actor_user_id, target_user_id, action, created_at, metadata_json) "
+            "VALUES ('actor', 'target', 'user.created', CURRENT_TIMESTAMP, '{}')"
+        ))
+
+    for statement in (
+        "UPDATE admin_audit_events SET action = 'tampered'",
+        "DELETE FROM admin_audit_events",
+    ):
+        with pytest.raises(DatabaseError, match="append-only"):
+            with engine.begin() as connection:
+                connection.execute(text(statement))
+    engine.dispose()
+
+
+def test_admin_audit_migration_renders_postgresql_trigger_offline():
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
+        check=True,
+        env={**os.environ, "DATABASE_URL": "postgresql://offline.invalid/stockanalyzer"},
+        capture_output=True,
+        text=True,
+    )
+    sql = result.stdout.lower()
+    assert "create function" in sql
+    assert "create trigger" in sql
+    assert "before update or delete on admin_audit_events" in sql
+
+
 def test_compose_has_private_database_and_loopback_only_application():
     compose = yaml.safe_load(Path("compose.yaml").read_text())
     db = compose["services"]["db"]
@@ -134,3 +193,32 @@ def test_compose_has_private_database_and_loopback_only_application():
     assert compose["networks"]["database"]["internal"] is True
     assert "ALL" in app["cap_drop"]
     assert "no-new-privileges:true" in app["security_opt"]
+
+
+def test_compose_runs_private_background_radar_worker():
+    compose = yaml.safe_load(Path("compose.yaml").read_text())
+    worker = compose["services"]["radar-worker"]
+    assert worker["image"] == compose["services"]["app"]["image"]
+    assert worker["command"] == ["python", "-m", "stockanalyzer.radar_worker"]
+    assert "ports" not in worker
+    assert worker["networks"] == ["database", "egress"]
+    assert worker["depends_on"]["db"]["condition"] == "service_healthy"
+    assert worker["depends_on"]["app"]["condition"] == "service_healthy"
+    assert worker["environment"]["DATABASE_URL"].startswith("${DATABASE_URL:")
+    assert "--healthcheck" in worker["healthcheck"]["test"]
+    assert "ALL" in worker["cap_drop"]
+    assert "no-new-privileges:true" in worker["security_opt"]
+
+    entrypoint = Path("docker/entrypoint.sh").read_text()
+    assert 'if [ "$#" -gt 0 ]' in entrypoint
+    assert 'exec "$@"' in entrypoint
+    assert "radar-worker" in Path("scripts/healthcheck.sh").read_text()
+
+
+def test_entrypoint_command_path_executes_before_application_migration():
+    entrypoint = Path("docker/entrypoint.sh").read_text()
+    command_guard = entrypoint.index('if [ "$#" -gt 0 ]')
+    command_exec = entrypoint.index('exec "$@"')
+    migration = entrypoint.index("alembic upgrade head")
+
+    assert command_guard < command_exec < migration

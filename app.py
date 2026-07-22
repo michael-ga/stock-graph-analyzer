@@ -29,6 +29,7 @@ import streamlit as st
 
 from stockanalyzer import papertrade, session, swingwatch, virtualbook, watchlist
 from stockanalyzer.auth import AuthError, AuthService
+from stockanalyzer.user_management import UserManagementService
 from stockanalyzer.config import ConfigurationError, Settings
 from stockanalyzer.db.repositories.analysis_history import AnalysisHistoryRepository
 from stockanalyzer.db.session import configure_engine
@@ -103,12 +104,18 @@ def _require_login() -> bool:
     now = time.time()
     user_id = st.session_state.get("auth_user_id")
     last_activity = float(st.session_state.get("auth_last_activity", 0))
+    current_user = None
     if (
         user_id
         and now - last_activity <= settings.auth_session_minutes * 60
-        and AuthService(settings.auth_max_failures, settings.auth_lockout_minutes).session_user(user_id)
     ):
+        current_user = AuthService(
+            settings.auth_max_failures, settings.auth_lockout_minutes
+        ).browser_session_user(user_id, st.session_state.get("auth_session_revision"))
+    if current_user is not None:
         st.session_state["auth_last_activity"] = now
+        st.session_state["auth_is_admin"] = bool(current_user.is_admin)
+        st.session_state["auth_must_change_password"] = bool(current_user.must_change_password)
         with st.sidebar:
             st.caption(f"Signed in as **{st.session_state.get('auth_username', 'user')}**")
             if st.button("Log out", use_container_width=True):
@@ -116,9 +123,31 @@ def _require_login() -> bool:
                     if key.startswith("auth_"):
                         del st.session_state[key]
                 st.rerun()
+        if current_user.must_change_password:
+            st.title("Change your password")
+            st.info("An administrator reset your password. Choose a new password to continue.")
+            with st.form("forced_password_change"):
+                current = st.text_input("Current password", type="password")
+                replacement = st.text_input("New password", type="password")
+                confirmation = st.text_input("Confirm new password", type="password")
+                submitted = st.form_submit_button("Change password", type="primary")
+            if submitted:
+                if replacement != confirmation:
+                    st.error("New passwords must match")
+                else:
+                    try:
+                        changed = AuthService().change_password(user_id, current, replacement)
+                    except (AuthError, ValueError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.session_state["auth_session_revision"] = changed.session_revision
+                        st.session_state["auth_must_change_password"] = False
+                        st.rerun()
+            return False
         return True
-    for key in ("auth_user_id", "auth_username", "auth_last_activity"):
-        st.session_state.pop(key, None)
+    for key in list(st.session_state):
+        if key.startswith("auth_"):
+            st.session_state.pop(key, None)
 
     st.title("📈 Stock Graph Analyzer")
     st.caption("Private access — sign in to continue.")
@@ -137,6 +166,9 @@ def _require_login() -> bool:
             st.session_state["auth_user_id"] = user.id
             st.session_state["auth_username"] = user.username
             st.session_state["auth_last_activity"] = now
+            st.session_state["auth_session_revision"] = user.session_revision
+            st.session_state["auth_is_admin"] = bool(user.is_admin)
+            st.session_state["auth_must_change_password"] = bool(user.must_change_password)
             st.rerun()
     return False
 
@@ -274,6 +306,9 @@ def main() -> None:
     if ss.page == "history":
         render_history(st.session_state.auth_user_id)
         return
+    if ss.page == "users" and st.session_state.get("auth_is_admin"):
+        _users_page()
+        return
 
     flash = ss.pop("vb_flash", None)
     if flash:
@@ -357,6 +392,77 @@ def main() -> None:
 
 
 # --------------------------------------------------------------------------- #
+def _users_page() -> None:
+    """Admin user management; authorization is rechecked by every service call."""
+    st.header("Users")
+    service = UserManagementService()
+    actor_id = st.session_state.auth_user_id
+    with st.form("create_user"):
+        username = st.text_input("New username")
+        password = st.text_input("Temporary password", type="password")
+        password_confirmation = st.text_input("Confirm temporary password", type="password")
+        create = st.form_submit_button("Create user")
+    if create:
+        if password != password_confirmation:
+            st.error("Temporary passwords must match")
+        else:
+            try:
+                service.create_user(actor_id, username, password)
+            except (PermissionError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.success("User created")
+                st.rerun()
+
+    try:
+        users = service.list_users(actor_id)
+    except PermissionError:
+        st.error("Administrator access is required")
+        return
+    for user in users:
+        cols = st.columns([3, 2, 2])
+        cols[0].write(f"**{user.username}**" + (" · admin" if user.is_admin else ""))
+        cols[1].write("Active" if user.is_active else "Disabled")
+        desired = not user.is_active
+        if cols[2].button("Enable" if desired else "Disable", key=f"active_{user.id}"):
+            try:
+                service.set_active(actor_id, user.id, desired)
+            except (PermissionError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.rerun()
+        lock_status = (
+            f"Locked until {user.locked_until:%Y-%m-%d %H:%M UTC}"
+            if user.locked_until else "Not locked"
+        )
+        st.markdown(
+            f"Created: {user.created_at:%Y-%m-%d %H:%M UTC} · "
+            f"Last login: {user.last_login_at:%Y-%m-%d %H:%M UTC} "
+            if user.last_login_at else
+            f"Created: {user.created_at:%Y-%m-%d %H:%M UTC} · Last login: Never"
+        )
+        st.markdown(f"Lock status: {lock_status}")
+        with st.form(f"reset_{user.id}"):
+            replacement = st.text_input(
+                f"Temporary password for {user.username}", type="password"
+            )
+            reset_confirmation = st.text_input(
+                f"Confirm temporary password for {user.username}", type="password"
+            )
+            reset = st.form_submit_button(f"Reset {user.username} password")
+        if reset:
+            if replacement != reset_confirmation:
+                st.error("Temporary passwords must match")
+            else:
+                try:
+                    service.reset_password(actor_id, user.id, replacement)
+                except (PermissionError, ValueError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Password reset; existing sessions revoked")
+                    st.rerun()
+
+
 def _sidebar():
     ss = st.session_state
     with st.sidebar:
@@ -367,6 +473,10 @@ def _sidebar():
         if nav2.button("🕘 History", use_container_width=True):
             ss.page = "history"
             st.rerun()
+        if st.session_state.get("auth_is_admin"):
+            if st.button("👥 Users", use_container_width=True):
+                ss.page = "users"
+                st.rerun()
         st.header("What do you want to do?")
         usecase = _USECASE_BY_LABEL[st.radio(
             "Your situation", [uc.label for uc in UseCase], key="usecase_label",
@@ -1052,13 +1162,8 @@ def _radar_body(tracked: list[str]) -> None:
             # Notices + trading only when we recomputed this tick, or when we
             # already hold a position (babysit it every tick, any tier).
             if due or has_open:
-                previous_level = swingwatch.get_notice_level(
-                    tk, user_id=st.session_state.auth_user_id)
-                fired = swingwatch.new_notice(previous_level, plan.score)
-                current_level = swingwatch.notice_level(plan.score)
-                if current_level != previous_level:
-                    swingwatch.set_notice_level(
-                        tk, current_level, user_id=st.session_state.auth_user_id)
+                fired = swingwatch.claim_notice(
+                    tk, plan.score, user_id=st.session_state.auth_user_id)
                 if fired:
                     stored = papertrade.record(dict(
                         ts=time.time(), date=time.strftime("%x %X"),
