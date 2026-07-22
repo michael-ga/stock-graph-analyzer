@@ -30,6 +30,9 @@ def upgrade() -> None:
     op.add_column("trades", sa.Column(
         "hold_weekend", sa.Boolean(), nullable=False, server_default=sa.false()))
     op.execute("UPDATE trades SET init_stop = stop WHERE init_stop IS NULL")
+    with op.batch_alter_table("trades") as batch_op:
+        batch_op.alter_column(
+            "init_stop", existing_type=sa.Float(), nullable=False)
 
     op.create_table(
         "trade_events",
