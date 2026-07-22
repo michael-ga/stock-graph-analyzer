@@ -25,12 +25,10 @@ import streamlit as st
 from stockanalyzer import papertrade, session, swingwatch, virtualbook, watchlist
 from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
 from stockanalyzer.analysis.engine import CATEGORY_WEIGHTS, analyze_timeframe
-from stockanalyzer.analysis.indicators import relative_volume
 from stockanalyzer.explain.swing import _MIN_RR, build_swing_plan
 from stockanalyzer.manage import _SPREAD_PER_SHARE
 from stockanalyzer.analysis.signals import Direction
 from stockanalyzer.charting import candlestick_figure
-from stockanalyzer.data.market_session import _to_et
 from stockanalyzer.data.realtime import RealtimeStream, summarize, ticks_to_candles
 from stockanalyzer.data.resample import available_intervals, resample_ohlcv
 from stockanalyzer.data.schema import Timeframe
@@ -486,12 +484,17 @@ def _is_extended(p) -> bool:
 
 # --------------------------------------------------------------------------- #
 # Gap-and-Go (opening-range breakout) — Carter-style intraday rules.
+# The decision logic lives in stockanalyzer.analysis.orb (pure + testable); this
+# module keeps the Streamlit/session wiring and delegates the rules to it, so the
+# live radar and daytrade_backtest.py share one code path.
 # --------------------------------------------------------------------------- #
-_GAP_MIN_PCT       = 0.02      # ORB only for a real gap-up: open > prev_close +2%
-_OPENING_RANGE_MIN = 15        # opening range = first 15 minutes (9:30–9:45 ET)
-_MIN_BREAKOUT_RVOL = 1.5       # breakout needs volume > 1.5× average
-_ORB_STOP_BUFFER   = 0.001     # hard stop = OR-Low × (1 − 0.1%)
-_ORB_TARGET_R      = 2.0       # target = entry + 2R
+from stockanalyzer.analysis import orb as _orb  # noqa: E402
+
+_GAP_MIN_PCT       = _orb.GAP_MIN_PCT
+_OPENING_RANGE_MIN = _orb.OPENING_RANGE_MIN
+_MIN_BREAKOUT_RVOL = _orb.MIN_BREAKOUT_RVOL
+_ORB_STOP_BUFFER   = _orb.ORB_STOP_BUFFER
+_ORB_TARGET_R      = _orb.ORB_TARGET_R
 
 # Radar tiers → recompute cadence (seconds). Base fragment tick = 5s, so a far
 # buildup recomputes ~1/12 as often as a hot name — CPU spent where it matters.
@@ -553,29 +556,17 @@ def _opening_range(tk: str, res) -> dict | None:
     cur = ss.opening_range.get(tk)
     if cur and cur.get("day") == day:
         return cur
-    if session.market_phase(ts) in ("opening_range", "premarket", "closed"):
-        return None                               # range not finished yet
     df = _intraday_frame(getattr(res, "reports", None))
-    if df is None or not isinstance(df.index, pd.DatetimeIndex) or df.empty:
-        return None
+    prev_close = res.quote.prev_close if (res.quote and res.quote.prev_close) else None
     try:
-        from stockanalyzer.analysis.daycard import _session_bars
-        sess = _session_bars(df)
-        hhmm = [_to_et(t).strftime("%H:%M") for t in sess.index]
-        win = sess[["09:30" <= t < "09:45" for t in hhmm]]
-        if win.empty:
-            return None
-        prev_close = res.quote.prev_close if (res.quote and res.quote.prev_close) else None
-        today_open = float(sess["open"].iloc[0])
-        gap_pct = (today_open / prev_close - 1) if (prev_close and today_open) else None
-        rng = {"day": day, "open": today_open,
-               "high": float(win["high"].max()), "low": float(win["low"].min()),
-               "gap_pct": gap_pct,
-               "gap_up": gap_pct is not None and gap_pct >= _GAP_MIN_PCT}
+        rng = _orb.opening_range(df, prev_close, ts)
     except Exception:
         return None
-    ss.opening_range[tk] = rng
-    return rng
+    if rng is None:
+        return None
+    stored = rng.as_dict()
+    ss.opening_range[tk] = stored
+    return stored
 
 
 def _gap_snapshot(tk: str, orange: dict, rvol: float | None,
@@ -598,19 +589,12 @@ def _run_gap_bots(tk: str, reports, orange: dict | None, price: float | None) ->
     Hard stop sits just below the opening-range LOW (Carter's ORB rule)."""
     if not (orange and orange.get("gap_up") and price and reports):
         return
-    if not session.is_orb_window():
-        return
-    if price < orange["high"]:                    # not broken out yet
-        return
     df = _intraday_frame(reports)
-    rvol = relative_volume(df) if df is not None else None
-    if rvol is not None and rvol <= _MIN_BREAKOUT_RVOL:
-        return                                    # break without volume — invalid
-    entry = float(price)
-    init_stop = round(orange["low"] * (1 - _ORB_STOP_BUFFER), 4)
-    if init_stop >= entry:                        # degenerate geometry — skip
+    dec = _orb.gap_and_go_signal(_orb.OpeningRange(**orange), df,
+                                 float(price), session.now_et())
+    if not dec.fired:
         return
-    target = round(entry + _ORB_TARGET_R * (entry - init_stop), 4)
+    entry, init_stop, target, rvol = dec.entry, dec.stop, dec.target, dec.rvol
     snap = _gap_snapshot(tk, orange, rvol, entry, init_stop, target)
     for trader, managed in (("bot-gap-fixed", False), ("bot-gap-mgd", True)):
         try:
