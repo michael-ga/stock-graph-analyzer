@@ -28,9 +28,12 @@ from .data.store import (
     DB_PATH,
     algorithm_correctness as _algorithm_correctness,
     close_trade,
+    has_any_open as _has_any_open,
     has_open_trade,
     insert_trade,
     load_trades,
+    manage_trades,
+    managed_vs_fixed as _managed_vs_fixed,
     mark_trades,
     trade_stats,
 )
@@ -78,13 +81,16 @@ def open_position(*, ticker: str, trader: str, entry: float, stop: float,
                   target: float, kind: str = "immediate",
                   trigger: float | None = None, horizon_days: int = 3,
                   stake: float = STAKE_USD, snapshot: dict | None = None,
+                  managed: bool = False, hold_weekend: bool = False,
+                  entry_rvol: float | None = None, init_stop: float | None = None,
                   now: float | None = None, path: Path = _PATH,
                   user_id: str | None = None) -> dict:
     """Open a virtual position (or a pending breakout order).
 
     ``snapshot`` carries the full decision context — signals, indicators,
     verdict, swing checks, recommendation — stored in normalized DB tables
-    for post-hoc analysis.
+    for post-hoc analysis. ``managed`` marks a row whose exit is run by
+    ``manage_trades`` (the Gap-and-Go A/B); ``init_stop`` pins the original 1R.
     """
     now = now or time.time()
     status = "pending" if (kind == "breakout_wait" and trigger) else "open"
@@ -99,6 +105,9 @@ def open_position(*, ticker: str, trader: str, entry: float, stop: float,
         stake=round(stake, 2),
         shares=round(stake / entry, 4) if entry else 0.0,
         horizon_days=int(horizon_days),
+        managed=bool(managed), hold_weekend=bool(hold_weekend),
+        entry_rvol=(round(float(entry_rvol), 3) if entry_rvol is not None else None),
+        init_stop=round(float(init_stop if init_stop is not None else stop), 4),
         snapshot=snapshot or {},
         exit_price=None, close_reason=None, closed=None,
         pnl_pct=0.0, pnl_usd=0.0,
@@ -126,6 +135,25 @@ def mark(ticker: str, price: float, now: float | None = None,
     if _postgres(path, user_id):
         return _REPOSITORY.mark(user_id, ticker, price, now)
     return mark_trades(ticker, price, now, db_path=_db(path))
+
+
+def manage(ticker: str, price: float, reports=None, trend_change=None,
+           now: float | None = None, path: Path = _PATH,
+           *, user_id: str | None = None) -> list[dict]:
+    """Run best-practice exit management on this ticker's MANAGED positions
+    (breakeven/trail/trend-test-tighten/weekend-flat). Call before ``mark`` so a
+    freshly-tightened stop can trigger the close on the same tick."""
+    if _postgres(path, user_id):
+        return _REPOSITORY.manage(user_id, ticker, price, reports, trend_change, now)
+    return manage_trades(ticker, price, reports, trend_change, now, db_path=_db(path))
+
+
+def has_any_open(ticker: str, path: Path = _PATH,
+                 *, user_id: str | None = None) -> bool:
+    """True if any trader holds an open/pending position in this ticker."""
+    if _postgres(path, user_id):
+        return _REPOSITORY.has_any_open(user_id, ticker)
+    return _has_any_open(ticker.upper(), db_path=_db(path))
 
 
 def stats(positions: list[dict] | None = None, *, user_id: str | None = None) -> dict:
@@ -163,3 +191,13 @@ def algorithm_correctness(path: Path = _PATH, *, user_id: str | None = None) -> 
     if _postgres(path, user_id):
         return _REPOSITORY.algorithm_correctness(user_id)
     return _algorithm_correctness(_db(path))
+
+
+def managed_vs_fixed(path: Path = _PATH, *, user_id: str | None = None) -> dict:
+    """Paired Gap-and-Go A/B: managed exit vs fixed exit on the same ORB idea.
+
+    See ``store.managed_vs_fixed`` — the answer to "is the bot smarter with the
+    adaptive exit behaviors?" isolated from entry quality."""
+    if _postgres(path, user_id):
+        return _REPOSITORY.managed_vs_fixed(user_id)
+    return _managed_vs_fixed(_db(path))

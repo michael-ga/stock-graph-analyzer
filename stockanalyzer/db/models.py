@@ -160,6 +160,27 @@ class Trade(Base):
     pnl_usd: Mapped[float] = mapped_column(Float, default=0, nullable=False)
     snapshot: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     cohort_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    init_stop: Mapped[float] = mapped_column(Float, nullable=False)
+    mfe_pct: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    mae_pct: Mapped[float] = mapped_column(Float, default=0, nullable=False)
+    stop_moves: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    managed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    entry_rvol: Mapped[float | None] = mapped_column(Float)
+    hold_weekend: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class TradeEvent(Base):
+    __tablename__ = "trade_events"
+    id: Mapped[int] = mapped_column(ID, primary_key=True, autoincrement=True)
+    trade_id: Mapped[str] = mapped_column(
+        ForeignKey("trades.id", ondelete="CASCADE"), nullable=False, index=True)
+    ts: Mapped[float] = mapped_column(Float, nullable=False)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False)
+    price: Mapped[float | None] = mapped_column(Float)
+    old_stop: Mapped[float | None] = mapped_column(Float)
+    new_stop: Mapped[float | None] = mapped_column(Float)
+    fraction: Mapped[float | None] = mapped_column(Float)
 
 
 class TradeSignal(Base):

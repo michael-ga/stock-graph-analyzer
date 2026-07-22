@@ -1,8 +1,6 @@
 """Tests for watchlist persistence, rate limiter, and live assurance math."""
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
 import pytest
 
 from stockanalyzer import watchlist

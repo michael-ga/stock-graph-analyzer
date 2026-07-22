@@ -8,7 +8,7 @@ multi-timeframe verdict.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .analysis.engine import TimeframeReport
 from .analysis.signals import Direction
@@ -97,5 +97,5 @@ def _message(pct, agree, total, gate_ok, trend, intended, go) -> str:
     elif pct >= 65:
         head = f"🟡 Direction agrees but {gate}"
     else:
-        head = f"⏳ No added confidence yet — readings mixed"
+        head = "⏳ No added confidence yet — readings mixed"
     return f"{head}: {agree}/{total} recent readings support {side} → {pct}% {arrow} ({gate})."
