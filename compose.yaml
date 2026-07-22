@@ -1,0 +1,58 @@
+services:
+  db:
+    image: postgres:16.9-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-stockanalyzer}
+      POSTGRES_USER: ${POSTGRES_USER:-stockapp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - database
+    security_opt:
+      - no-new-privileges:true
+
+  app:
+    build: .
+    image: stock-graph-analyzer:local
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_ENV: production
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      AUTH_SESSION_MINUTES: ${AUTH_SESSION_MINUTES:-60}
+      AUTH_MAX_FAILURES: ${AUTH_MAX_FAILURES:-5}
+      AUTH_LOCKOUT_MINUTES: ${AUTH_LOCKOUT_MINUTES:-15}
+      FINNHUB_KEY: ${FINNHUB_KEY:-}
+      TWELVEDATA_KEY: ${TWELVEDATA_KEY:-}
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ./legacy:/legacy:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+      - /home/stockapp/.streamlit:rw,noexec,nosuid,size=4m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - database
+      - egress
+
+networks:
+  database:
+    internal: true
+  egress: {}
+
+volumes:
+  postgres_data: {}

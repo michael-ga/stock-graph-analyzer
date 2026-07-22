@@ -1,55 +1,62 @@
-"""Followed tickers, persisted to a JSON file so they survive app restarts."""
-from __future__ import annotations
+"""Per-user followed tickers stored in PostgreSQL during normal operation.
 
+An explicit ``Path`` is retained only as a compatibility adapter for legacy-data
+migration tests; the production UI always supplies ``user_id`` and never writes JSON.
+"""
+from __future__ import annotations
 import json
 from pathlib import Path
+from stockanalyzer.db.repositories.watchlist import WatchlistRepository
 
 _PATH = Path(__file__).resolve().parent.parent / ".watchlist.json"
+_repo = WatchlistRepository()
 
 
-def _read(path: Path) -> list[str]:
+def _legacy_read(path: Path) -> list[str]:
     try:
         data = json.loads(path.read_text())
-        if isinstance(data, list):
-            return [str(t).upper() for t in data]
+        return [str(t).upper() for t in data] if isinstance(data, list) else []
     except Exception:
-        pass
-    return []
+        return []
 
 
-def _write(path: Path, tickers: list[str]) -> None:
-    try:
-        path.write_text(json.dumps(tickers))
-    except Exception:
-        pass
+def _legacy_write(path: Path, tickers: list[str]) -> None:
+    path.write_text(json.dumps(tickers))
 
 
-def load(path: Path = _PATH) -> list[str]:
-    return _read(path)
+def load(path: Path | None = None, *, user_id: str | None = None) -> list[str]:
+    if path is not None:
+        return _legacy_read(path)
+    if not user_id:
+        raise ValueError("user_id is required")
+    return _repo.list(user_id)
 
 
-def add(ticker: str, path: Path = _PATH) -> list[str]:
-    ticker = ticker.strip().upper()
-    tickers = _read(path)
-    if ticker and ticker not in tickers:
-        tickers.append(ticker)
-        _write(path, tickers)
-    return tickers
+def add(ticker: str, path: Path | None = None, *, user_id: str | None = None) -> list[str]:
+    if path is not None:
+        ticker = ticker.strip().upper(); items = _legacy_read(path)
+        if ticker and ticker not in items: items.append(ticker); _legacy_write(path, items)
+        return items
+    if not user_id: raise ValueError("user_id is required")
+    return _repo.add(user_id, ticker)
 
 
-def remove(ticker: str, path: Path = _PATH) -> list[str]:
-    ticker = ticker.strip().upper()
-    tickers = [t for t in _read(path) if t != ticker]
-    _write(path, tickers)
-    return tickers
+def remove(ticker: str, path: Path | None = None, *, user_id: str | None = None) -> list[str]:
+    if path is not None:
+        items = [t for t in _legacy_read(path) if t != ticker.strip().upper()]
+        _legacy_write(path, items); return items
+    if not user_id: raise ValueError("user_id is required")
+    return _repo.remove(user_id, ticker)
 
 
-def toggle(ticker: str, path: Path = _PATH) -> list[str]:
-    ticker = ticker.strip().upper()
-    if ticker in _read(path):
-        return remove(ticker, path)
-    return add(ticker, path)
+def toggle(ticker: str, path: Path | None = None, *, user_id: str | None = None) -> list[str]:
+    if path is not None:
+        return remove(ticker, path) if ticker.strip().upper() in _legacy_read(path) else add(ticker, path)
+    if not user_id: raise ValueError("user_id is required")
+    return _repo.toggle(user_id, ticker)
 
 
-def is_followed(ticker: str, path: Path = _PATH) -> bool:
-    return ticker.strip().upper() in _read(path)
+def is_followed(ticker: str, path: Path | None = None, *, user_id: str | None = None) -> bool:
+    if path is not None: return ticker.strip().upper() in _legacy_read(path)
+    if not user_id: raise ValueError("user_id is required")
+    return _repo.contains(user_id, ticker)

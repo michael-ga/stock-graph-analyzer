@@ -329,7 +329,6 @@ def _long_geometry(price, walls, supports, atr_abs, budget_atr_abs,
     # stops run on the live ATR (must survive today's actual noise).
     budget = budget_atr_abs / price * math.sqrt(tuning.budget_days)  # fraction
     cap = min(tuning.target_cap, budget)
-    buffer = max(0.001 * price, 0.02 * atr_abs)
     s1 = supports[0] if supports else None
 
     def _stop_for(entry: float, wall_below: float | None) -> float:
@@ -414,7 +413,6 @@ def _short_geometry(price, walls, supports, atr_abs, budget_atr_abs,
                     leg_spent: bool = False) -> _Geometry:
     budget = budget_atr_abs / price * math.sqrt(tuning.budget_days)
     cap = min(tuning.target_cap, budget)
-    buffer = max(0.001 * price, 0.02 * atr_abs)
     r1 = walls[0] if walls else None                     # resistance above (stop side)
 
     def _stop_for(entry: float, wall_above: float | None) -> float:

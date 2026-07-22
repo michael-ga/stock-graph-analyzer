@@ -7,8 +7,7 @@ import pandas as pd
 
 from stockanalyzer.analysis.engine import analyze_timeframe
 from stockanalyzer.data.schema import Timeframe, validate_ohlcv
-from stockanalyzer.explain.emerging import (EMERGING_SCORE_CAP, EmergingScore,
-                                            score_emerging)
+from stockanalyzer.explain.emerging import (EMERGING_SCORE_CAP, score_emerging)
 from stockanalyzer.explain.swing import build_swing_plan
 from stockanalyzer.explain.usecase import UseCase
 

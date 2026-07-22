@@ -10,8 +10,11 @@ counts first.
 """
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
+
+from .db.repositories.paper_trades import PaperTradeRepository
 
 from .data.store import (
     DB_PATH,
@@ -22,6 +25,15 @@ from .data.store import (
 
 # Legacy path kept only so the JSON→SQLite migration can find the old file.
 _PATH = Path(__file__).resolve().parent.parent / ".papertrade.json"
+_REPOSITORY = PaperTradeRepository()
+
+
+def _postgres(path: Path, user_id: str | None) -> bool:
+    if path != _PATH or not os.getenv("DATABASE_URL"):
+        return False
+    if not user_id:
+        raise ValueError("user_id is required for PostgreSQL persistence")
+    return True
 
 _FINAL = {"target_hit", "stop_hit", "expired", "not_triggered"}
 
@@ -37,7 +49,9 @@ def _db(path: Path) -> Path:
     return path if path.suffix == ".db" else path.with_suffix(".db")
 
 
-def load(path: Path = _PATH) -> list[dict]:
+def load(path: Path = _PATH, *, user_id: str | None = None) -> list[dict]:
+    if _postgres(path, user_id):
+        return _REPOSITORY.list(user_id)
     return load_paper_trades(_db(path))
 
 
@@ -49,8 +63,10 @@ def recent_duplicate(records: list[dict], ticker: str, level: int,
                and r.get("ts", 0) >= cutoff for r in records)
 
 
-def record(rec: dict, path: Path = _PATH) -> bool:
+def record(rec: dict, path: Path = _PATH, *, user_id: str | None = None) -> bool:
     """Append a proposition unless it's a fresh duplicate. Returns True if stored."""
+    if _postgres(path, user_id):
+        return _REPOSITORY.insert(user_id, rec)
     return insert_paper_trade(rec, db_path=_db(path))
 
 
@@ -111,9 +127,11 @@ def _bars_after(df, alert_ts: float) -> list[tuple[float, float, float]]:
                     sub["close"].astype(float)))
 
 
-def evaluate_all(frames_by_ticker: dict, path: Path = _PATH) -> list[dict]:
+def evaluate_all(frames_by_ticker: dict, path: Path = _PATH,
+                 *, user_id: str | None = None) -> list[dict]:
     """Re-judge every non-final record using fresh daily frames. Saves + returns."""
-    records = load_paper_trades(_db(path))
+    postgres = _postgres(path, user_id)
+    records = _REPOSITORY.list(user_id) if postgres else load_paper_trades(_db(path))
     for r in records:
         if r.get("status") in _FINAL:
             continue
@@ -128,7 +146,10 @@ def evaluate_all(frames_by_ticker: dict, path: Path = _PATH) -> list[dict]:
             r["status"], r["result_pct"] = status, result
             rid = r.get("id")
             if rid is not None:
-                update_paper_status(rid, status, result, db_path=_db(path))
+                if postgres:
+                    _REPOSITORY.update(user_id, rid, status, result)
+                else:
+                    update_paper_status(rid, status, result, db_path=_db(path))
     return records
 
 
