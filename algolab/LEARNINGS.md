@@ -61,6 +61,15 @@ again without materially more data:**
   only 13 swing-checked trades across 7 tickers. The lone nominally-significant
   one ("Engine bias agrees", p≈0.035, and *anti*-predictive) does not survive
   multiple-comparison correction. Treat all as hypotheses, not facts.
+- ❌ **"Speed up the radar by fetching fewer timeframes."** Tempting every time
+  the UI feels slow — and it is an *algorithm* change wearing a performance
+  costume. `build_verdict` normalizes by the weight of the timeframes actually
+  **present** (`aggregate.py`, `weighted_sum / weight_total`), so dropping 6M/YTD/
+  1Y/5Y silently re-weights the investor score, which flows into
+  `_radar_plan` → `context={"investor_pct": …}` → plan score → bot entries → the
+  book. Any "perf fix" that changes which timeframes reach `build_verdict` must be
+  treated as a scoring change and measured as one. (The long frames are cached on
+  disk for 6–24h anyway, so they are rarely the actual cost — measure first.)
 
 ---
 
@@ -181,3 +190,56 @@ pairs** — H5 is *collecting*, not concluded. No score re-weighting was done.
 ≥~30 with a positive mean Δ, the management earns its place; if negative, inspect
 which rule (over-tight trail? premature trend-test?) is bleeding the edge before
 touching thresholds in `manage.py`.
+
+---
+
+### 2026-07-21 — live-mode responsiveness (no algorithm change)
+
+**Nothing in this entry touches scoring, entries, exits, or the book.** It is
+recorded here only because the first plan for it *would* have — see the new
+"speed up the radar by fetching fewer timeframes" item under **Ruled out**.
+
+**Problem:** live mode felt stuck and the chart froze. Cause was structural, not
+algorithmic: a single `@st.fragment(run_every="1s")` rebuilt the *entire*
+dashboard every second, including two full Plotly figures, while the 5s radar and
+30s portfolio fragments competed for the same per-session script lock.
+
+**Changed:**
+1. Live mode split into three sibling fragments by how fast the content actually
+   changes — FAST 1s (price header, HTML only), MID 3s (heartbeat, bots, flip
+   detection, event feed), SLOW 15s (plan, orders guide, candlestick chart,
+   chips). Shared engine/plan state moved to `ss.live_shared`, rebuilt only in the
+   slow frame, so the fast frames never touch the network.
+2. Chart viewport (`_stable_focus`) computed **once per (ticker, timeframe,
+   interval)** instead of on every redraw. It was derived from the last 40% of
+   bars, so it crept with each new bar and the plot drifted under the user.
+3. Candle-size picker (5m / 15m / 30m) via local roll-up — `data/resample.py`,
+   pure + unit-tested. Coarser candles are exact integer multiples of the fetched
+   5m bars, so switching costs **no** network call and no rate-limit budget. The
+   engine is re-run on the rolled-up frame (indicator columns are deliberately
+   dropped — RSI on 5m ≠ RSI on 15m) and memoized per last-bar.
+4. Radar: reuse the `AnalysisResult` already in hand instead of re-entering
+   `st.cache_data` via `_quiet_price` purely to read one float (that path pays a
+   full unpickle of a seven-timeframe result). Behaviour identical.
+5. Added an opt-in frame-timing panel (sidebar → "⏱ Show frame timings").
+
+**How we know it worked — measured, after hours, 2026-07-21:**
+
+| fragment | p50 | p95 | budget |
+|---|--:|--:|--:|
+| fast · price header | 1 ms | 2 ms | 1000 ms |
+| mid · pulse/bots/feed | 1 ms | 1 ms | 3000 ms |
+| slow · chart/plan | 407 ms | 448 ms | 15000 ms |
+| radar | 9 ms | **4386 ms** | 5000 ms |
+
+The 407 ms chart rebuild used to run **every second** against a 1000 ms budget —
+~40% duty cycle before the radar took its share, which is exactly the backlog that
+made the UI feel frozen. It is now ~2.7%.
+
+**Next session, start here:** radar p95 is **4386 ms against a 5000 ms budget** —
+it only passes because most tickers are idle-tiered after hours, and it will blow
+the budget during RTH. That is the next thing to fix, and the fix is *not* fewer
+timeframes (see Ruled out): move `_run_quiet` + `virtualbook` marking onto a
+background worker thread (the `RealtimeStream` pattern in `data/realtime.py`) and
+let the fragment read a snapshot. Re-measure with the timing panel during market
+hours before and after.
