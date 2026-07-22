@@ -44,6 +44,18 @@ def test_update_exports_pulled_head_before_build_and_up():
     assert FULL_SHA not in script
 
 
+def test_rollback_exports_detached_head_before_build_and_up():
+    script = Path("scripts/rollback.sh").read_text()
+    switch = script.index('git switch --detach "$ref"')
+    version = script.index('APP_VERSION=$(git rev-parse HEAD)')
+    export = script.index("export APP_VERSION")
+    build = script.index("docker compose build")
+    up = script.index("docker compose up")
+
+    assert switch < version < export < build < up
+    assert FULL_SHA not in script
+
+
 def test_healthcheck_rejects_container_version_mismatch_without_docker():
     with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
         fake_bin = Path(directory)

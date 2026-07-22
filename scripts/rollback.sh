@@ -18,6 +18,8 @@ if [ -n "$(git status --porcelain)" ]; then
 fi
 ./scripts/backup_db.sh
 git switch --detach "$ref"
+APP_VERSION=$(git rev-parse HEAD)
+export APP_VERSION
 docker compose build app
 docker compose up -d
 ./scripts/healthcheck.sh
