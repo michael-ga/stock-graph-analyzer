@@ -147,6 +147,27 @@ def test_the_real_book_is_never_touched(tmp_path):
     assert virtualbook.load(path=_db(tmp_path))
 
 
+def test_a_replay_never_reaches_postgres_even_when_it_is_configured(tmp_path,
+                                                                    monkeypatch):
+    """On the NUC ``DATABASE_URL`` routes the default book to PostgreSQL. A replay
+    passes its own ``path`` on every call, so it must stay in its SQLite file —
+    practice trades in the production book would corrupt the real sample."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://unused@nowhere/db")
+
+    class _Forbidden:
+        def __getattr__(self, name):
+            raise AssertionError(f"replay reached the PostgreSQL repository ({name})")
+
+    monkeypatch.setattr(virtualbook, "_REPOSITORY", _Forbidden())
+    db = _db(tmp_path)
+    sess = _session([_bar(0, gap_fired=True), _bar(1), _bar(2, close=106.0)])
+    for i in range(3):
+        replay.apply_bar(sess, i, _ALL_BOTS, db)
+    replay.force_flat(sess, db)
+    card = replay.scorecard(sess, db)
+    assert card["book"] and all(r["status"] == "closed" for r in card["book"])
+
+
 # --------------------------------------------------------------------------- #
 # Per-bar lifecycle.
 # --------------------------------------------------------------------------- #
