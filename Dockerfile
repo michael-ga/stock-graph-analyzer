@@ -7,17 +7,18 @@ COPY requirements.txt requirements.lock ./
 RUN pip install --upgrade pip && pip install -r requirements.lock
 
 FROM python:3.12.11-slim-bookworm
-ARG APP_VERSION=unknown
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH=/opt/venv/bin:$PATH \
     STREAMLIT_SERVER_ADDRESS=0.0.0.0 STREAMLIT_SERVER_PORT=8501 \
-    STREAMLIT_SERVER_HEADLESS=true STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
-    APP_VERSION=$APP_VERSION
-LABEL org.opencontainers.image.revision=$APP_VERSION
+    STREAMLIT_SERVER_HEADLESS=true STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 RUN groupadd --gid 10001 stockapp && useradd --uid 10001 --gid stockapp --create-home stockapp
+RUN mkdir -p /var/lib/stockanalyzer/replay && chown -R stockapp:stockapp /var/lib/stockanalyzer
 COPY --from=builder /opt/venv /opt/venv
 WORKDIR /app
 COPY --chown=stockapp:stockapp . .
-RUN chmod 0555 docker/entrypoint.sh
+RUN python -m scripts.source_version --write /app/.source-version && chmod 0555 docker/entrypoint.sh
+ARG APP_VERSION=unknown
+ENV APP_VERSION=$APP_VERSION
+LABEL org.opencontainers.image.revision=$APP_VERSION
 USER 10001:10001
 EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \

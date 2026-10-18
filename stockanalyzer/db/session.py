@@ -7,7 +7,7 @@ from contextvars import ContextVar
 from typing import Iterator
 
 from sqlalchemy import create_engine
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 _engine: Engine | None = None
@@ -20,6 +20,10 @@ def configure_engine(database_url: str | None = None) -> Engine:
     url = database_url or os.getenv("DATABASE_URL", "")
     if not url:
         raise RuntimeError("DATABASE_URL is required")
+    # All browser sessions use the same process-wide engine. A new login must
+    # not dispose the connection pool while other users/worker threads use it.
+    if _engine is not None and _engine.url == make_url(url):
+        return _engine
     if _engine is not None:
         _engine.dispose()
     kwargs = {"pool_pre_ping": True}

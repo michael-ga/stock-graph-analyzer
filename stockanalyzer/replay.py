@@ -19,7 +19,10 @@ No Streamlit import lives here on purpose — everything below is unit-testable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
+import os
 from pathlib import Path
+import re
 
 import pandas as pd
 
@@ -371,6 +374,22 @@ def precompute_day(i5, i30, daily, day, prev_close, ticker: str = "",
 # --------------------------------------------------------------------------- #
 # The replay book (an isolated sandbox — never the real trades.db).
 # --------------------------------------------------------------------------- #
+def practice_root(root: Path, user_id: str) -> Path:
+    """Keep each authenticated user's practice files in their own namespace."""
+    if not user_id:
+        raise ValueError("Replay requires an authenticated user")
+    base = Path(os.environ.get("STOCKANALYZER_REPLAY_DIR") or root)
+    owner = hashlib.sha256(user_id.encode()).hexdigest()
+    return base / "users" / owner
+
+
+def _book_key(ticker: str, day) -> str:
+    symbol = ticker.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9^][A-Z0-9.^=_-]{0,31}", symbol):
+        raise ValueError("Invalid replay ticker")
+    return f"{symbol}-{pd.Timestamp(day):%Y%m%d}"
+
+
 def replay_db_path(root: Path, ticker: str, day, attempt: int = 1) -> Path:
     """Where one practice attempt is recorded.
 
@@ -379,10 +398,10 @@ def replay_db_path(root: Path, ticker: str, day, attempt: int = 1) -> Path:
     at the project root would silently inherit the real trade history and wreck
     the scorecard. Keeping it one level down means the migration finds no JSON.
     """
-    d = pd.Timestamp(day).strftime("%Y%m%d")
+    key = _book_key(ticker, day)
     folder = Path(root) / ".replay"
     folder.mkdir(parents=True, exist_ok=True)
-    return folder / f"{ticker.upper()}-{d}-{attempt}.db"
+    return folder / f"{key}-{attempt}.db"
 
 
 def next_attempt(root: Path, ticker: str, day) -> int:
@@ -393,10 +412,10 @@ def next_attempt(root: Path, ticker: str, day) -> int:
     a previous one. Ask the filesystem instead; old attempts stay put as a
     practice log.
     """
-    d = pd.Timestamp(day).strftime("%Y%m%d")
+    key = _book_key(ticker, day)
     folder = Path(root) / ".replay"
     used = set()
-    for p in folder.glob(f"{ticker.upper()}-{d}-*.db"):
+    for p in folder.glob(f"{key}-*.db"):
         try:
             used.add(int(p.stem.rsplit("-", 1)[1]))
         except (IndexError, ValueError):
@@ -405,6 +424,20 @@ def next_attempt(root: Path, ticker: str, day) -> int:
     while n in used:
         n += 1
     return n
+
+
+def create_attempt(root: Path, ticker: str, day) -> tuple[int, Path]:
+    """Reserve a fresh book even when two browser sessions start together."""
+    attempt = next_attempt(root, ticker, day)
+    while True:
+        path = replay_db_path(root, ticker, day, attempt)
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            attempt += 1
+        else:
+            os.close(descriptor)
+            return attempt, path
 
 
 def _open(trader: str, ticker: str, bar: ReplayBar, db: Path, *, entry: float,

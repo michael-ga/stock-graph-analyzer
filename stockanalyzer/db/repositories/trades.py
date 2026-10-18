@@ -11,6 +11,7 @@ from stockanalyzer.db.models import (
     Trade, TradeEvent, TradeIndicator, TradeSignal, TradeSwingCheck, TradeVerdict,
 )
 from stockanalyzer.db.session import session_scope
+from stockanalyzer.version import app_version
 
 _CONFIRM_MARGIN = 0.002
 
@@ -85,7 +86,8 @@ class TradeRepository:
             ).limit(1)) is not None
 
     def insert(self, user_id: str, trade: dict, context: dict | None = None) -> dict:
-        snapshot = context or trade.get("snapshot") or {}
+        snapshot = dict(context or trade.get("snapshot") or {})
+        snapshot.setdefault("app_version", app_version())
         with session_scope() as session:
             row = Trade(
                 id=trade["id"], user_id=user_id, ticker=trade["ticker"].upper(),

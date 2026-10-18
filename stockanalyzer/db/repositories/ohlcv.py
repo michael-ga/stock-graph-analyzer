@@ -3,11 +3,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, or_, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from stockanalyzer.db.models import OhlcvBar
+from stockanalyzer.db.models import OhlcvBar, OhlcvFetch
 from stockanalyzer.db.session import session_scope
 
 
@@ -53,16 +53,19 @@ class OhlcvRepository:
             )
         with session_scope() as session:
             table = OhlcvBar.__table__
-            # Each cache key represents one rolling provider snapshot. Replacing
-            # it atomically prevents stale bars from accumulating forever.
-            session.execute(
-                delete(table).where(
-                    table.c.provider == provider,
-                    table.c.ticker == ticker,
-                    table.c.timeframe == timeframe,
-                )
-            )
             dialect = session.get_bind().dialect.name
+            if dialect == "postgresql":
+                # Serialize writers of the SAME snapshot only; never hold a
+                # global/session transaction open between fetches.
+                session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                                {"key": f"ohlcv:{provider}:{ticker}:{timeframe}"})
+            # Remove only candles outside the latest rolling snapshot. Replacing
+            # every row on every poll caused millions of dead tuples.
+            session.execute(delete(table).where(
+                table.c.provider == provider, table.c.ticker == ticker,
+                table.c.timeframe == timeframe,
+                table.c.bar_time.not_in([row["bar_time"] for row in rows]),
+            ))
             insert = pg_insert(table) if dialect == "postgresql" else sqlite_insert(table)
             excluded = insert.excluded
             statement = insert.values(rows).on_conflict_do_update(
@@ -75,8 +78,18 @@ class OhlcvRepository:
                     "volume": excluded.volume,
                     "fetched_at": excluded.fetched_at,
                 },
+                where=or_(*(table.c[name].is_distinct_from(excluded[name])
+                            for name in ("open", "high", "low", "close", "volume"))),
             )
             session.execute(statement)
+            freshness = OhlcvFetch.__table__
+            insert_fetch = pg_insert(freshness) if dialect == "postgresql" else sqlite_insert(freshness)
+            session.execute(insert_fetch.values(
+                provider=provider, ticker=ticker, timeframe=timeframe, fetched_at=fetched,
+            ).on_conflict_do_update(
+                index_elements=["provider", "ticker", "timeframe"],
+                set_={"fetched_at": fetched},
+            ))
 
     def load_stale(self, key: str) -> pd.DataFrame | None:
         provider, ticker, timeframe = _parts(key)
@@ -110,10 +123,10 @@ class OhlcvRepository:
         provider, ticker, timeframe = _parts(key)
         with session_scope() as session:
             fetched = session.scalar(
-                select(func.max(OhlcvBar.fetched_at)).where(
-                    OhlcvBar.provider == provider,
-                    OhlcvBar.ticker == ticker,
-                    OhlcvBar.timeframe == timeframe,
+                    select(OhlcvFetch.fetched_at).where(
+                        OhlcvFetch.provider == provider,
+                        OhlcvFetch.ticker == ticker,
+                        OhlcvFetch.timeframe == timeframe,
                 )
             )
         if fetched is None or datetime.now(timezone.utc) - _aware(fetched) > timedelta(seconds=ttl):
@@ -122,9 +135,12 @@ class OhlcvRepository:
 
     def prune(self, before: datetime, timeframes=("1D", "5D")) -> int:
         with session_scope() as session:
+            expired = select(OhlcvFetch.provider, OhlcvFetch.ticker, OhlcvFetch.timeframe).where(
+                OhlcvFetch.fetched_at < before,
+            )
             result = session.execute(
                 delete(OhlcvBar).where(
-                    OhlcvBar.fetched_at < before,
+                    tuple_(OhlcvBar.provider, OhlcvBar.ticker, OhlcvBar.timeframe).in_(expired),
                     OhlcvBar.timeframe.in_(timeframes),
                 )
             )

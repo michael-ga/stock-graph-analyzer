@@ -6,6 +6,7 @@ from datetime import datetime
 from sqlalchemy import select
 from stockanalyzer.db.models import AnalysisRun, AnalysisTimeframe
 from stockanalyzer.db.session import session_scope
+from stockanalyzer.version import app_version
 
 
 class AnalysisHistoryRepository:
@@ -21,6 +22,7 @@ class AnalysisHistoryRepository:
             if existing:
                 return existing.id
             run = AnalysisRun(user_id=user_id, idempotency_key=idempotency_key,
+                              app_version=app_version(),
                               ticker=ticker.strip().upper(), provider=provider,
                               strategy=strategy, swing_pace=swing_pace, use_case=use_case,
                               quote=quote, sentiment=sentiment, verdict=verdict,

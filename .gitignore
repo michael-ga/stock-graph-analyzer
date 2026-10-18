@@ -22,6 +22,8 @@ legacy/
 .last-deploy
 # Replay simulator practice books — one SQLite file per attempt, never the real book
 .replay/
+.local/
+exports/
 # Editor/agent config and the copyrighted source PDF (rules are encoded in code)
 .claude/
 *.pdf

@@ -81,6 +81,30 @@ class ProviderRateLimit(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class OhlcvFetch(Base):
+    """Freshness belongs to the fetched snapshot, not every unchanged candle."""
+    __tablename__ = "ohlcv_fetches"
+    provider: Mapped[str] = mapped_column(String(64), primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(32), primary_key=True)
+    timeframe: Mapped[str] = mapped_column(String(16), primary_key=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class RadarSnapshot(Base):
+    """One compact, replaceable market result per ticker, with no user data."""
+    __tablename__ = "radar_snapshots"
+    ticker: Mapped[str] = mapped_column(String(32), primary_key=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class Installation(Base):
+    """Persistent identity for deduplicating portable history exports."""
+    __tablename__ = "installation"
+    key: Mapped[str] = mapped_column(String(32), primary_key=True)
+    value: Mapped[str] = mapped_column(String(128), nullable=False)
+
+
 class OhlcvBar(Base):
     __tablename__ = "ohlcv_bars"
     __table_args__ = (Index("ix_ohlcv_ticker_timeframe_time", "ticker", "timeframe", "bar_time"),)
@@ -113,6 +137,7 @@ class AnalysisRun(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     ticker: Mapped[str] = mapped_column(String(32), nullable=False)
+    app_version: Mapped[str] = mapped_column(String(128), default="unknown", nullable=False)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     strategy: Mapped[str | None] = mapped_column(String(64))
     swing_pace: Mapped[str | None] = mapped_column(String(64))

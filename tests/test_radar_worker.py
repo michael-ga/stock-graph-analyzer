@@ -157,7 +157,7 @@ def test_disabled_user_is_revalidated_at_worker_write_boundary(monkeypatch):
     assert report == worker.ProcessReport(None, False, 0, 0)
 
 
-def test_open_position_only_swallows_integrity_errors(monkeypatch):
+def test_open_position_only_swallows_integrity_errors(monkeypatch, db):
     import pytest
     import stockanalyzer.radar_worker as worker
 
@@ -321,6 +321,11 @@ def test_postgres_worker_lease_prevents_duplicate_worker_instances():
     calls: list[str] = []
 
     class Connection:
+        def execution_options(self, *, isolation_level):
+            assert isolation_level == "AUTOCOMMIT"
+            calls.append("autocommit")
+            return self
+
         def scalar(self, statement, parameters):
             calls.append(str(statement))
             return True

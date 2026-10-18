@@ -6,6 +6,7 @@ from sqlalchemy import select
 
 from stockanalyzer.db.models import PaperTrade
 from stockanalyzer.db.session import session_scope
+from stockanalyzer.version import app_version
 
 
 def _dict(row: PaperTrade) -> dict:
@@ -45,7 +46,8 @@ class PaperTradeRepository:
             session.add(PaperTrade(
                 source_id=str(source_id) if source_id else None,
                 user_id=user_id, ts=ts, date=record.get("date", ""), ticker=ticker,
-                level=level, payload={k: v for k, v in record.items() if k not in core},
+                level=level, payload={"app_version": app_version(),
+                                      **{k: v for k, v in record.items() if k not in core}},
                 status=record.get("status", "open"), result_pct=record.get("result_pct", 0.0),
             ))
             return True

@@ -85,6 +85,12 @@ def _load_session(ticker: str, day: pd.Timestamp, hist: dict) -> None:
     if not sess.bars:
         st.error(f"No usable session bars for {ticker} on {day:%Y-%m-%d}.")
         return
+    try:
+        root = replay.practice_root(_ROOT, ss.get("auth_user_id", ""))
+        attempt, database = replay.create_attempt(root, ticker, day)
+    except (OSError, ValueError) as exc:
+        st.error(f"Couldn't create a practice book: {exc}")
+        return
     _reset_session()
     ss.rp_sess = sess
     ss.rp_i = 0
@@ -93,8 +99,8 @@ def _load_session(ticker: str, day: pd.Timestamp, hist: dict) -> None:
     ss.rp_revealed = False
     ss.rp_next_at = 0.0
     ss.rp_events = []
-    ss.rp_attempt = replay.next_attempt(_ROOT, ticker, day)
-    ss.rp_db = replay.replay_db_path(_ROOT, ticker, day, ss.rp_attempt)
+    ss.rp_attempt = attempt
+    ss.rp_db = database
 
 
 def _setup_row() -> None:

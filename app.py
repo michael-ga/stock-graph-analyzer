@@ -18,6 +18,7 @@ import os
 import re
 import threading
 import time
+from html import escape
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -35,6 +36,7 @@ from stockanalyzer.auth import AuthError, AuthService
 from stockanalyzer.user_management import UserManagementService
 from stockanalyzer.config import ConfigurationError, Settings
 from stockanalyzer.db.repositories.analysis_history import AnalysisHistoryRepository
+from stockanalyzer.db.repositories.radar_snapshots import RadarSnapshotRepository
 from stockanalyzer.db.session import configure_engine
 from stockanalyzer.analysis import reversal
 from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
@@ -55,6 +57,7 @@ from stockanalyzer.live_events import LiveState, diff_states
 from stockanalyzer.pipeline import analyze_ticker
 from stockanalyzer.strategy import Strategy, SwingPace
 from stockanalyzer.ui.history import render_history
+from stockanalyzer.version import app_version
 from stockanalyzer.verdict.aggregate import build_verdict
 # NOTE: stockanalyzer.vision imports OpenCV (cv2). It is imported lazily inside
 # _render_image_mode so a cv2 load failure on a server can never blank the app.
@@ -97,9 +100,13 @@ st.set_page_config(page_title="Stock Graph Analyzer", layout="wide")
 
 def _engineering_version() -> str:
     """Format the immutable image revision for authenticated UI display."""
-    version = os.environ.get("APP_VERSION", "development")
+    version = app_version()
     if re.fullmatch(r"[0-9a-f]{40}", version):
         return f"eng-{version[:12]}"
+    if re.fullmatch(r"[0-9a-f]{40}\+local(?:\.[0-9a-f]+)?", version):
+        return f"eng-{version[:12]} (local changes)"
+    if re.fullmatch(r"source-[0-9a-f]{16}", version):
+        return f"eng-{version}"
     if version in {"development", "unknown"}:
         return version
     return "unknown"
@@ -135,9 +142,10 @@ def _require_login() -> bool:
             st.caption(f"Signed in as **{st.session_state.get('auth_username', 'user')}**")
             st.caption(f"Engineering version: {_engineering_version()}")
             if st.button("Log out", use_container_width=True):
-                for key in list(st.session_state):
-                    if key.startswith("auth_"):
-                        del st.session_state[key]
+                stream = st.session_state.get("rt_stream")
+                if stream is not None:
+                    stream.stop()
+                st.session_state.clear()
                 st.rerun()
         if current_user.must_change_password:
             st.title("Change your password")
@@ -172,10 +180,12 @@ def _require_login() -> bool:
         password = st.text_input("Password", type="password", autocomplete="current-password")
         submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
     if submitted:
+        st.session_state["_login_started"] = time.perf_counter()
         try:
             user = AuthService(settings.auth_max_failures, settings.auth_lockout_minutes).authenticate(
                 username, password
             )
+            st.session_state["_auth_ms"] = (time.perf_counter() - st.session_state["_login_started"]) * 1000
         except AuthError:
             st.error("Invalid username or password")
         else:
@@ -329,8 +339,8 @@ def main() -> None:
         _users_page()
         return
 
-    # Before the radar/portfolio panels on purpose: their 5s/30s fragments would
-    # fetch quotes and redraw beside a 0.5s animation frame, stuttering the tape.
+    # Keep radar/portfolio fragments off the replay page so optional dashboard
+    # refreshes do not redraw beside the playback animation.
     if ss.page == "replay":
         replay_page.render()
         return
@@ -586,7 +596,9 @@ def _sidebar():
                               help="auto uses Twelve Data if TWELVEDATA_KEY is set, else "
                                    "yfinance. Pre-market/after-hours data comes from "
                                    "yfinance (free); Twelve Data needs a paid plan for it.")
-        live_on = st.toggle("🔴 Live mode (real-time)", value=True,
+        st.toggle("Auto-refresh radar and portfolio", value=False, key="dashboard_auto_refresh",
+                  help="Read the latest prepared results every 30 seconds. Leave off for a still view; use Refresh results when needed.")
+        live_on = st.toggle("🔴 Live mode (real-time)", value=False,
                             help="Turns the page into a real-time dashboard: tick-by-tick "
                                  "price, plan/stop/target & P&L recomputed every second, "
                                  "signals re-run ~45s, with flip alerts. Needs FINNHUB_KEY. "
@@ -630,7 +642,8 @@ def _price_of(res) -> float | None:
 
 def _quiet_price(tk: str) -> float | None:
     try:
-        return _price_of(_run_quiet(tk))
+        saved = RadarSnapshotRepository().for_user(st.session_state.auth_user_id).get(tk, {})
+        return (saved.get("quote") or {}).get("price")
     except Exception:
         return None
 
@@ -1047,11 +1060,12 @@ def _radar_card(tk: str, plan, res=None, tier: str | None = None) -> None:
         st.rerun(scope="app")
 
 
-_RADAR_REFRESH_S = 5
+_RADAR_REFRESH_S = 30
 
 
 def _radar_panel(tracked: list[str]) -> None:
-    @st.fragment(run_every=f"{_RADAR_REFRESH_S}s")
+    cadence = f"{_RADAR_REFRESH_S}s" if st.session_state.get("dashboard_auto_refresh") else None
+    @st.fragment(run_every=cadence)
     def _radar():
         with _timed("radar", _RADAR_REFRESH_S):
             _radar_body(tracked)
@@ -1062,102 +1076,52 @@ def _radar_panel(tracked: list[str]) -> None:
 
 
 def _radar_body(tracked: list[str]) -> None:
-    ss = st.session_state
-    ss.setdefault("radar_cache", {})     # tk -> {res, plan, orange, tier}
-    ss.setdefault("radar_due", {})        # tk -> next recompute epoch
-    now = time.time()
-    ts_et = session.now_et()
-    phase = session.market_phase(ts_et)
-    orb_window = session.is_orb_window(ts_et)
-
-    # Drop state for tickers no longer tracked (keep the dicts bounded).
-    for k in list(ss.radar_cache):
-        if k not in tracked:
-            ss.radar_cache.pop(k, None)
-            ss.radar_due.pop(k, None)
-
-    head_l, head_r = st.columns([3, 1])
-    head_l.markdown("#### 📡 Swing radar — adaptive (Gap-and-Go aware)")
-    sort_pct = head_r.toggle("Sort by %", value=True, key="radar_sort",
-                             help="Highest swing score first. Off = the order "
-                                  "you added them.")
-
-    items: list[tuple] = []
-    for tk in tracked:
-        has_open = virtualbook.has_any_open(
-            tk, user_id=st.session_state.auth_user_id)
-        due = ss.radar_due.get(tk, 0) <= now
-        if due:                          # only recompute the heavy analysis when due
-            try:
-                res = _run_quiet(tk)
-                plan = (_radar_plan(res, _quiet_sentiment(tk))
-                        if res.reports else None)
-            except Exception:
-                res, plan = None, None
-            orange = _opening_range(tk, res) if res is not None else None
-            price = res.quote.price if (res is not None and res.quote) else None
-            tier = _radar_tier(plan, price, has_open, phase, orange, orb_window)
-            ss.radar_cache[tk] = {"res": res, "plan": plan,
-                                  "orange": orange, "tier": tier}
-            ss.radar_due[tk] = now + _RADAR_TIERS.get(tier, 60)
-        cached = ss.radar_cache.get(tk) or {}
-        items.append((tk, cached.get("res"), cached.get("plan"),
-                      cached.get("tier", "FAR"), cached.get("orange"),
-                      has_open, due))
-    if sort_pct:
-        items.sort(key=lambda it: it[2].score if it[2] is not None else -1,
-                   reverse=True)
-
-    cols = st.columns(min(4, max(1, len(tracked))))
-    for i, (tk, res, plan, tier, orange, has_open, due) in enumerate(items):
-        with cols[i % len(cols)]:
-            if plan is None:
-                st.caption(f"{tk}: no data")
+    """Render saved cards only. No network, engine runs, or automatic trading."""
+    st.markdown("#### 📡 Swing radar")
+    left, right = st.columns([3, 1])
+    sort_pct = left.toggle("Sort by %", value=True, key="radar_sort")
+    right.button("Refresh results", key="radar_refresh", use_container_width=True)
+    saved = RadarSnapshotRepository().for_user(st.session_state.auth_user_id)
+    ordered = sorted(tracked, key=lambda tk: (saved.get(tk, {}).get("plan") or {}).get("score", -1),
+                     reverse=True) if sort_pct else tracked
+    columns = st.columns(min(4, max(1, len(ordered))))
+    for index, ticker in enumerate(ordered):
+        item = saved.get(ticker, {})
+        plan = item.get("plan")
+        with columns[index % len(columns)]:
+            if not plan:
+                st.info(f"{ticker}: preparing analysis…")
                 continue
-            # Notices + trading only when we recomputed this tick, or when we
-            # already hold a position (babysit it every tick, any tier).
-            if due or has_open:
-                fired = swingwatch.claim_notice(
-                    tk, plan.score, user_id=st.session_state.auth_user_id)
-                if fired:
-                    stored = papertrade.record(dict(
-                        ts=time.time(), date=time.strftime("%x %X"),
-                        ticker=tk, level=fired[0], score=plan.score,
-                        label=plan.score_label, kind=plan.kind, setup=plan.setup,
-                        entry=plan.entry, stop=plan.stop, target=plan.target1,
-                        rr=plan.rr, trigger=plan.trigger, horizon_days=3,
-                        guidance=plan.guidance, status="open", result_pct=0.0),
-                        user_id=st.session_state.auth_user_id)
-                    note = " · 📒 recorded for paper trading" if stored else ""
-                    st.toast(f"📡 {tk}: {fired[1]} — {plan.guidance[:80]}{note}", icon="🔔")
-                # `res` is already in hand — going back through _quiet_price
-                # would re-enter st.cache_data and pay a full unpickle of a
-                # seven-timeframe AnalysisResult just to read one float.
-                px = _price_of(res)
-                reports = res.reports if res is not None else None
-                _run_bots(tk, plan, reports=reports, orange=orange,
-                          price=px, phase=phase)
-                _run_reversal_bots(tk, res, px, phase)
-                if px:
-                    dec = _radar_decision_rep(res) if res is not None else None
-                    tc = getattr(dec, "trend_change", None)
-                    virtualbook.manage(
-                        tk, px, reports, tc,
-                        user_id=st.session_state.auth_user_id)   # before mark
-                    for chg in virtualbook.mark(
-                            tk, px, user_id=st.session_state.auth_user_id):
-                        if chg["status"] == "closed":
-                            st.toast(f"💼 {chg['trader']} closed {tk}: "
-                                     f"{chg['close_reason']} ({chg['pnl_pct']:+.1f}%)",
-                                     icon="💼")
-                        else:
-                            st.toast(f"💼 {chg['trader']}'s breakout order filled in {tk}",
-                                     icon="🚀")
-            _radar_card(tk, plan, res, tier=tier)
-    st.caption("Adaptive scan — imminent setups refresh ~5–10s, far buildups ~60s "
-               "(saves CPU). First 15 min after the open = ⏸ PAUSED, no entries. "
-               "States: ⚪ NO SETUP → 🟡 BUILDUP → 👀 WATCH CLOSE → 🟢 GO · "
-               "🔔 = score reached 60 / 70 / 80%.")
+            from types import SimpleNamespace
+            color, label, instruction = _plan_brief(SimpleNamespace(**plan))
+            quote = item.get("quote") or {}
+            price = quote.get("price")
+            price_text = f"${price:,.2f}" if price is not None else ""
+            change = quote.get("day_change_pct")
+            if change is not None:
+                price_text += f" ({change:+.1f}%)"
+            st.markdown(
+                f"<div style='border:1px solid {color};border-radius:10px;padding:10px'>"
+                f"<b>{escape(ticker)}</b> {price_text}<br>"
+                f"<b style='color:{color}'>{escape(label)} · {plan['score']}%</b><br>"
+                f"{escape(instruction)}</div>", unsafe_allow_html=True,
+            )
+            trends = item.get("trends") or []
+            st.caption(" · ".join(
+                f"{row['timeframe']} {_DIR_EMOJI[Direction(row['direction'])]}"
+                for row in trends if row["timeframe"] in ("5D", "1M")
+            ))
+            stamp = datetime.fromisoformat(item["updated_at"])
+            age = max(0, int((datetime.now(timezone.utc) - stamp).total_seconds()))
+            st.caption(f"Updated {age // 60} min ago" if age >= 60 else f"Updated {age}s ago")
+            if age > 600 and session.market_phase(session.now_et()) != "closed":
+                st.caption("Waiting for a newer scan. Check the radar worker if this persists.")
+            if st.button(f"🔎 Open {ticker}", key=f"radar_open_{ticker}", use_container_width=True):
+                st.session_state._pending_ticker = ticker
+                st.rerun(scope="app")
+    st.caption("Background scans continue with the browser closed. Refresh results to read the latest scan.")
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -1325,23 +1289,17 @@ def _portfolio_panel() -> None:
                     "as the radar scans, so the report card fills up on its own.")
         return
 
-    @st.fragment(run_every="30s")
+    cadence = "30s" if st.session_state.get("dashboard_auto_refresh") else None
+    @st.fragment(run_every=cadence)
     def _folio():
 
         book = virtualbook.load(user_id=st.session_state.auth_user_id)
         live = [p for p in book if p["status"] in ("open", "pending")]
-        # Mark holdings to fresh prices (auto-close stop/target hits).
-        prices: dict[str, float] = {}
-        for tk in {p["ticker"] for p in live}:
-            px = _quiet_price(tk)
-            if px:
-                prices[tk] = px
-                for chg in virtualbook.mark(tk, px, user_id=st.session_state.auth_user_id):
-                    if chg["status"] == "closed":
-                        st.toast(f"💼 {chg['trader']} closed {tk}: {chg['close_reason']} "
-                                 f"({chg['pnl_pct']:+.1f}%)", icon="💼")
-        book = virtualbook.load(user_id=st.session_state.auth_user_id)
-        live = [p for p in book if p["status"] in ("open", "pending")]
+        # A render only reads prices. Stop/target handling belongs to the worker.
+        saved = RadarSnapshotRepository().for_user(st.session_state.auth_user_id)
+        prices = {tk: item["quote"]["price"] for tk, item in saved.items()
+                  if item.get("quote") and item["quote"].get("price") is not None}
+        st.button("Refresh portfolio", key="portfolio_refresh")
         s = virtualbook.stats(book)
         tot = s["totals"]
         unreal = sum((prices.get(p["ticker"], p["entry"]) - p["entry"]) * p["shares"]
@@ -2703,7 +2661,8 @@ def _live_chart(ticker, d1, plan, key_level, live_price, snap, reports=None) -> 
                         "the latest candles", use_container_width=True):
         st.session_state.get("_chart_focus", {}).pop(view_key, None)
     _apply_focus(fig, _stable_focus(view_key, rep.df, keep_prices=keep))
-    st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_CFG)
+    st.plotly_chart(fig, use_container_width=True, config=_PLOTLY_CFG,
+                    key=f"live-chart-{view_key}")
 
 
 def _live_heartbeat(ticks) -> None:
@@ -2990,3 +2949,11 @@ if __name__ == "__main__" or _running_in_streamlit():
     _start_keep_alive()
     if _require_login():
         main()
+        started = st.session_state.pop("_login_started", None)
+        if started is not None:
+            st.session_state["_login_ms"] = (time.perf_counter() - started) * 1000
+        if st.session_state.get("show_perf") and st.session_state.get("_login_ms") is not None:
+            st.sidebar.caption(
+                f"Last sign-in: {st.session_state['_login_ms']:.0f} ms "
+                f"(authentication {st.session_state.get('_auth_ms', 0):.0f} ms)"
+            )

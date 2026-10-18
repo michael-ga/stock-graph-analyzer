@@ -20,4 +20,7 @@ venv
 *.parquet
 secrets
 backups
+.local
+.replay
+exports
 tests

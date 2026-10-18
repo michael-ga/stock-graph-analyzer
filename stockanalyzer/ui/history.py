@@ -477,6 +477,8 @@ def render_history(user_id: str) -> None:
         unsafe_allow_html=True,
     )
 
+    _portable_history(user_id)
+
     result_type = st.radio(
         "History type", ("Completed analyses", "Virtual trades", "Paper trades"),
         horizontal=True, label_visibility="collapsed",
@@ -540,3 +542,47 @@ def render_history(user_id: str) -> None:
             "Download filtered CSV", export, file_name=filename, mime="text/csv",
             use_container_width=True,
         )
+
+
+def _portable_history(user_id: str) -> None:
+    """Prepare archives only on a deliberate click, keeping page loads cheap."""
+    from stockanalyzer.history_archive import combine_archives, make_archive
+    from stockanalyzer.history_export import collect_history
+
+    with st.expander("Export history / combine team files", expanded=False):
+        st.caption("Export all your saved analyses and trades, including decision details. This export covers all pages and ignores the filters below.")
+        label = st.text_input("Name in team reports", value=st.session_state.get("auth_username", ""),
+                              key="history_export_label")
+        if st.button("Prepare complete history export"):
+            try:
+                with st.spinner("Preparing history archive…"):
+                    document = collect_history(user_id, label=label)
+                    st.session_state["_history_archive"] = {
+                        "owner": user_id, "data": make_archive(document),
+                    }
+            except Exception:
+                st.error("History export could not be prepared. Try again.")
+        prepared = st.session_state.get("_history_archive") or {}
+        if prepared.get("owner") == user_id:
+            st.download_button("Download complete history ZIP", prepared["data"],
+                               file_name="stockanalyzer-history.zip", mime="application/zip")
+        st.divider()
+        st.caption("Combine teammates' ZIP exports on this computer. Repeated exports are deduplicated; newer records replace older copies. Nothing is synchronized to another server.")
+        files = st.file_uploader("History archives", type=["zip"], accept_multiple_files=True,
+                                 key="history_team_files")
+        if st.button("Combine selected archives", disabled=not files):
+            try:
+                document = combine_archives([file.getvalue() for file in files])
+                st.session_state["_team_archive"] = {
+                    "owner": user_id, "data": make_archive(document), "report": document["report"],
+                }
+            except (ValueError, OSError) as exc:
+                st.error(str(exc))
+        combined = st.session_state.get("_team_archive") or {}
+        if combined.get("owner") == user_id:
+            report = combined["report"]
+            st.caption(f"{report['trade_observations']} closed trade observations · {report['unique_market_ideas']} unique market ideas")
+            if report["by_participant_and_trader"]:
+                st.dataframe(pd.DataFrame(report["by_participant_and_trader"]), use_container_width=True)
+            st.download_button("Download combined team ZIP", combined["data"],
+                               file_name="stockanalyzer-team-history.zip", mime="application/zip")

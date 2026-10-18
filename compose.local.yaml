@@ -1,0 +1,82 @@
+# Standalone desktop stack: never inherits the server's external networks or volumes.
+services:
+  db:
+    image: postgres:16.9-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stockanalyzer
+      POSTGRES_USER: stockapp
+      POSTGRES_PASSWORD: ${LOCAL_DB_PASSWORD:?Run the local launcher first}
+    volumes:
+      - local_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stockapp -d stockanalyzer"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [database]
+    security_opt: ["no-new-privileges:true"]
+
+  app:
+    image: stockanalyzer-local:app
+    build:
+      context: .
+      args:
+        APP_VERSION: ${LOCAL_APP_VERSION:-development}
+    init: true
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment: &app_environment
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://stockapp:${LOCAL_DB_PASSWORD}@db:5432/stockanalyzer
+      FINNHUB_KEY: ${FINNHUB_KEY:-}
+      TWELVEDATA_KEY: ${TWELVEDATA_KEY:-}
+      AUTH_SESSION_MINUTES: 60
+      XDG_CACHE_HOME: /tmp/.cache
+      STOCKANALYZER_REPLAY_DIR: /var/lib/stockanalyzer/replay
+    ports:
+      - "127.0.0.1:${LOCAL_PORT:-8501}:8501"
+    volumes:
+      - local_replay_data:/var/lib/stockanalyzer/replay
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+      - /home/stockapp/.streamlit:rw,noexec,nosuid,size=4m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [database, egress]
+
+  radar-worker:
+    image: stockanalyzer-local:app
+    init: true
+    restart: unless-stopped
+    command: [python, -m, stockanalyzer.radar_worker]
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      <<: *app_environment
+      RADAR_WORKER_HEARTBEAT: /tmp/radar-worker-heartbeat
+      RADAR_WORKER_INTERVAL_SECONDS: 30
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [database, egress]
+    healthcheck:
+      test: [CMD, python, -m, stockanalyzer.worker_health, --healthcheck]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 3
+
+networks:
+  database:
+    internal: true
+  egress: {}
+volumes:
+  local_postgres_data: {}
+  local_replay_data: {}

@@ -5,19 +5,17 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete
 from stockanalyzer.config import Settings
-from stockanalyzer.db.models import AnalysisRun, ApiCacheEntry, OhlcvBar
+from stockanalyzer.db.models import AnalysisRun, ApiCacheEntry
+from stockanalyzer.db.repositories.ohlcv import OhlcvRepository
 from stockanalyzer.db.session import configure_engine, session_scope
 
 
 def prune(*, intraday_days: int = 30, history_days: int | None = None) -> dict[str, int]:
     now = datetime.now(timezone.utc)
+    bars = OhlcvRepository().prune(now - timedelta(days=intraday_days))
     with session_scope() as session:
         api = session.execute(delete(ApiCacheEntry).where(ApiCacheEntry.expires_at < now)).rowcount or 0
         # Short rolling ranges are disposable; longer history is retained.
-        bars = session.execute(delete(OhlcvBar).where(
-            OhlcvBar.timeframe.in_(("1D", "5D")),
-            OhlcvBar.fetched_at < now - timedelta(days=intraday_days),
-        )).rowcount or 0
         history = 0
         if history_days is not None:
             history = session.execute(delete(AnalysisRun).where(

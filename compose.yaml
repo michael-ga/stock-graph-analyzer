@@ -19,6 +19,7 @@ services:
       - no-new-privileges:true
 
   app:
+    init: true
     build:
       context: .
       args:
@@ -34,12 +35,15 @@ services:
       AUTH_SESSION_MINUTES: ${AUTH_SESSION_MINUTES:-60}
       AUTH_MAX_FAILURES: ${AUTH_MAX_FAILURES:-5}
       AUTH_LOCKOUT_MINUTES: ${AUTH_LOCKOUT_MINUTES:-15}
+      XDG_CACHE_HOME: /tmp/.cache
+      STOCKANALYZER_REPLAY_DIR: /var/lib/stockanalyzer/replay
       FINNHUB_KEY: ${FINNHUB_KEY:-}
       TWELVEDATA_KEY: ${TWELVEDATA_KEY:-}
     ports:
-      - "127.0.0.1:8501:8501"
+      - "8501:8501"
     volumes:
       - ./legacy:/legacy:ro
+      - replay_data:/var/lib/stockanalyzer/replay
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
@@ -51,8 +55,9 @@ services:
     networks:
       - database
       - egress
-
+      - grabbit_net
   radar-worker:
+    init: true
     image: stock-graph-analyzer:local
     restart: unless-stopped
     command: ["python", "-m", "stockanalyzer.radar_worker"]
@@ -68,6 +73,7 @@ services:
       TWELVEDATA_KEY: ${TWELVEDATA_KEY:-}
       RADAR_WORKER_INTERVAL_SECONDS: ${RADAR_WORKER_INTERVAL_SECONDS:-30}
       RADAR_WORKER_HEARTBEAT: /tmp/radar-worker-heartbeat
+      XDG_CACHE_HOME: /tmp/.cache
     volumes:
       - ./legacy:/legacy:ro
     read_only: true
@@ -81,7 +87,7 @@ services:
       - database
       - egress
     healthcheck:
-      test: ["CMD", "python", "-m", "stockanalyzer.radar_worker", "--healthcheck"]
+      test: ["CMD", "python", "-m", "stockanalyzer.worker_health", "--healthcheck"]
       interval: 30s
       timeout: 5s
       start_period: 60s
@@ -91,6 +97,9 @@ networks:
   database:
     internal: true
   egress: {}
-
+  grabbit_net:
+        name: affiliate-platform_frontend
+        external: true
 volumes:
   postgres_data: {}
+  replay_data: {}

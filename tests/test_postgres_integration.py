@@ -41,6 +41,36 @@ def test_postgres_user_isolation(postgres_database):
     assert watchlist.list(other.id) == []
 
 
+def test_worker_lease_does_not_hold_a_transaction_snapshot(postgres_database):
+    from sqlalchemy import text
+    from stockanalyzer.radar_worker import worker_lease
+    with worker_lease(postgres_database) as acquired:
+        assert acquired
+        with worker_lease(postgres_database) as duplicate:
+            assert duplicate is False
+        with postgres_database.connect() as connection:
+            rows = connection.execute(text("""
+                SELECT a.state, a.backend_xmin FROM pg_stat_activity a
+                JOIN pg_locks l ON l.pid = a.pid
+                WHERE l.locktype = 'advisory' AND l.granted
+                  AND a.datname = current_database()
+            """)).all()
+        assert rows and all(state == "idle" and xmin is None for state, xmin in rows)
+    with worker_lease(postgres_database) as acquired:
+        assert acquired
+
+
+def test_postgres_export_is_owner_scoped_and_uses_consistent_snapshot(postgres_database):
+    from stockanalyzer.history_archive import make_archive, read_archive
+    from stockanalyzer.history_export import collect_history
+    owner = AuthService().create_user("export-owner", "correct horse battery staple")
+    other = AuthService().create_user("export-other", "another sufficiently long password")
+    WatchlistRepository().add(owner.id, "MSFT")
+    document = read_archive(make_archive(collect_history(owner.id)))
+    assert document["participant"]["id"] == owner.id
+    assert other.id not in str(document)
+
+
 def test_postgres_concurrent_failed_logins_lock_account(postgres_database):
     service = AuthService(max_failures=5, lockout_minutes=15)
     service.create_user("lock-owner", "correct horse battery staple")

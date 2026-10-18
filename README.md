@@ -98,6 +98,15 @@ See [the plan](../../.claude/plans/i-want-to-plan-happy-coral.md) for the origin
 
 ## Setup
 
+For Windows/Linux installation with your own users and a background radar worker,
+use the [local setup guide](docs/local-setup.md): double-click `Start-Windows.cmd`
+or run `./start-linux.sh`. Docker is the only runtime prerequisite.
+The guide also covers portable history exports and combining the team's files
+without sending them to a shared server.
+
+The Python commands below are for development; database configuration, migrations
+and a user account are also required.
+
 ```powershell
 # from this folder
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
