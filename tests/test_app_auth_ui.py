@@ -195,7 +195,7 @@ def test_forced_password_change_requires_matching_confirmation(tmp_path, monkeyp
 
 
 def test_movers_radar_add_is_scoped_to_authenticated_user():
-    tree = ast.parse(Path("app.py").read_text())
+    tree = ast.parse(Path("app.py").read_text(encoding="utf-8"))
     movers_page = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "_movers_page"
