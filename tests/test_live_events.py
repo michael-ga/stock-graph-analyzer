@@ -1,7 +1,7 @@
 """Tests for live flip detection (pure, no Streamlit)."""
 from __future__ import annotations
 
-from stockanalyzer.live_events import Event, LiveState, diff_states
+from stockanalyzer.live_events import LiveState, diff_states
 
 
 def test_no_prev_state_is_silent():

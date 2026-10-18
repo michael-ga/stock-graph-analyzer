@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from stockanalyzer.analysis.engine import analyze_timeframe
-from stockanalyzer.analysis.indicators import add_indicators, adx
+from stockanalyzer.analysis.indicators import add_indicators
 from stockanalyzer.data.schema import Timeframe, validate_ohlcv
 from stockanalyzer.explain.swing import (_long_geometry, _macd_against,
                                          _short_geometry, build_swing_plan)

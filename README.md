@@ -118,6 +118,49 @@ Then open the URL it prints (default http://localhost:8501).
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
+## Private NUC deployment
+
+The production path uses Docker Compose, PostgreSQL, database-backed Argon2 login,
+and host-level Tailscale Serve. Streamlit is published only on
+`127.0.0.1:8501`; PostgreSQL is not published. See:
+
+- [`docs/nuc-deployment.md`](docs/nuc-deployment.md) for first run and mobile access.
+- [`docs/backup-restore.md`](docs/backup-restore.md) for backups and retention.
+
+Create the first administrator explicitly; there is no public signup:
+
+```bash
+docker compose exec app python -m scripts.create_admin --username admin
+```
+
+The command prompts securely for the password.
+
+After merging the change that first introduces engineering-version checks, update and
+verify the NUC with this one-time bootstrap command. Passing the fetched target SHA
+ensures the pre-versioning copy of `update.sh` builds the new image with the correct
+identity:
+
+```bash
+cd /home/shambik/stock-graph-analyzer
+git switch dev
+git fetch origin
+APP_VERSION="$(git rev-parse origin/dev)" ./scripts/update.sh
+./scripts/healthcheck.sh
+```
+
+After that first deployment, future merged changes only require:
+
+```bash
+cd /home/shambik/stock-graph-analyzer
+git switch dev
+./scripts/update.sh
+```
+
+The updated script fetches and pulls the branch, then automatically bakes the resulting
+full Git SHA into both containers. The authenticated sidebar shows
+`eng-<first 12 characters of the deployed Git SHA>`. The healthcheck confirms that the
+host, app, and radar worker all report the same full SHA.
+
 ## Layout
 
 ```

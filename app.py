@@ -11,10 +11,16 @@ Run:  streamlit run app.py
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import locale
 import os
+import re
 import threading
 import time
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timezone
+from enum import Enum
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -25,6 +31,11 @@ import streamlit as st
 import replay_page
 import ui_common
 from stockanalyzer import papertrade, session, swingwatch, virtualbook, watchlist
+from stockanalyzer.auth import AuthError, AuthService
+from stockanalyzer.user_management import UserManagementService
+from stockanalyzer.config import ConfigurationError, Settings
+from stockanalyzer.db.repositories.analysis_history import AnalysisHistoryRepository
+from stockanalyzer.db.session import configure_engine
 from stockanalyzer.analysis import reversal
 from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
 from stockanalyzer.analysis.engine import CATEGORY_WEIGHTS, analyze_timeframe
@@ -43,6 +54,7 @@ from stockanalyzer.live import assess, make_tick
 from stockanalyzer.live_events import LiveState, diff_states
 from stockanalyzer.pipeline import analyze_ticker
 from stockanalyzer.strategy import Strategy, SwingPace
+from stockanalyzer.ui.history import render_history
 from stockanalyzer.verdict.aggregate import build_verdict
 # NOTE: stockanalyzer.vision imports OpenCV (cv2). It is imported lazily inside
 # _render_image_mode so a cv2 load failure on a server can never blank the app.
@@ -82,6 +94,101 @@ def _bridge_cloud_secrets() -> None:
 _bridge_cloud_secrets()
 st.set_page_config(page_title="Stock Graph Analyzer", layout="wide")
 
+
+def _engineering_version() -> str:
+    """Format the immutable image revision for authenticated UI display."""
+    version = os.environ.get("APP_VERSION", "development")
+    if re.fullmatch(r"[0-9a-f]{40}", version):
+        return f"eng-{version[:12]}"
+    if version in {"development", "unknown"}:
+        return version
+    return "unknown"
+
+
+def _require_login() -> bool:
+    """Render the only public UI and return True for an active DB session."""
+    try:
+        settings = Settings.from_env()
+        if not st.session_state.get("_database_configured"):
+            configure_engine(settings.database_url)
+            st.session_state["_database_configured"] = True
+    except (ConfigurationError, RuntimeError):
+        st.error("The application is not configured. Contact the administrator.")
+        return False
+
+    now = time.time()
+    user_id = st.session_state.get("auth_user_id")
+    last_activity = float(st.session_state.get("auth_last_activity", 0))
+    current_user = None
+    if (
+        user_id
+        and now - last_activity <= settings.auth_session_minutes * 60
+    ):
+        current_user = AuthService(
+            settings.auth_max_failures, settings.auth_lockout_minutes
+        ).browser_session_user(user_id, st.session_state.get("auth_session_revision"))
+    if current_user is not None:
+        st.session_state["auth_last_activity"] = now
+        st.session_state["auth_is_admin"] = bool(current_user.is_admin)
+        st.session_state["auth_must_change_password"] = bool(current_user.must_change_password)
+        with st.sidebar:
+            st.caption(f"Signed in as **{st.session_state.get('auth_username', 'user')}**")
+            st.caption(f"Engineering version: {_engineering_version()}")
+            if st.button("Log out", use_container_width=True):
+                for key in list(st.session_state):
+                    if key.startswith("auth_"):
+                        del st.session_state[key]
+                st.rerun()
+        if current_user.must_change_password:
+            st.title("Change your password")
+            st.info("An administrator reset your password. Choose a new password to continue.")
+            with st.form("forced_password_change"):
+                current = st.text_input("Current password", type="password")
+                replacement = st.text_input("New password", type="password")
+                confirmation = st.text_input("Confirm new password", type="password")
+                submitted = st.form_submit_button("Change password", type="primary")
+            if submitted:
+                if replacement != confirmation:
+                    st.error("New passwords must match")
+                else:
+                    try:
+                        changed = AuthService().change_password(user_id, current, replacement)
+                    except (AuthError, ValueError) as exc:
+                        st.error(str(exc))
+                    else:
+                        st.session_state["auth_session_revision"] = changed.session_revision
+                        st.session_state["auth_must_change_password"] = False
+                        st.rerun()
+            return False
+        return True
+    for key in list(st.session_state):
+        if key.startswith("auth_"):
+            st.session_state.pop(key, None)
+
+    st.title("📈 Stock Graph Analyzer")
+    st.caption("Private access — sign in to continue.")
+    with st.form("login", clear_on_submit=False):
+        username = st.text_input("Username", autocomplete="username")
+        password = st.text_input("Password", type="password", autocomplete="current-password")
+        submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+    if submitted:
+        try:
+            user = AuthService(settings.auth_max_failures, settings.auth_lockout_minutes).authenticate(
+                username, password
+            )
+        except AuthError:
+            st.error("Invalid username or password")
+        else:
+            st.session_state["auth_user_id"] = user.id
+            st.session_state["auth_username"] = user.username
+            st.session_state["auth_last_activity"] = now
+            st.session_state["auth_session_revision"] = user.session_revision
+            st.session_state["auth_is_admin"] = bool(user.is_admin)
+            st.session_state["auth_must_change_password"] = bool(user.must_change_password)
+            st.rerun()
+    return False
+
+
 _DIR_EMOJI = {Direction.BULL: "🟢", Direction.BEAR: "🔴", Direction.NEUTRAL: "⚪"}
 # Presentation helpers shared with the replay page live in `ui_common` (a leaf
 # module, so app.py can import replay_page without a cycle).
@@ -100,6 +207,59 @@ _PACE_BY_LABEL = {p.label: p for p in SwingPace}
 @st.cache_data(show_spinner=False, ttl=60 * 20)
 def _run(ticker: str, prefer: str | None):
     return analyze_ticker(ticker, prefer=prefer)
+
+
+def _jsonable(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return _jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(k.value if isinstance(k, Enum) else k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    return str(value)
+
+
+def _save_analysis_history(result, verdict, strategy, pace, usecase) -> None:
+    """Persist a compact decision snapshot without breaking the visible analysis."""
+    try:
+        frames = []
+        freshness = []
+        for tf, rep in result.reports.items():
+            tf_name = tf.value if hasattr(tf, "value") else str(tf)
+            if not rep.df.empty:
+                freshness.append(str(rep.df.index[-1]))
+            frames.append({
+                "timeframe": tf_name,
+                "bias_score": float(rep.bias_score),
+                "trend_direction": rep.trend.direction.value,
+                "last_close": float(rep.df["close"].iloc[-1]) if not rep.df.empty else None,
+                "bar_count": len(rep.df),
+                "signals": _jsonable(rep.signals),
+                "levels": _jsonable(rep.levels),
+                "trendlines": _jsonable(rep.trendlines),
+                "trend_change": _jsonable(rep.trend_change),
+            })
+        identity = json.dumps(
+            [st.session_state.auth_user_id, result.ticker, result.provider, freshness,
+             _jsonable(verdict)], sort_keys=True, separators=(",", ":")
+        )
+        key = hashlib.sha256(identity.encode()).hexdigest()
+        now = datetime.now(timezone.utc)
+        AnalysisHistoryRepository().save(
+            st.session_state.auth_user_id, ticker=result.ticker, provider=result.provider,
+            verdict=_jsonable(verdict), timeframes=frames, started_at=now,
+            completed_at=now, idempotency_key=key, strategy=strategy.value,
+            swing_pace=pace.value, use_case=usecase.value,
+            quote=_jsonable(result.quote), sentiment=_jsonable(result.sentiment),
+            errors=_jsonable(result.errors) if isinstance(result.errors, dict) else {"items": _jsonable(result.errors)},
+            notices=_jsonable(result.notices),
+        )
+    except Exception as exc:
+        st.caption(f"ℹ️ Analysis shown, but history could not be saved ({type(exc).__name__}).")
 
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -162,6 +322,12 @@ def main() -> None:
     if ss.page == "movers":
         _movers_page()
         return
+    if ss.page == "history":
+        render_history(st.session_state.auth_user_id)
+        return
+    if ss.page == "users" and st.session_state.get("auth_is_admin"):
+        _users_page()
+        return
 
     # Before the radar/portfolio panels on purpose: their 5s/30s fragments would
     # fetch quotes and redraw beside a 0.5s animation frame, stuttering the tape.
@@ -174,7 +340,7 @@ def main() -> None:
         st.success(flash + " — see the **💼 Virtual portfolio** panel below.")
 
     # Quiet swing radar — always visible while tickers are tracked.
-    tracked = swingwatch.load()
+    tracked = swingwatch.load(user_id=st.session_state.auth_user_id)
     if tracked:
         _radar_panel(tracked)
     _portfolio_panel()
@@ -228,6 +394,7 @@ def main() -> None:
     # Recompute the verdict for the chosen strategy (swing weights short timeframes).
     sent = result.sentiment.score if (result.sentiment and result.sentiment.available) else None
     verdict = build_verdict(result.reports, sent, strategy, pace)
+    _save_analysis_history(result, verdict, strategy, pace, usecase)
     rec = build_recommendation(ticker, verdict, result.reports, usecase, strategy, pace,
                                context=_reco_context(result))
     _recommendation_section(result, rec, usecase)
@@ -250,9 +417,91 @@ def main() -> None:
 
 
 # --------------------------------------------------------------------------- #
+def _users_page() -> None:
+    """Admin user management; authorization is rechecked by every service call."""
+    st.header("Users")
+    service = UserManagementService()
+    actor_id = st.session_state.auth_user_id
+    with st.form("create_user"):
+        username = st.text_input("New username")
+        password = st.text_input("Temporary password", type="password")
+        password_confirmation = st.text_input("Confirm temporary password", type="password")
+        create = st.form_submit_button("Create user")
+    if create:
+        if password != password_confirmation:
+            st.error("Temporary passwords must match")
+        else:
+            try:
+                service.create_user(actor_id, username, password)
+            except (PermissionError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.success("User created")
+                st.rerun()
+
+    try:
+        users = service.list_users(actor_id)
+    except PermissionError:
+        st.error("Administrator access is required")
+        return
+    for user in users:
+        cols = st.columns([3, 2, 2])
+        cols[0].write(f"**{user.username}**" + (" · admin" if user.is_admin else ""))
+        cols[1].write("Active" if user.is_active else "Disabled")
+        desired = not user.is_active
+        if cols[2].button("Enable" if desired else "Disable", key=f"active_{user.id}"):
+            try:
+                service.set_active(actor_id, user.id, desired)
+            except (PermissionError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.rerun()
+        lock_status = (
+            f"Locked until {user.locked_until:%Y-%m-%d %H:%M UTC}"
+            if user.locked_until else "Not locked"
+        )
+        st.markdown(
+            f"Created: {user.created_at:%Y-%m-%d %H:%M UTC} · "
+            f"Last login: {user.last_login_at:%Y-%m-%d %H:%M UTC} "
+            if user.last_login_at else
+            f"Created: {user.created_at:%Y-%m-%d %H:%M UTC} · Last login: Never"
+        )
+        st.markdown(f"Lock status: {lock_status}")
+        with st.form(f"reset_{user.id}"):
+            replacement = st.text_input(
+                f"Temporary password for {user.username}", type="password"
+            )
+            reset_confirmation = st.text_input(
+                f"Confirm temporary password for {user.username}", type="password"
+            )
+            reset = st.form_submit_button(f"Reset {user.username} password")
+        if reset:
+            if replacement != reset_confirmation:
+                st.error("Temporary passwords must match")
+            else:
+                try:
+                    service.reset_password(actor_id, user.id, replacement)
+                except (PermissionError, ValueError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.success("Password reset; existing sessions revoked")
+                    st.rerun()
+
+
 def _sidebar():
     ss = st.session_state
     with st.sidebar:
+        nav1, nav2 = st.columns(2)
+        if nav1.button("📊 Analyzer", use_container_width=True):
+            ss.page = "analyze"
+            st.rerun()
+        if nav2.button("🕘 History", use_container_width=True):
+            ss.page = "history"
+            st.rerun()
+        if st.session_state.get("auth_is_admin"):
+            if st.button("👥 Users", use_container_width=True):
+                ss.page = "users"
+                st.rerun()
         st.header("What do you want to do?")
         usecase = _USECASE_BY_LABEL[st.radio(
             "Your situation", [uc.label for uc in UseCase], key="usecase_label",
@@ -275,7 +524,7 @@ def _sidebar():
         st.subheader("Stock")
 
         # Quick-pick chips for followed tickers, shown ABOVE the input.
-        followed = watchlist.load()
+        followed = watchlist.load(user_id=st.session_state.auth_user_id)
         if followed:
             st.caption("⭐ Following — tap to analyze:")
             cols = st.columns(min(4, len(followed)))
@@ -292,9 +541,9 @@ def _sidebar():
         if c1.button("🔎 Analyze", type="primary", use_container_width=True):
             ss.submitted = True
             st.rerun()
-        followed_now = watchlist.is_followed(ss.ticker)
+        followed_now = watchlist.is_followed(ss.ticker, user_id=st.session_state.auth_user_id)
         if c2.button("★ Unfollow" if followed_now else "☆ Follow", use_container_width=True):
-            watchlist.toggle(ss.ticker)
+            watchlist.toggle(ss.ticker, user_id=st.session_state.auth_user_id)
             st.rerun()
 
         # --- Swing radar: quiet tracking + escalating alerts ---
@@ -302,12 +551,12 @@ def _sidebar():
         st.subheader("📡 Swing radar")
         st.caption("Track tickers quietly for **daily (fast) swings** — you get a toast "
                    "when the swing score climbs past **60% → 70% → 80%**.")
-        tracked_now = swingwatch.load()
+        tracked_now = swingwatch.load(user_id=st.session_state.auth_user_id)
         r1c, r2c = st.columns([2, 1])
         radar_add = r1c.text_input("Add to radar", key="radar_add",
                                    placeholder="e.g. NVDA", label_visibility="collapsed")
         if r2c.button("➕ Track", use_container_width=True) and radar_add.strip():
-            swingwatch.add(radar_add)
+            swingwatch.add(radar_add, user_id=st.session_state.auth_user_id)
             st.rerun()
         if tracked_now:
             cols = st.columns(min(3, len(tracked_now)))
@@ -315,7 +564,7 @@ def _sidebar():
                 if cols[i % len(cols)].button(f"✕ {sym}", key=f"radar_rm_{sym}",
                                               use_container_width=True,
                                               help=f"Stop tracking {sym}"):
-                    swingwatch.remove(sym)
+                    swingwatch.remove(sym, user_id=st.session_state.auth_user_id)
                     st.rerun()
 
         # Buy-price input — only shown when "I Own" is selected.
@@ -394,7 +643,7 @@ def _virtual_buy_button(plan, ticker: str, key_suffix: str = "",
     pending = plan.kind == "breakout_wait"
     k = f"{ticker}_{key_suffix}"
 
-    if virtualbook.has_open(ticker, "me"):
+    if virtualbook.has_open(ticker, "me", user_id=st.session_state.auth_user_id):
         st.success(f"💼 You already hold a virtual position in {ticker} — see the "
                    "**Virtual portfolio** panel at the top to manage it.")
         return
@@ -435,7 +684,8 @@ def _virtual_buy_button(plan, ticker: str, key_suffix: str = "",
         virtualbook.open_position(
             ticker=ticker, trader="me", entry=entry, stop=stop, target=target,
             kind=plan.kind, trigger=(entry if pending else plan.trigger),
-            horizon_days=3 if "1–3" in plan.horizon else 10, stake=amount, snapshot=snap)
+            horizon_days=3 if "1–3" in plan.horizon else 10, stake=amount,
+            snapshot=snap, user_id=st.session_state.auth_user_id)
         msg = (f"Armed: fills if {ticker} crosses ${entry:.2f}" if pending
                else f"Bought {ticker} at ${entry:.2f} "
                     f"(stop ${stop:.2f} / target ${target:.2f})")
@@ -552,12 +802,13 @@ def _run_gap_bots(tk: str, reports, orange: dict | None, price: float | None) ->
     snap = _gap_snapshot(orange, rvol, entry, init_stop, target)
     for trader, managed in (("bot-gap-fixed", False), ("bot-gap-mgd", True)):
         try:
-            if not virtualbook.has_open(tk, trader):
+            if not virtualbook.has_open(
+                    tk, trader, user_id=st.session_state.auth_user_id):
                 virtualbook.open_position(
                     ticker=tk, trader=trader, entry=entry, stop=init_stop,
                     target=target, kind="immediate", horizon_days=1,
                     managed=managed, entry_rvol=rvol, init_stop=init_stop,
-                    snapshot=snap)
+                    snapshot=snap, user_id=st.session_state.auth_user_id)
                 st.toast(f"🚀 {trader} opened Gap-and-Go {tk} @ ${entry:.2f} "
                          f"(stop ${init_stop:.2f}, {(rvol or 0):.1f}×vol)", icon="🚀")
         except Exception:
@@ -595,12 +846,13 @@ def _run_bots(ticker: str, plan, reports=None, verdict=None, rec=None,
         return
     for name, cond, _pending in _BOTS:
         try:
-            if cond(plan) and not virtualbook.has_open(ticker, name):
+            if cond(plan) and not virtualbook.has_open(ticker, name, user_id=st.session_state.auth_user_id):
                 virtualbook.open_position(
                     ticker=ticker, trader=name, entry=plan.entry, stop=plan.stop,
                     target=plan.target1, kind=plan.kind, trigger=plan.trigger,
                     horizon_days=3,
-                    snapshot=_plan_snapshot(plan, reports, verdict, rec))
+                    snapshot=_plan_snapshot(plan, reports, verdict, rec),
+                    user_id=st.session_state.auth_user_id)
                 st.toast(f"🤖 {name} opened a virtual position in {ticker} "
                          f"(score {plan.score}%)", icon="🤖")
         except Exception:
@@ -636,11 +888,13 @@ def _run_reversal_bots(tk: str, res, price: float | None, phase=None) -> None:
                     continue
                 fired.append(dec)
                 try:
-                    if not virtualbook.has_open(tk, dec.variant):
+                    if not virtualbook.has_open(
+                            tk, dec.variant, user_id=st.session_state.auth_user_id):
                         virtualbook.open_position(
                             ticker=tk, trader=dec.variant, entry=dec.entry,
                             stop=dec.stop, target=dec.target, kind="immediate",
-                            horizon_days=1, snapshot=_reversal_snapshot(dec))
+                            horizon_days=1, snapshot=_reversal_snapshot(dec),
+                            user_id=st.session_state.auth_user_id)
                         st.toast(f"🔄 {dec.variant} opened reversal {tk} "
                                  f"@ ${dec.entry:.2f} (stop ${dec.stop:.2f}, "
                                  f"tgt ${dec.target:.2f})", icon="🔄")
@@ -675,6 +929,7 @@ def _quiet_sentiment(ticker: str) -> float | None:
         frm = to - timedelta(days=7)
         info = client.company_info(ticker, frm.strftime("%Y-%m-%d"),
                                    to.strftime("%Y-%m-%d"))
+
         res = score_sentiment(info)
         return res.score if res.available else None
     except Exception:
@@ -808,7 +1063,6 @@ def _radar_panel(tracked: list[str]) -> None:
 
 def _radar_body(tracked: list[str]) -> None:
     ss = st.session_state
-    ss.setdefault("radar_levels", {})
     ss.setdefault("radar_cache", {})     # tk -> {res, plan, orange, tier}
     ss.setdefault("radar_due", {})        # tk -> next recompute epoch
     now = time.time()
@@ -830,7 +1084,8 @@ def _radar_body(tracked: list[str]) -> None:
 
     items: list[tuple] = []
     for tk in tracked:
-        has_open = virtualbook.has_any_open(tk)
+        has_open = virtualbook.has_any_open(
+            tk, user_id=st.session_state.auth_user_id)
         due = ss.radar_due.get(tk, 0) <= now
         if due:                          # only recompute the heavy analysis when due
             try:
@@ -862,8 +1117,8 @@ def _radar_body(tracked: list[str]) -> None:
             # Notices + trading only when we recomputed this tick, or when we
             # already hold a position (babysit it every tick, any tier).
             if due or has_open:
-                fired = swingwatch.new_notice(ss.radar_levels.get(tk, 0), plan.score)
-                ss.radar_levels[tk] = swingwatch.notice_level(plan.score)
+                fired = swingwatch.claim_notice(
+                    tk, plan.score, user_id=st.session_state.auth_user_id)
                 if fired:
                     stored = papertrade.record(dict(
                         ts=time.time(), date=time.strftime("%x %X"),
@@ -871,7 +1126,8 @@ def _radar_body(tracked: list[str]) -> None:
                         label=plan.score_label, kind=plan.kind, setup=plan.setup,
                         entry=plan.entry, stop=plan.stop, target=plan.target1,
                         rr=plan.rr, trigger=plan.trigger, horizon_days=3,
-                        guidance=plan.guidance, status="open", result_pct=0.0))
+                        guidance=plan.guidance, status="open", result_pct=0.0),
+                        user_id=st.session_state.auth_user_id)
                     note = " · 📒 recorded for paper trading" if stored else ""
                     st.toast(f"📡 {tk}: {fired[1]} — {plan.guidance[:80]}{note}", icon="🔔")
                 # `res` is already in hand — going back through _quiet_price
@@ -885,8 +1141,11 @@ def _radar_body(tracked: list[str]) -> None:
                 if px:
                     dec = _radar_decision_rep(res) if res is not None else None
                     tc = getattr(dec, "trend_change", None)
-                    virtualbook.manage(tk, px, reports, tc)   # before mark
-                    for chg in virtualbook.mark(tk, px):
+                    virtualbook.manage(
+                        tk, px, reports, tc,
+                        user_id=st.session_state.auth_user_id)   # before mark
+                    for chg in virtualbook.mark(
+                            tk, px, user_id=st.session_state.auth_user_id):
                         if chg["status"] == "closed":
                             st.toast(f"💼 {chg['trader']} closed {tk}: "
                                      f"{chg['close_reason']} ({chg['pnl_pct']:+.1f}%)",
@@ -994,7 +1253,7 @@ def _movers_page() -> None:
         with st.spinner("Running the swing radar on all tickers…"):
             plans = _movers_plans(tuple(m.symbol for m in movers))
 
-    tracked = set(swingwatch.load())
+    tracked = set(swingwatch.load(user_id=st.session_state.auth_user_id))
     for m in movers:
         with st.container(border=True):
             cols = st.columns([2.0, 1.1, 1.1, 0.9, 1.3, 1.0, 1.0, 1.0])
@@ -1023,7 +1282,7 @@ def _movers_page() -> None:
                                 use_container_width=True,
                                 help=f"Track {m.symbol} on the swing radar "
                                      "(60/70/80% alerts)"):
-                swingwatch.add(m.symbol)
+                swingwatch.add(m.symbol, user_id=st.session_state.auth_user_id)
                 st.toast(f"📡 {m.symbol} added to the swing radar", icon="➕")
                 st.rerun()
             if cols[6].button("🔎 Open", key=f"mv_open_{m.symbol}",
@@ -1057,7 +1316,7 @@ def _movers_page() -> None:
 def _portfolio_panel() -> None:
     """💼 Virtual holdings — compact summary line + collapsible detail, refreshing
     every ~30s so unrealized P&L stays current."""
-    if not virtualbook.load():
+    if not virtualbook.load(user_id=st.session_state.auth_user_id):
         with st.expander("💼 Virtual portfolio — empty (use the 📒 Virtual BUY button)",
                          expanded=False):
             st.info("No virtual positions yet. On any actionable plan press "
@@ -1068,9 +1327,8 @@ def _portfolio_panel() -> None:
 
     @st.fragment(run_every="30s")
     def _folio():
-        import pandas as pd
 
-        book = virtualbook.load()
+        book = virtualbook.load(user_id=st.session_state.auth_user_id)
         live = [p for p in book if p["status"] in ("open", "pending")]
         # Mark holdings to fresh prices (auto-close stop/target hits).
         prices: dict[str, float] = {}
@@ -1078,11 +1336,11 @@ def _portfolio_panel() -> None:
             px = _quiet_price(tk)
             if px:
                 prices[tk] = px
-                for chg in virtualbook.mark(tk, px):
+                for chg in virtualbook.mark(tk, px, user_id=st.session_state.auth_user_id):
                     if chg["status"] == "closed":
                         st.toast(f"💼 {chg['trader']} closed {tk}: {chg['close_reason']} "
                                  f"({chg['pnl_pct']:+.1f}%)", icon="💼")
-        book = virtualbook.load()
+        book = virtualbook.load(user_id=st.session_state.auth_user_id)
         live = [p for p in book if p["status"] in ("open", "pending")]
         s = virtualbook.stats(book)
         tot = s["totals"]
@@ -1140,7 +1398,8 @@ def _portfolio_panel() -> None:
                     pid = sel.split(" · ")[-1]
                     pos = next((p for p in live if p["id"] == pid), None)
                     px = prices.get(pos["ticker"]) if pos else None
-                    closed = virtualbook.close_position(pid, px or (pos or {}).get("entry", 0))
+                    closed = virtualbook.close_position(
+                        pid, px or (pos or {}).get("entry", 0), user_id=st.session_state.auth_user_id)
                     if closed:
                         st.toast(f"💼 Closed {closed['ticker']} "
                                  f"({closed.get('pnl_pct', 0):+.1f}%)", icon="✂")
@@ -1182,7 +1441,7 @@ def _portfolio_panel() -> None:
                 # this collapses each plan to a single idea so the numbers judge
                 # the engine's CALLS, not how many bots echoed them.
                 try:
-                    algo = virtualbook.algorithm_correctness()
+                    algo = virtualbook.algorithm_correctness(user_id=st.session_state.auth_user_id)
                     at = algo["totals"]
                     if at["n_ideas"]:
                         st.markdown(
@@ -1221,7 +1480,8 @@ def _portfolio_panel() -> None:
                 # same ORB entry (shared cohort_id), so this isolates the exit
                 # policy: breakeven/EMA8-trail/test-don't-dump vs fixed stop/target.
                 try:
-                    ab = virtualbook.managed_vs_fixed()
+                    ab = virtualbook.managed_vs_fixed(
+                        user_id=st.session_state.auth_user_id)
                     if ab["n_pairs"]:
                         delta = ab["mean_delta_pct"]
                         st.markdown(
@@ -1266,7 +1526,7 @@ def _portfolio_panel() -> None:
 
 def _journal_panel() -> None:
     """Paper-trade journal: recorded propositions + the per-level report card."""
-    recs = papertrade.load()
+    recs = papertrade.load(user_id=st.session_state.auth_user_id)
     n = len(recs)
     head = (f"📒 Paper-trade journal — {n} proposition{'s' if n != 1 else ''} recorded"
             if n else "📒 Paper-trade journal — empty (auto-fills on ≥60% alerts)")
@@ -1288,7 +1548,7 @@ def _journal_panel() -> None:
                         frames[tk] = rep.df
                 except Exception:
                     continue
-            recs = papertrade.evaluate_all(frames)
+            recs = papertrade.evaluate_all(frames, user_id=st.session_state.auth_user_id)
             st.success("Outcomes updated.")
 
         # Report card per alert level — the calibration loop.
@@ -1915,6 +2175,7 @@ def _live_dashboard(ticker, prefer, usecase, strategy, pace, buy_price, result) 
     # (Re)start the stream on entry, ticker change, or explicit restart.
     if ss.get("rt_stream") is None or ss.get("rt_ticker") != ticker or restart:
         old = ss.get("rt_stream")
+
         if old is not None:
             old.stop()
         stream = RealtimeStream(ticker)
@@ -2087,7 +2348,8 @@ def _live_mid_frame(ctx: dict) -> None:
     # Virtual book: bots act on the analyzed ticker too. Mark every ~2s when we
     # hold a position (ASAP stop/target/trend reaction) else ~10s; manage runs
     # BEFORE mark so a freshly-tightened stop can close on the same tick.
-    mark_gap = 2 if virtualbook.has_any_open(ticker) else 10
+    mark_gap = 2 if virtualbook.has_any_open(
+        ticker, user_id=st.session_state.auth_user_id) else 10
     if plan is not None and live_price and now - ss.get("vb_last_mark", 0) > mark_gap:
         ss.vb_last_mark = now
         phase = session.market_phase()
@@ -2095,8 +2357,11 @@ def _live_mid_frame(ctx: dict) -> None:
         _run_bots(ticker, plan, reports=shared["reports"], verdict=shared["swing_verdict"],
                   rec=shared["swing_rec"], orange=orange, price=live_price, phase=phase)
         tc = d1.trend_change if d1 is not None else None
-        virtualbook.manage(ticker, live_price, shared["reports"], tc)
-        for chg in virtualbook.mark(ticker, live_price):
+        virtualbook.manage(
+            ticker, live_price, shared["reports"], tc,
+            user_id=st.session_state.auth_user_id)
+        for chg in virtualbook.mark(
+                ticker, live_price, user_id=st.session_state.auth_user_id):
             if chg["status"] == "closed":
                 st.toast(f"💼 {chg['trader']} closed {ticker}: {chg['close_reason']} "
                          f"({chg['pnl_pct']:+.1f}%)", icon="💼")
@@ -2638,6 +2903,7 @@ def _render_tabs(ticker, result) -> None:
                 st.write(f"Trend (structure): {_badge(rep.trend.direction)} — {rep.trend.evidence}")
                 if rep.levels:
                     st.write("**Key levels:** " + " · ".join(
+
                         f"{lv.kind} ~{lv.price:.2f}" for lv in rep.levels[:4]))
                 if rep.trend_change.likely:
                     st.warning(f"Possible trend change → {_badge(rep.trend_change.direction)} "
@@ -2722,4 +2988,5 @@ def _start_keep_alive() -> None:
 # (A plain `python -c "import app"` has no Streamlit context, so it stays a no-op.)
 if __name__ == "__main__" or _running_in_streamlit():
     _start_keep_alive()
-    main()
+    if _require_login():
+        main()

@@ -6,11 +6,13 @@ and callers fall back to technicals-only.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
 
 import requests
 
-from . import cache
+from stockanalyzer.db.repositories.api_cache import ApiCacheRepository
+
 
 _BASE = "https://finnhub.io/api/v1"
 
@@ -202,7 +204,7 @@ class FinnhubClient:
         ticker = ticker.upper()
         today = date.today()
         ck = f"finnhub_earnings:{ticker}:{today.isoformat()}"
-        cached = _load_pickle(ck, ttl=60 * 60 * 24)
+        cached = _load_cache(ck, ttl=60 * 60 * 24)
         if cached is not None:
             return cached or None              # "" caches a confirmed miss
         d = self._get("calendar/earnings",
@@ -215,7 +217,7 @@ class FinnhubClient:
                            if e.get("date"))
             if dates:
                 result = dates[0]
-        _store_pickle(ck, result)
+        _store_cache(ck, result)
         return result or None
 
     # --- aggregate ------------------------------------------------------------
@@ -225,8 +227,8 @@ class FinnhubClient:
             return CompanyInfo(ticker, available=False, error="FINNHUB_KEY not set")
 
         ck = f"finnhub_info:{ticker}:{news_from}:{news_to}"
-        # company_info isn't a DataFrame, so we cache it separately as JSON-ish via pickle.
-        cached = _load_pickle(ck)
+        # Cache the aggregate as JSON-compatible structured data.
+        cached = _load_cache(ck)
         if cached is not None:
             return cached
 
@@ -284,37 +286,44 @@ class FinnhubClient:
         news_items.sort(key=lambda x: x.datetime, reverse=True)
 
         info = CompanyInfo(ticker, fundamentals, analyst, news_items[:20], available=True)
-        _store_pickle(ck, info)
+        _store_cache(ck, info)
         return info
 
 
-# --- tiny pickle cache for non-DataFrame objects -----------------------------
-import pickle  # noqa: E402
-import time  # noqa: E402
+# --- JSON-compatible database cache for non-DataFrame objects ----------------
+_api_cache = ApiCacheRepository()
+_memory_cache: dict[str, tuple[float, object]] = {}
 
 
-def _pickle_path(key: str):
-    import hashlib
-
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
-    return cache.CACHE_DIR / f"{digest}.pkl"
+def _serialize(value):
+    return asdict(value) if hasattr(value, "__dataclass_fields__") else value
 
 
-def _load_pickle(key: str, ttl: int = 60 * 30):
-    path = _pickle_path(key)
-    if not path.exists() or (time.time() - path.stat().st_mtime) > ttl:
+def _deserialize(key: str, value):
+    if not key.startswith("finnhub_info:") or not isinstance(value, dict):
+        return value
+    fundamentals = Fundamentals(**(value.get("fundamentals") or {}))
+    analyst_data = value.get("analyst")
+    analyst = AnalystView(**analyst_data) if analyst_data else None
+    news = [NewsItem(**item) for item in value.get("news", [])]
+    return CompanyInfo(
+        ticker=value.get("ticker", ""), fundamentals=fundamentals, analyst=analyst,
+        news=news, available=bool(value.get("available", True)), error=value.get("error")
+    )
+
+
+def _load_cache(key: str, ttl: int = 60 * 30):
+    if os.getenv("DATABASE_URL"):
+        return _deserialize(key, _api_cache.get(key, provider="finnhub"))
+    item = _memory_cache.get(key)
+    if item is None or time.time() - item[0] > ttl:
         return None
-    try:
-        with open(path, "rb") as f:
-            return pickle.load(f)
-    except Exception:
-        return None
+    return _deserialize(key, item[1])
 
 
-def _store_pickle(key: str, obj) -> None:
-    cache.CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(_pickle_path(key), "wb") as f:
-            pickle.dump(obj, f)
-    except Exception:
-        pass
+def _store_cache(key: str, obj, ttl: int = 60 * 30) -> None:
+    payload = _serialize(obj)
+    if os.getenv("DATABASE_URL"):
+        _api_cache.put(key, "finnhub", payload, ttl_seconds=ttl)
+    else:
+        _memory_cache[key] = (time.time(), payload)

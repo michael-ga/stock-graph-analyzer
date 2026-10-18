@@ -1,7 +1,6 @@
 """Schema v4: idea-level cohorts, full indicator persistence, closed_ts repair."""
 from __future__ import annotations
 
-import sqlite3
 
 from stockanalyzer import virtualbook as vb
 from stockanalyzer.data import store

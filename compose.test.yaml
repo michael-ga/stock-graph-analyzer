@@ -1,0 +1,12 @@
+services:
+  db:
+    environment:
+      POSTGRES_DB: stockanalyzer_test
+      POSTGRES_USER: stockapp_test
+      POSTGRES_PASSWORD: integration-test-only
+    tmpfs:
+      - /var/lib/postgresql/data
+  app:
+    environment:
+      DATABASE_URL: postgresql+psycopg://stockapp_test:integration-test-only@db:5432/stockanalyzer_test
+    ports: []

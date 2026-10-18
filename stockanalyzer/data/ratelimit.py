@@ -15,11 +15,14 @@ budget survives app restarts. Minute buckets are in-memory (process-local).
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from threading import Lock
+
+from stockanalyzer.db.repositories.rate_limits import RateLimitRepository
 
 _STATE_PATH = Path(__file__).resolve().parent.parent.parent / ".ratelimit.json"
 
@@ -82,10 +85,14 @@ class RateLimiter:
         self._lock = Lock()
         self._day = date.today().isoformat()
         self._daily: dict[str, int] = {}
+        self._repository = RateLimitRepository()
         self._load()
 
     # --- persistence (daily counts) ------------------------------------------
     def _load(self) -> None:
+        if os.getenv("DATABASE_URL"):
+            self._daily = {}
+            return
         try:
             data = json.loads(_STATE_PATH.read_text())
             if data.get("day") == self._day:
@@ -94,6 +101,8 @@ class RateLimiter:
             self._daily = {}
 
     def _save(self) -> None:
+        if os.getenv("DATABASE_URL"):
+            return
         try:
             _STATE_PATH.write_text(json.dumps({"day": self._day, "counts": self._daily}))
         except Exception:
@@ -111,7 +120,8 @@ class RateLimiter:
         caps = CAPS.get(provider, _DEFAULT)
         with self._lock:
             self._roll_day()
-            if caps.per_day is not None and self._daily.get(provider, 0) >= caps.per_day:
+            if (caps.per_day is not None and not os.getenv("DATABASE_URL")
+                    and self._daily.get(provider, 0) >= caps.per_day):
                 raise RateLimitExceeded(
                     f"{provider} daily cap ({caps.per_day}) reached — using cached data."
                 )
@@ -122,14 +132,22 @@ class RateLimiter:
         if not bucket.take():
             raise RateLimitExceeded(f"{provider} per-minute limit busy — using cached data.")
 
-        with self._lock:
-            self._daily[provider] = self._daily.get(provider, 0) + 1
-            self._save()
+        if caps.per_day is not None and os.getenv("DATABASE_URL"):
+            if self._repository.increment(provider, limit=caps.per_day) is None:
+                raise RateLimitExceeded(
+                    f"{provider} daily cap ({caps.per_day}) reached — using cached data."
+                )
+        else:
+            with self._lock:
+                self._daily[provider] = self._daily.get(provider, 0) + 1
+                self._save()
 
     def remaining_today(self, provider: str) -> int | None:
         caps = CAPS.get(provider, _DEFAULT)
         if caps.per_day is None:
             return None
+        if os.getenv("DATABASE_URL"):
+            return self._repository.remaining(provider, limit=caps.per_day)
         with self._lock:
             self._roll_day()
             return max(0, caps.per_day - self._daily.get(provider, 0))
