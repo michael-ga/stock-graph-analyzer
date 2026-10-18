@@ -73,3 +73,31 @@ def last_regular_close(df: pd.DataFrame) -> float | None:
         if classify(ts) == Session.REGULAR:
             return float(df.loc[ts, "close"])
     return None
+
+
+def session_closes(df: pd.DataFrame, n: int = 2) -> list[tuple]:
+    """The last ``n`` distinct trading days' REGULAR-session closes in ``df``,
+    most recent first, as ``(date, close)`` pairs.
+
+    Exists to recover an accurate day-over-day change when a daily-bar feed is
+    missing its most recent row — a real provider quirk where the daily candle
+    for a session that already closed hasn't backfilled yet. The intraday frame
+    (fetched at finer resolution) already has that session's bars, so callers
+    can cross-check the daily series against this and prefer it when the daily
+    frame turns out to be a session behind.
+    """
+    if not isinstance(df.index, pd.DatetimeIndex) or df.empty:
+        return []
+    out: list[tuple] = []
+    seen: set = set()
+    for ts in reversed(df.index):
+        if classify(ts) != Session.REGULAR:
+            continue
+        day = _to_et(ts).date()
+        if day in seen:
+            continue
+        seen.add(day)
+        out.append((day, float(df.loc[ts, "close"])))
+        if len(out) >= n:
+            break
+    return out
