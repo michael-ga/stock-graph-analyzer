@@ -362,3 +362,31 @@ usage — load a day, run the bots, and check that the fired/blocked verdicts ma
 what `daytrade_backtest.py <ticker> --verbose` prints for the same day. Any
 disagreement means the shared as-of path has drifted, which is exactly what the
 import-identity test exists to prevent.
+
+---
+
+### 2026-07-27 — quote day-change fix when the daily feed skips a session (no algorithm change)
+
+**Why:** INTC's price header printed a "day change" roughly double the real
+one-day move. Root cause: `pipeline._fallback_quote` takes `prev_close` from
+`daily.df["close"].iloc[-2]` and *assumes* that row is the immediately preceding
+session. yfinance's daily bars occasionally drop a session entirely (here Friday
+2026-07-24 was missing while Monday was present), so `iloc[-2]` silently spanned
+two trading days.
+
+**This entry changes NO algorithm behaviour.** No gate, weight, threshold or
+`SCHEMA_VERSION` moved; only the displayed quote (`prev_close` / `regular_close`)
+is corrected.
+
+**What changed (code):**
+1. `data/market_session.session_closes(df, n)` — the last `n` distinct trading days'
+   REGULAR-session closes from an intraday frame, most recent first.
+2. `_fallback_quote` cross-checks the daily frame against the 5D/1D intraday frame,
+   which gets every session's bars as they trade: if intraday knows a newer session
+   than the daily frame, both closes come from intraday; if the latest day matches
+   but the session *before* it differs, `prev_close` comes from intraday.
+
+**How we'll know it worked:** `tests/test_fallback_quote.py` reproduces the INTC
+gap (Thu → Mon daily, Friday present intraday → `prev_close` is Friday's close,
+day change −2.58%, not the 2-day move) and pins that the common no-gap case is
+left untouched.
