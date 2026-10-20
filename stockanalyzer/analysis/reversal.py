@@ -144,8 +144,12 @@ def reversal_signal(card: DayCard | None, intraday_df: pd.DataFrame | None,
     at_support = bool(support is not None
                       and abs(price - support) <= band and rng_ok)
 
-    session_open = (price / (1 + card.day_change_pct / 100.0)
-                    if card.day_change_pct is not None else None)
+    # Prefer the card's 09:30 open; backing it out of day_change_pct gives the
+    # pre-market open when the feed includes extended hours (kept as a fallback
+    # for cards built without intraday regular-session bars).
+    session_open = card.session_open
+    if session_open is None and card.day_change_pct is not None:
+        session_open = price / (1 + card.day_change_pct / 100.0)
     gap_pct = (session_open / prev_close - 1) if (session_open and prev_close) else None
     conf = _support_confidence(card, support, band)
 

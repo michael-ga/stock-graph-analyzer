@@ -390,3 +390,51 @@ is corrected.
 gap (Thu → Mon daily, Friday present intraday → `prev_close` is Friday's close,
 day change −2.58%, not the 2-day move) and pins that the common no-gap case is
 left untouched.
+
+---
+
+### 2026-10-21 — gap measured from the 09:30 open, not the pre-market open (ALGORITHM CHANGE)
+
+**Supersedes the "open observation" in the 2026-07-26 entry.** That entry flagged
+that `orb.opening_range` took the gap from the first bar of the day, which with
+`prepost=True` data is the **04:00 pre-market open**, and judged it a near-boundary
+risk. A replay of SNDK 2026-10-12…20 shows it is systematic: the bot's gap was off
+on **all 6 days**, by 0.4–2.3 pp, always toward zero:
+
+| Day | Bot's gap (pre-market) | Real gap (09:30) |
+|---|--:|--:|
+| 10-13 | −3.4% | −5.5% |
+| 10-16 | −1.1% | −3.3% |
+| 10-19 | +3.4% | +4.6% |
+
+The reversal family had the same bug by another route: it backed `session_open`
+out of `card.day_change_pct`, which `build_day_card` also measures from the first
+(pre-market) bar. On 10-16 (real −3.3%) the `with_trend` "gap-down ≤ −2% is a
+knife" guard read −1.1% and **would not have stood aside**, on a day that closed
+at its low.
+
+**What changed (code):**
+1. `data/market_session.regular_open(df)`: open of the first REGULAR bar of the
+   latest ET date; `None` until 09:30 exists.
+2. `orb.opening_range` uses it (returns `None` if there is no regular bar yet).
+3. `DayCard.session_open` (new, default `None`) is set from it in `build_day_card`;
+   `reversal_signal` prefers it and only falls back to the old `day_change_pct`
+   derivation when the card has no regular-session bars.
+
+**Deliberately NOT changed:** `DayCard.day_change_pct`, session high/low,
+range position and battle zones still span pre-market. They are separate
+behaviours (display + the reversal "lower 35% of range" gate), and changing them
+on the same PR would blur what this one measures.
+
+**Measurement honesty:** this changes which days pass the ORB `gap_up` gate and the
+reversal knife guard, so **ORB and reversal stats before and after 2026-10-21 are
+not comparable**. The H5 paired read (`managed_vs_fixed`) is unaffected: both bots
+share the entry. Swing bots are unaffected.
+
+**How we'll know:** `test_gap_is_measured_from_the_regular_open_not_premarket`,
+`test_premarket_gap_up_that_opens_flat_is_not_a_gap_up` and
+`test_gap_uses_card_regular_open_over_premarket_derived_open` all fail on the old
+code. `daytrade_backtest.py SNDK --date 2026-10-16` now prints `gap -3.3% (open
+$1348.82 …)`. Next: count how many ORB fires the corrected gate added/removed once
+a few weeks of live data exist. Plan with the related L2 overnight-hold issue:
+`docs/plans/2026-10-21-sndk-snapshot-review.md` (on the daychart branch).

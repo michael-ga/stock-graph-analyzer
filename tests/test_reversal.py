@@ -7,6 +7,7 @@ the ~3% go/no-go aim) across the variant family.
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from stockanalyzer.analysis.daycard import BattleZone, DayCard
 from stockanalyzer.analysis.reversal import (
@@ -141,3 +142,13 @@ def test_every_variant_produces_sane_geometry_when_it_fires():
             assert dec.rr > 0
             assert dec.target / dec.entry - 1 >= REV_MIN_AIM - 1e-9
     assert fired_any            # at least the touch/trend variants fire on this card
+
+
+def test_gap_uses_card_regular_open_over_premarket_derived_open():
+    # day_change_pct=-1 alone implies open≈101.01 (gap −1.9%, NOT a knife); the
+    # card's 09:30 open of 99.0 is the real gap (−5.7%) → with_trend stands aside.
+    card = _card()
+    card.session_open = 99.0
+    dec = reversal_signal(card, None, 100.0, Direction.BULL, 103.0, _REG, _TOUCH)
+    assert dec.gap_pct == pytest.approx(99.0 / 103.0 - 1)
+    assert dec.fired is False and "gap" in dec.reason.lower()

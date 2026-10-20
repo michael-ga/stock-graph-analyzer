@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from ..data.market_session import _to_et
+from ..data.market_session import _to_et, regular_open
 from ..session import is_orb_window, market_phase
 from .daycard import _session_bars
 from .indicators import relative_volume
@@ -85,7 +85,11 @@ def opening_range(intraday_df: pd.DataFrame | None, prev_close: float | None,
     win = sess[[_OR_START_HHMM <= t < _OR_END_HHMM for t in hhmm]]
     if win.empty:
         return None
-    today_open = float(sess["open"].iloc[0])
+    # The 09:30 open, not sess["open"].iloc[0] — that is the 04:00 pre-market
+    # open when the feed includes extended hours.
+    today_open = regular_open(sess)
+    if today_open is None:
+        return None
     gap_pct = (today_open / prev_close - 1) if (prev_close and today_open) else None
     return OpeningRange(
         day=_to_et(sess.index[-1]).strftime("%Y-%m-%d"),
