@@ -390,3 +390,41 @@ is corrected.
 gap (Thu → Mon daily, Friday present intraday → `prev_close` is Friday's close,
 day change −2.58%, not the 2-day move) and pins that the common no-gap case is
 left untouched.
+
+---
+
+### 2026-10-21 — replay multi-day scan + replay daily-window fidelity (no algorithm change)
+
+**Why:** the replay simulator answers "what happened on this day", but most days
+nothing happens — stepping through them one ten-second rebuild at a time wastes the
+session. `stockanalyzer/replay_scan.py` runs the same headless replay over a ticker
+list × a set of days (every bot on, a throwaway book per day) and summarizes each
+ticker-day — signals, the bots' trades and R, the idea count, the modal blocking gate
+— so the 🔎 Multi-day scan view on the Replay page can point at the days worth
+replaying. Rows are cached in `.replay/scan-cache.db`, keyed by a hash of the
+decision code (`analysis/`, `explain/`, `verdict/`, `replay.py`, `strategy.py`,
+`virtualbook.py`, `data/store.py`), so any algorithm change re-scans instead of
+serving the old algorithm's answer.
+
+**No gate, weight, threshold or `SCHEMA_VERSION` moved.** Two *harness* changes do
+shift replay numbers, and are recorded here so they aren't mistaken for an
+algorithm effect:
+1. The replay/backtest intraday window is now yfinance's 60-day maximum
+   (`replay.INTRADAY_PERIOD`), up from 1 month — more days, same per-day logic.
+2. `replay.daily_for_day` rebuilds the 1-month daily frame as the trailing month
+   **before the replayed day** (from the 6-month frame). Previously it was the
+   month fetched *today*, so a session three weeks back saw only ~1 week of prior
+   daily bars — often below `MIN_BARS`, silently dropping the M1 report the live
+   radar had on that morning. `daytrade_backtest.py` uses the same window, so the
+   replay ↔ backtest agreement check below still holds. `prev_close` now comes from
+   the 6-month frame (identical values for recent days; defined for older ones).
+
+**Statistical discipline still applies.** A scan's 🟢 days are a *finding aid*, not
+evidence: they are one ticker list over ≤60 days, and the per-day "ideas" column is
+the number to read, not the trade count (several bots copy one plan). Don't tune a
+gate from a scan grid — use it to pick days, then judge with `algorithm_correctness`.
+
+**How we'll know it worked:** a 🟢 cell's trades must match what the single-day
+replay shows for that day with all three bot toggles on and the day revealed —
+`tests/test_replay_scan.py` pins that the summary is built from the same
+`apply_bar → force_flat → scorecard` path.

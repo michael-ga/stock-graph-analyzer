@@ -179,8 +179,12 @@ def yf_intraday(ticker: str, interval: str, period: str = "1mo") -> pd.DataFrame
     return validate_ohlcv(df[["open", "high", "low", "close", "volume"]])
 
 
-def load_history(ticker: str, provider=None) -> dict:
-    """~1 month of 5m + 30m intraday, plus the daily frames, for one ticker.
+# yfinance serves 5- and 30-minute bars for the trailing 60 days, no further back.
+INTRADAY_PERIOD = "60d"
+
+
+def load_history(ticker: str, provider=None, period: str = INTRADAY_PERIOD) -> dict:
+    """~60 days of 5m + 30m intraday, plus the daily frames, for one ticker.
 
     The provider cache only carries 2 days of 5-min bars, so the intraday pulls go
     straight to yfinance. Callers should memoize this — it is the only network
@@ -189,26 +193,47 @@ def load_history(ticker: str, provider=None) -> dict:
     if provider is None:
         from stockanalyzer.data.providers import get_provider
         provider = get_provider("yfinance")
-    i5 = yf_intraday(ticker, "5m", "1mo")
-    i30 = yf_intraday(ticker, "30m", "1mo")
+    i5 = yf_intraday(ticker, "5m", period)
+    i30 = yf_intraday(ticker, "30m", period)
     daily = {tf: provider.fetch_cached(ticker, tf) for tf in
              (Timeframe.M1, Timeframe.M6, Timeframe.Y1)}
     for tf, df in daily.items():                     # normalize to tz-naive dates
         if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
             df.index = df.index.tz_localize(None)
     days = asof.trading_days(i5)
-    m1 = daily[Timeframe.M1]
+    # The 6-month frame reaches back past the whole intraday window; the 1-month
+    # one does not, so the oldest sessions would otherwise have no prior close.
+    longest = daily[Timeframe.M6] if len(daily[Timeframe.M6]) else daily[Timeframe.M1]
     prev_close = {}
     for day in days:
-        prior = m1[asof.naive_dates(m1.index) < day]
+        prior = longest[asof.naive_dates(longest.index) < day]
         prev_close[day] = float(prior["close"].iloc[-1]) if len(prior) else None
     return {"i5": i5, "i30": i30, "daily": daily, "days": days,
             "prev_close": prev_close}
 
 
+def daily_for_day(daily: dict, day) -> dict:
+    """The daily frames as the live radar would have fetched them ON ``day``.
+
+    The 1-month frame is fetched once, today — so for a session three weeks back
+    it holds only a week of prior bars, while the live radar that morning held a
+    full trailing month. Rebuild it from the 6-month frame as ``[day − 1 month,
+    day)``; ``asof_reports`` then appends the day's partial bar exactly as before.
+    A no-op when there is no 6-month frame to rebuild from.
+    """
+    m6 = daily.get(Timeframe.M6)
+    if m6 is None or not len(m6):
+        return daily
+    day = pd.Timestamp(day).normalize()
+    dates = asof.naive_dates(m6.index)
+    out = dict(daily)
+    out[Timeframe.M1] = m6[(dates >= day - pd.DateOffset(months=1)) & (dates < day)]
+    return out
+
+
 def replayable_days(history: dict) -> list[pd.Timestamp]:
     """Days worth offering: everything except the earliest, which has no prior
-    session inside the 1-month intraday window (degraded context and prev_close)."""
+    session inside the intraday window (degraded context and prev_close)."""
     return list(history["days"][1:])
 
 
@@ -341,6 +366,7 @@ def precompute_day(i5, i30, daily, day, prev_close, ticker: str = "",
     roughly ten seconds.
     """
     day = pd.Timestamp(day).normalize()
+    daily = daily_for_day(daily, day)
     sess_full = asof.day_bars(i5, day).between_time(
         asof.REG_START, asof.REG_END, inclusive="left")
     if sess_full.empty:

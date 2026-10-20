@@ -110,6 +110,7 @@ def _eval_bar(reports, orange, price, t) -> BarTrace | None:
 # One ticker-day.
 # --------------------------------------------------------------------------- #
 def run_day(ticker: str, intraday5, intraday30, daily, day, verbose: bool) -> list[BarTrace]:
+    daily = replay.daily_for_day(daily, day)        # same daily view the replay sees
     m1 = daily.get(Timeframe.M1)
     prior = m1[m1.index.normalize() < day] if m1 is not None else None
     prev_close = float(prior["close"].iloc[-1]) if prior is not None and len(prior) else None
@@ -301,6 +302,7 @@ def _reversal_contexts(i5, i30, daily, prev_close, day):
     """Per-bar (t, price, card, higher_trend, intraday_df) for bars sitting in a
     candidate reversal zone (near the running session low). The heavy as-of
     reconstruction runs once per day; every variant then reuses these contexts."""
+    daily = replay.daily_for_day(daily, day)
     sess = _day_bars(i5, day).between_time(_REG_START, _REG_END, inclusive="left")
     if sess.empty:
         return sess, []
@@ -379,7 +381,7 @@ def run_reversal_variants(tickers, per_ticker_data) -> None:
 
 # --------------------------------------------------------------------------- #
 def _load(ticker: str, provider) -> dict:
-    """The ~1-month intraday + daily bundle. Shared with the interactive replay."""
+    """The ~60-day intraday + daily bundle. Shared with the interactive replay."""
     return replay.load_history(ticker, provider)
 
 
