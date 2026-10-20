@@ -24,6 +24,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import replay_scan_page
 import ui_common
 from stockanalyzer import replay, virtualbook
 from stockanalyzer.charting import candlestick_figure
@@ -56,7 +57,7 @@ _BOT_LABELS = {"orb": "🚀 Gap-and-Go", "rev": "🔄 Reversal @ support",
 # --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner=False, ttl=60 * 30)
 def _history(ticker: str) -> dict:
-    """The month of intraday bars. Cached because it is the only network cost —
+    """The ~60 days of intraday bars. Cached because it is the only network cost —
     but note only the RAW frames are cached: the precomputed session is far too
     big to round-trip through cache_data's pickle on every rerun."""
     return replay.load_history(ticker)
@@ -124,13 +125,24 @@ def _setup_row() -> None:
 
     days = replay.replayable_days(hist)
     if not days:
-        st.warning("No replayable sessions in the last month of 5-minute data.")
+        st.warning("No replayable sessions in the 5-minute data window.")
         return
 
     labels = [f"{d:%a %Y-%m-%d}" for d in days]
-    pick = c2.selectbox("Trading day", labels, index=len(labels) - 1,
+    # A day opened from the multi-day scan: preselect it, then load it below.
+    goto = ss.pop("rp_goto", None)
+    if goto and (goto[0] != ticker or goto[1] not in days):
+        goto = None
+    loaded = ss.get("rp_sess")
+    if goto:
+        default = days.index(goto[1])
+    elif loaded is not None and loaded.ticker == ticker and loaded.day in days:
+        default = days.index(loaded.day)       # back from the scan: keep the tape's day
+    else:
+        default = len(labels) - 1
+    pick = c2.selectbox("Trading day", labels, index=default,
                         key="rp_day_pick",
-                        help="Only ~1 month of 5-minute bars exists at this "
+                        help="Only ~60 days of 5-minute bars exist at this "
                              "granularity. The earliest session is excluded — it "
                              "has no prior day for context.")
     day = days[labels.index(pick)]
@@ -140,7 +152,7 @@ def _setup_row() -> None:
     c3.write("")
     if c3.button("🎬 Load day" if stale else "↻ Reload day",
                  type="primary" if stale else "secondary",
-                 use_container_width=True):
+                 use_container_width=True) or (goto and stale):
         ss.rp_ticker = ticker
         _load_session(ticker, day, hist)
         st.rerun()
@@ -719,6 +731,16 @@ def render() -> None:
     ss.setdefault("rp_next_at", 0.0)
 
     st.subheader("🎬 Replay — trade a past day with the future hidden")
+    # Seeded here, not via default= — the scan's "Replay" buttons set it too.
+    ss.setdefault("rp_mode", replay_scan_page.SINGLE)
+    mode = st.segmented_control("Mode", [replay_scan_page.SINGLE, replay_scan_page.SCAN],
+                                required=True, key="rp_mode",
+                                label_visibility="collapsed")
+    if mode == replay_scan_page.SCAN:
+        ss.rp_play = False                 # the tape fragment isn't drawn here
+        replay_scan_page.render(_history)
+        return
+
     st.caption("The chart only ever holds the bars that had actually printed. "
                "Practice trades go to their own book — your real trade record is "
                "never touched.")
