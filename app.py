@@ -30,7 +30,7 @@ import streamlit as st
 
 import replay_page
 import ui_common
-from stockanalyzer import papertrade, session, swingwatch, virtualbook, watchlist
+from stockanalyzer import papertrade, replay, session, swingwatch, virtualbook, watchlist
 from stockanalyzer.auth import AuthError, AuthService
 from stockanalyzer.user_management import UserManagementService
 from stockanalyzer.config import ConfigurationError, Settings
@@ -2403,9 +2403,27 @@ def _live_slow_frame(ctx: dict) -> None:
     _live_chart(ctx["ticker"], d1, plan, shared["key_level"], live_price, snap,
                 reports=shared["reports"])
     _live_signal_chips(d1)
+    _live_bot_brain(ctx, shared, live_price)
     st.caption(f"Price updates ~{_LIVE_FAST_S}s · pulse/bots ~{_LIVE_MID_S}s · "
                f"chart & plan ~{_LIVE_SLOW_S}s · signals re-run ~{_ENGINE_REFRESH_S}s · "
                "the multi-timeframe verdict is structural · **not financial advice.**")
+
+
+def _live_bot_brain(ctx, shared, live_price) -> None:
+    """Replay's per-bot gate panel, fed the live plan the bots just acted on."""
+    with st.expander("🤖 Why the bots are / aren't trading", expanded=False):
+        try:
+            quote = ctx["result"].quote
+            bar = replay.live_bar(
+                shared["reports"], live_price, session.now_et(),
+                _opening_range(ctx["ticker"], ctx["result"]),
+                quote.prev_close if quote else None, shared["plan"])
+        except Exception:
+            bar = None                     # a view option must never break live mode
+        if bar is None:
+            st.caption("Bot read unavailable on this refresh.")
+            return
+        replay_page._bot_panel(bar, live=True)
 
 
 def _live_header(ctx, snap, live_price, elapsed, engine_age, ended) -> None:

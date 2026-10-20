@@ -275,3 +275,43 @@ def test_trade_r_is_none_without_a_usable_exit_or_risk():
     assert replay.trade_r({"entry": 100.0, "init_stop": 98.0}) is None
     assert replay.trade_r({"entry": 100.0, "init_stop": 100.0,
                            "exit_price": 104.0}) is None
+
+
+# --------------------------------------------------------------------------- #
+# Live mode reuses the replay bot panel via live_bar.
+# --------------------------------------------------------------------------- #
+def test_live_bar_matches_the_precomputed_bar_on_the_same_reports(hist, sess):
+    """Same reports + price + opening range → the same bot verdicts as replay."""
+    for bar in (sess.bars[0], next(b for b in sess.bars if b.bots.orb.fired)):
+        reports = asof.asof_reports(hist["i5"], hist["i30"], hist["daily"], _DAY, bar.t)
+        live = replay.live_bar(reports, bar.close, bar.t, sess.orange.as_dict(),
+                               hist["prev_close"], plan=None)
+        assert live is not None
+        assert (live.bots.orb, live.bots.reversals, live.bots.swing_go,
+                live.bots.swing_block, live.bots.contradiction) == (
+            bar.bots.orb, bar.bots.reversals, bar.bots.swing_go,
+            bar.bots.swing_block, bar.bots.contradiction)
+        assert (live.setup, live.score, live.go) == (bar.setup, bar.score, bar.go)
+
+
+def test_live_bar_uses_the_plan_the_live_bots_acted_on(hist, sess):
+    """A passed plan (user pace + sentiment in live mode) is shown as-is."""
+    from stockanalyzer.explain.swing import build_swing_plan
+    from stockanalyzer.explain.usecase import UseCase
+    from stockanalyzer.strategy import SwingPace
+
+    bar = sess.bars[5]
+    reports = asof.asof_reports(hist["i5"], hist["i30"], hist["daily"], _DAY, bar.t)
+    plan = build_swing_plan(asof.decision_rep(reports), UseCase.BUY, SwingPace.STANDARD,
+                            price_override=bar.close, all_reports=reports)
+    live = replay.live_bar(reports, bar.close, bar.t, None, hist["prev_close"], plan)
+    assert (live.score, live.go, live.kind, live.entry) == (
+        int(plan.score), bool(plan.go), plan.kind, float(plan.entry))
+    assert not live.bots.orb.fired            # no opening range → gap bots stand aside
+
+
+def test_live_bar_is_none_without_daily_data():
+    assert replay.live_bar({}, 100.0, pd.Timestamp("2026-06-18 10:00", tz=asof.ET),
+                           None, 99.0, plan=None) is None
+    assert replay.live_bar(None, 100.0, pd.Timestamp("2026-06-18 10:00", tz=asof.ET),
+                           None, 99.0, plan=None) is None
