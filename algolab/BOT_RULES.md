@@ -65,7 +65,8 @@ Bot entry conditions then layer on top of `plan` (see §1 roster column).
 Fires only when **all** hold:
 1. `session.market_phase() == "regular"` and **NOT** the opening-range freeze (no entries 9:30–9:45).
 2. `session.is_orb_window()` — **9:45–11:30 ET only** (no afternoon Gap-and-Go).
-3. `orange["gap_up"]` — today's open ≥ **prev close +2%** (`_GAP_MIN_PCT`).
+3. `orange["gap_up"]` — today's **09:30 regular open** ≥ **prev close +2%** (`_GAP_MIN_PCT`).
+   Pre-market bars are ignored for the gap (`market_session.regular_open`, since 2026-10-21).
 4. `price ≥ orange["high"]` — breaks the **15-minute opening-range high**.
 5. `rvol > 1.5` (`_MIN_BREAKOUT_RVOL`) — volume confirms the break.
 

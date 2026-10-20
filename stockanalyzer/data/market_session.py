@@ -75,6 +75,21 @@ def last_regular_close(df: pd.DataFrame) -> float | None:
     return None
 
 
+def regular_open(df: pd.DataFrame) -> float | None:
+    """Open of the first REGULAR-session bar (09:30 ET) of the latest ET date in
+    ``df`` — the gap reference. With ``prepost=True`` data the latest day starts
+    at 04:00, so ``df["open"].iloc[0]`` is the *pre-market* open, which mis-states
+    the gap. ``None`` until the 09:30 bar exists (or for daily bars)."""
+    if not isinstance(df.index, pd.DatetimeIndex) or df.empty:
+        return None
+    last_day = _to_et(df.index[-1]).date()
+    for ts in df.index:
+        et = _to_et(ts)
+        if et.date() == last_day and classify(et) == Session.REGULAR:
+            return float(df.loc[ts, "open"])
+    return None
+
+
 def session_closes(df: pd.DataFrame, n: int = 2) -> list[tuple]:
     """The last ``n`` distinct trading days' REGULAR-session closes in ``df``,
     most recent first, as ``(date, close)`` pairs.
