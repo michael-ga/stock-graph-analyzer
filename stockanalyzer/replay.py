@@ -289,15 +289,19 @@ def judge_intraday(rest, entry, stop, target, rr_floor) -> tuple[str, float]:
 # --------------------------------------------------------------------------- #
 # Precompute — the whole day's decisions, once.
 # --------------------------------------------------------------------------- #
-def _eval_bar(i, t, row, reports, orange, prev_close) -> ReplayBar | None:
-    """Freeze one bar's complete decision. Everything it reads is as-of ``t``."""
-    dec = asof.decision_rep(reports)
-    if dec is None:
-        return None
+def _eval_bar(i, t, row, reports, orange, prev_close, plan=None) -> ReplayBar | None:
+    """Freeze one bar's complete decision. Everything it reads is as-of ``t``.
+
+    ``plan`` lets live mode pass the exact plan its bots acted on (user pace +
+    sentiment) instead of replay's FAST, sentiment-free one."""
     price = float(row["close"])
-    inv = round((build_verdict(reports).score + 1) / 2 * 100)
-    plan = build_swing_plan(dec, UseCase.BUY, SwingPace.FAST, price_override=price,
-                            all_reports=reports, context={"investor_pct": inv})
+    if plan is None:
+        dec = asof.decision_rep(reports)
+        if dec is None:
+            return None
+        inv = round((build_verdict(reports).score + 1) / 2 * 100)
+        plan = build_swing_plan(dec, UseCase.BUY, SwingPace.FAST, price_override=price,
+                                all_reports=reports, context={"investor_pct": inv})
     if plan is None:
         return None
 
@@ -327,6 +331,20 @@ def _eval_bar(i, t, row, reports, orange, prev_close) -> ReplayBar | None:
                          swing_block=("" if plan.go else swing_block(plan)),
                          contradiction=contradiction(plan)),
     )
+
+
+def live_bar(reports, price, now, orange: dict | None, prev_close, plan) -> ReplayBar | None:
+    """One live 'bar' for the replay bot panel: the same gates the live bots run,
+    evaluated on the current reports at ``price``."""
+    d1 = reports.get(Timeframe.D1) if reports else None
+    if d1 is None or d1.df is None or not len(d1.df) or not price:
+        return None
+    last = d1.df.iloc[-1]
+    row = {"open": last["open"], "high": max(float(last["high"]), price),
+           "low": min(float(last["low"]), price), "close": price,
+           "volume": last["volume"]}
+    rng = orb.OpeningRange(**orange) if orange else None
+    return _eval_bar(0, pd.Timestamp(now), row, reports, rng, prev_close, plan=plan)
 
 
 def precompute_day(i5, i30, daily, day, prev_close, ticker: str = "",

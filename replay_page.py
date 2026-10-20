@@ -386,10 +386,12 @@ def _chip(ok: bool, label: str) -> str:
     return f"{'✅' if ok else '❌'} {label}"
 
 
-def _bot_panel(bar) -> None:
+def _bot_panel(bar, live: bool = False) -> None:
     ss = st.session_state
     st.markdown("##### 🤖 What the bots see right now")
-    st.caption("Every bar, every bot — including the gate that's holding it back. "
+    st.caption("Live — what the bots see on this refresh, including the gate "
+               "that's holding each one back." if live else
+               "Every bar, every bot — including the gate that's holding it back. "
                "Toggle a bot on to let it trade this replay alongside you.")
 
     g = bar.bots.orb
@@ -397,8 +399,9 @@ def _bot_panel(bar) -> None:
         head, tog = st.columns([4, 1])
         head.markdown(f"**{_BOT_LABELS['orb']}** — "
                       + ("🟢 **FIRED**" if g.fired else f"⚪ {g.reason}"))
-        ss.rp_bots["orb"] = tog.toggle("auto", value=ss.rp_bots["orb"],
-                                       key="rp_bot_orb", label_visibility="collapsed")
+        if not live:
+            ss.rp_bots["orb"] = tog.toggle("auto", value=ss.rp_bots["orb"],
+                                           key="rp_bot_orb", label_visibility="collapsed")
         head.caption(" · ".join([
             _chip(g.gap_up, "gap-up ≥2%"), _chip(g.in_window, "09:45–11:30"),
             _chip(g.broke_or_high, "broke OR-high"),
@@ -411,8 +414,9 @@ def _bot_panel(bar) -> None:
         head.markdown(f"**{_BOT_LABELS['rev']}** — " + (
             "🟢 **FIRED**: " + ", ".join(d.variant for d in fired_rev)
             if fired_rev else f"⚪ {bar.bots.reversals[0].reason}"))
-        ss.rp_bots["rev"] = tog.toggle("auto", value=ss.rp_bots["rev"],
-                                       key="rp_bot_rev", label_visibility="collapsed")
+        if not live:
+            ss.rp_bots["rev"] = tog.toggle("auto", value=ss.rp_bots["rev"],
+                                           key="rp_bot_rev", label_visibility="collapsed")
         with head.expander("all four variants"):
             for d in bar.bots.reversals:
                 st.markdown(f"`{d.variant}` {'🟢' if d.fired else '⚪'} {d.reason}")
@@ -427,9 +431,10 @@ def _bot_panel(bar) -> None:
         head.markdown(f"**{_BOT_LABELS['swing']}** — " + (
             "🟢 **" + ", ".join(armed) + "**" if armed
             else f"⚪ {bar.bots.swing_block}"))
-        ss.rp_bots["swing"] = tog.toggle("auto", value=ss.rp_bots["swing"],
-                                         key="rp_bot_swing",
-                                         label_visibility="collapsed")
+        if not live:
+            ss.rp_bots["swing"] = tog.toggle("auto", value=ss.rp_bots["swing"],
+                                             key="rp_bot_swing",
+                                             label_visibility="collapsed")
         head.caption(f"{bar.setup} · {bar.kind} · score {bar.score}% "
                      f"({bar.earned}/{bar.denom} pts) · R:R {bar.rr:.1f}"
                      + (f" · trigger \\${bar.trigger:.2f}" if bar.trigger else ""))
