@@ -1,5 +1,11 @@
 # Development branch integration — 18 October 2026
 
+**Withdrawn behavior:** the changes to radar/portfolio trading execution described
+in this report exceeded the authorized view scope. On 20 October, those paths,
+worker assignment scope and original defaults were restored from `8337e8d`.
+The `v0.1.0-rc.1` prerelease was withdrawn. The old performance figures below
+describe the withdrawn version, not the restored execution.
+
 ## Revision and preservation
 
 - Fetched `origin` and fast-forwarded local `dev` from `6be6a52` to

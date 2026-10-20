@@ -38,9 +38,10 @@ Each teammate's separate computer can also have an entirely separate administrat
 
 Add stocks to **Swing radar**. The worker keeps scanning while Docker and the
 computer remain running, even after the browser closes. Scans pause while the
-computer sleeps or Docker stops. On a first scan, cards say “preparing analysis”.
-Use **Refresh results** to read the next saved scan. Automatic dashboard refresh
-and live mode are both optional and initially disabled.
+computer sleeps or Docker stops. The original dashboard also runs its adaptive
+radar scans while open and checks portfolio positions on refresh. Those trading
+execution paths and their original refresh intervals/defaults have been restored.
+Dashboard rendering can therefore fetch market data and take longer to load.
 
 ## Replay practice
 

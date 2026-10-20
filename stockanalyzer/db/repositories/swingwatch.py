@@ -1,6 +1,6 @@
 from __future__ import annotations
 from sqlalchemy import select
-from stockanalyzer.db.models import SwingWatchItem, Trade, User
+from stockanalyzer.db.models import SwingWatchItem, User
 from stockanalyzer.db.session import session_scope
 
 
@@ -9,9 +9,6 @@ def normalize(ticker: str) -> str:
 
 
 class SwingWatchRepository:
-    def __init__(self, *, include_positions: bool = False):
-        self.include_positions = include_positions
-
     def list(self, user_id: str) -> list[str]:
         with session_scope() as s:
             return list(s.scalars(select(SwingWatchItem.ticker).where(SwingWatchItem.user_id == user_id).order_by(SwingWatchItem.created_at, SwingWatchItem.id)))
@@ -25,13 +22,7 @@ class SwingWatchRepository:
                 .where(User.is_active.is_(True))
                 .order_by(SwingWatchItem.created_at, SwingWatchItem.id)
             ).all()
-            assignments = [(str(user_id), str(ticker)) for user_id, ticker in rows]
-            if self.include_positions:
-                holdings = s.execute(select(Trade.user_id, Trade.ticker).join(
-                    User, User.id == Trade.user_id,
-                ).where(User.is_active.is_(True), Trade.status.in_(("open", "pending"))).distinct()).all()
-                assignments.extend((str(owner), str(ticker)) for owner, ticker in holdings)
-            return list(dict.fromkeys(assignments))
+            return [(str(user_id), str(ticker)) for user_id, ticker in rows]
 
     def add(self, user_id: str, ticker: str) -> list[str]:
         ticker = normalize(ticker)

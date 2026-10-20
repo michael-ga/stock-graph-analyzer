@@ -1,5 +1,10 @@
 # Verification — 18 October 2026
 
+**Superseded on 20 October:** the changes to browser trading execution and worker
+monitoring scope were reverted to the original `8337e8d` behavior. The zero-market-
+call login measurement and worker-only execution claims below apply to the
+withdrawn implementation. The original synchronous dashboard scans are restored.
+
 This records the initial performance and local-setup deployment. The subsequent
 development-branch update and current deployment are documented in
 [Development integration verification](dev-integration-verification.md).

@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
 
-from sqlalchemy import select, text
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from stockanalyzer import session as market_session, swingwatch, virtualbook
@@ -510,39 +510,7 @@ def run_forever() -> int:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    repository = SwingWatchRepository(include_positions=True)
-    from stockanalyzer.dashboard import snapshot_result
-    from stockanalyzer.db.repositories.radar_snapshots import RadarSnapshotRepository
-    snapshots = RadarSnapshotRepository()
-
-    def analyze_for_dashboard(ticker: str):
-        result = analyze_ticker(ticker, include_fundamentals=False, live_mode=True)
-        # Persist each result immediately, rather than making the browser wait
-        # for all tickers in a cycle. Keep the last good result on a fetch error.
-        if result.reports:
-            try:
-                snapshots.save(ticker, snapshot_result(result, build_radar_plan(result)))
-            except Exception:
-                # A presentation/storage error must not suppress trade processing.
-                logger.exception("dashboard snapshot failed ticker=%s", ticker)
-        return result
-
-    def process_for_worker(user_id: str, ticker: str, result, asof: datetime):
-        if swingwatch.assignment_is_active(ticker, user_id=user_id):
-            return process_analysis(user_id, ticker, result, asof)
-        # The old portfolio render marked manual holdings even when they weren't
-        # on the radar. Preserve that handling without requiring an open browser.
-        from stockanalyzer.db.models import User
-        price = _price_of(result)
-        if not price:
-            return None
-        with transaction_scope() as database:
-            active = database.scalar(select(User).where(
-                User.id == user_id, User.is_active.is_(True),
-            ).with_for_update())
-            if active:
-                return virtualbook.mark(ticker, price, user_id=user_id)
-        return None
+    repository = SwingWatchRepository()
 
     with worker_lease(engine) as acquired:
         if not acquired:
@@ -555,8 +523,10 @@ def run_forever() -> int:
                 if market_session.market_phase(asof) != "closed":
                     report = run_cycle(
                         repository,
-                        analyze=analyze_for_dashboard,
-                        process=process_for_worker,
+                        analyze=lambda ticker: analyze_ticker(
+                            ticker, include_fundamentals=False, live_mode=True
+                        ),
+                        process=process_analysis,
                         asof=asof,
                     )
                     logger.info(
@@ -565,18 +535,6 @@ def run_forever() -> int:
                         report.tickers_analyzed,
                         report.failures,
                     )
-                else:
-                    # Prepare cards for a first login/new ticker even on weekends.
-                    # Trading remains disabled when the market is closed.
-                    from datetime import timedelta, timezone
-                    cutoff = datetime.now(timezone.utc) - timedelta(hours=6)
-                    ages = snapshots.ages()
-                    for ticker in dict.fromkeys(t for _, t in repository.list_assignments()):
-                        if ticker not in ages or ages[ticker] < cutoff:
-                            try:
-                                analyze_for_dashboard(ticker)
-                            except Exception:
-                                logger.exception("dashboard preparation failed ticker=%s", ticker)
                 stop.wait(interval)
     logger.info("radar worker stopped")
     return 0

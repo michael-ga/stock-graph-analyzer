@@ -84,13 +84,14 @@ def test_saved_dashboard_is_owner_scoped_and_reads_no_market_data(database):
     assert repository.for_user(second.id) == {}
 
 
-def test_worker_monitors_manual_holdings_without_open_browser(database):
+def test_worker_assignment_scope_stays_limited_to_the_original_radar(database):
     user = owner()
     row = trade()
     row["status"] = "open"
     TradeRepository().insert(user.id, row)
     assert SwingWatchRepository().list_assignments() == []
-    assert SwingWatchRepository(include_positions=True).list_assignments() == [(user.id, "MSFT")]
+    SwingWatchRepository().add(user.id, "MSFT")
+    assert SwingWatchRepository().list_assignments() == [(user.id, "MSFT")]
 
 
 def test_complete_export_is_lossless_scoped_and_has_no_pagination_limit(database):
@@ -184,10 +185,10 @@ def test_second_local_launch_preserves_existing_admin(database, monkeypatch):
     assert main() == 0
 
 
-def test_populated_radar_login_performs_no_market_calls():
+def test_populated_radar_retains_its_original_analysis_execution():
     from scripts.benchmark_login import benchmark
     result = benchmark(Path("app.py").resolve(), tickers=14, delay=0.1)
-    assert result["market_calls_during_login"] == 0
+    assert result["market_calls_during_login"] == 14
     print(f"LOGIN_BENCHMARK {json.dumps(result)}")
 
 

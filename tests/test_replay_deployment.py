@@ -117,8 +117,7 @@ def test_authenticated_replay_load_step_and_reveal_leave_live_history_untouched(
             assert database.scalar(select(func.count()).select_from(Trade)) == 0
         next(button for button in app.button if button.label == "📊 Analyzer").click().run(timeout=30)
         assert app.session_state["page"] == "analyze"
-        assert next(toggle for toggle in app.toggle if "Live mode" in toggle.label).value is False
-        assert app.session_state["dashboard_auto_refresh"] is False
+        assert next(toggle for toggle in app.toggle if "Live mode" in toggle.label).value is True
         assert not app.exception
     finally:
         st.cache_data.clear()
