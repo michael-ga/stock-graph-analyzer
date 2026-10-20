@@ -1,9 +1,55 @@
 """Pin the restored trading execution to the pre-view-change commit 8337e8d."""
 import ast
+import copy
 import hashlib
 from pathlib import Path
 
 import pytest
+
+
+def _expand_portfolio_presentation(node, functions):
+    """Undo only the approved UI extraction before checking the ORIGINAL hash.
+
+    No trading statement is excluded. Inlining the report's exact body also
+    catches additions there. Pin the new wrapper so it cannot conceal trading
+    calls or change the parent fragment's timer.
+    """
+    expected = ast.parse('''
+@st.fragment
+def _portfolio_reports(book, s, tot, wr) -> None:
+    """Opening reports reruns only this view, without repeating trading checks."""
+    if st.toggle("Show closed-trade analytics and history", key="portfolio_reports_open"):
+        _render_portfolio_reports(book, s, tot, wr)
+''').body[0]
+    assert ast.dump(functions['_portfolio_reports']) == ast.dump(expected)
+    report = functions['_render_portfolio_reports']
+    assert ast.dump(report.args) == ast.dump(expected.args)
+    assert not report.decorator_list
+
+    class InlineReport(ast.NodeTransformer):
+        calls = 0
+        keys = 0
+
+        def visit_Expr(self, expression):
+            call = expression.value
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == '_portfolio_reports':
+                assert ast.dump(call) == ast.dump(ast.parse('_portfolio_reports(book, s, tot, wr)').body[0].value)
+                self.calls += 1
+                return copy.deepcopy(report.body)
+            return self.generic_visit(expression)
+
+        def visit_Call(self, call):
+            if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name) and call.func.value.id == 'st' and call.func.attr == 'expander':
+                for keyword in list(call.keywords):
+                    if keyword.arg == 'key' and isinstance(keyword.value, ast.Constant) and keyword.value.value == 'virtual-portfolio':
+                        call.keywords.remove(keyword)
+                        self.keys += 1
+            return self.generic_visit(call)
+
+    inline = InlineReport()
+    restored = inline.visit(copy.deepcopy(node))
+    assert (inline.calls, inline.keys) == (1, 1)
+    return restored
 
 
 @pytest.mark.parametrize("path,name,expected", [
@@ -22,7 +68,8 @@ import pytest
 def test_original_trading_execution_is_preserved(path, name, expected):
     functions = {node.name: node for node in ast.parse(Path(path).read_text()).body
                  if isinstance(node, ast.FunctionDef)}
-    fingerprint = hashlib.sha256(
-        ast.dump(functions[name], include_attributes=False).encode()
-    ).hexdigest()
+    node = functions[name]
+    if name == '_portfolio_panel':
+        node = _expand_portfolio_presentation(node, functions)
+    fingerprint = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
     assert fingerprint == expected, f"Trading execution changed: {path}:{name}"

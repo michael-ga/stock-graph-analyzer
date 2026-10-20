@@ -1361,7 +1361,7 @@ def _portfolio_panel() -> None:
         head = (f"💼 Virtual portfolio — {len(live)} live · "
                 f"realized ${tot['total_pnl_usd']:+,.0f} · unrealized ${unreal:+,.0f} "
                 f"{pnl_color} · win rate {wr}")
-        with st.expander(head, expanded=False):
+        with st.expander(head, expanded=False, key="virtual-portfolio"):
             # 💰 Bottom line — gross $ won, $ lost, and net, in plain dollars.
             done = [p for p in book if p["status"] == "closed"
                     and p.get("close_reason") != "cancelled"]
@@ -1416,122 +1416,133 @@ def _portfolio_panel() -> None:
                         st.rerun(scope="fragment")
 
             # The improvement evidence: who/what actually makes money.
-            closed_n = s["totals"]["n"]
-            if closed_n:
-                st.markdown("**📊 Algorithm evidence** _(closed trades)_")
-                c = st.columns(max(2, min(4, len(s["traders"]) + 1)))
-                c[0].metric("All traders", wr,
-                            f"{closed_n} trades · ${tot['total_pnl_usd']:+,.0f}",
-                            delta_color="off")
-                for i, (name, a) in enumerate(s["traders"].items(), start=1):
-                    if i >= len(c):
-                        break
-                    twr = f"{a['win_rate']}%" if a["win_rate"] is not None else "—"
-                    c[i].metric(name, twr,
-                                f"{a['n']} trades · ${a['total_pnl_usd']:+,.0f}",
-                                delta_color="off")
-                band_rows = [{"score band": k, **v} for k, v in s["bands"].items()]
-                setup_rows = [{"setup": k, **v} for k, v in s["setups"].items()]
-                b1, b2 = st.columns(2)
-                with b1:
-                    st.caption("By score band — does a higher score win more?")
-                    st.dataframe(_pnl_style(pd.DataFrame(band_rows),
-                                            pct_cols=["avg_pnl_pct"],
-                                            usd_cols=["total_pnl_usd"]),
-                                 use_container_width=True)
-                with b2:
-                    st.caption("By setup — which patterns deliver?")
-                    st.dataframe(_pnl_style(pd.DataFrame(setup_rows),
-                                            pct_cols=["avg_pnl_pct"],
-                                            usd_cols=["total_pnl_usd"]),
-                                 use_container_width=True)
-
-                # Algorithm correctness — the deduped view. The book copies one
-                # idea across bot-GO/bot-70/bot-BRK/me, which inflates the sample;
-                # this collapses each plan to a single idea so the numbers judge
-                # the engine's CALLS, not how many bots echoed them.
-                try:
-                    algo = virtualbook.algorithm_correctness(user_id=st.session_state.auth_user_id)
-                    at = algo["totals"]
-                    if at["n_ideas"]:
-                        st.markdown(
-                            f"**🧭 Algorithm correctness** — {at['n_ideas']} distinct "
-                            f"ideas (from {at['n_trades']} bot-trades) · "
-                            f"idea win-rate **{at['win_rate']}%** · "
-                            f"avg **{at['avg_pnl_pct']:+.2f}%** per idea")
-                        idea_setup = [{"setup": k, "ideas": v["n_ideas"],
-                                       "wins": v["wins"], "losses": v["losses"],
-                                       "win_rate": v["win_rate"],
-                                       "avg_pnl_pct": v["avg_pnl_pct"]}
-                                      for k, v in algo["setups"].items()]
-                        idea_band = [{"score band": k, "ideas": v["n_ideas"],
-                                      "win_rate": v["win_rate"],
-                                      "avg_pnl_pct": v["avg_pnl_pct"]}
-                                     for k, v in algo["bands"].items()]
-                        a1, a2 = st.columns(2)
-                        with a1:
-                            st.caption("By setup — one vote per idea")
-                            st.dataframe(_pnl_style(pd.DataFrame(idea_setup),
-                                                    pct_cols=["avg_pnl_pct"]),
-                                         use_container_width=True)
-                        with a2:
-                            st.caption("By score band — does a higher score win more?")
-                            st.dataframe(_pnl_style(pd.DataFrame(idea_band),
-                                                    pct_cols=["avg_pnl_pct"]),
-                                         use_container_width=True)
-                        st.caption("Same idea taken by several bots counts once "
-                                   "here — so a duplicated call can't masquerade as "
-                                   "a winning streak. Compare with the per-trader "
-                                   "cards above to see which bot *rule* earns its place.")
-                except Exception:
-                    pass
-
-                # Managed vs fixed — is the Gap-and-Go bot SMARTER? Paired on the
-                # same ORB entry (shared cohort_id), so this isolates the exit
-                # policy: breakeven/EMA8-trail/test-don't-dump vs fixed stop/target.
-                try:
-                    ab = virtualbook.managed_vs_fixed(
-                        user_id=st.session_state.auth_user_id)
-                    if ab["n_pairs"]:
-                        delta = ab["mean_delta_pct"]
-                        st.markdown(
-                            f"**🤖 Managed vs fixed (Gap-and-Go)** — {ab['n_pairs']} "
-                            f"matched pair(s) · mean Δ **{delta:+.2f}%** "
-                            f"(managed − fixed) · win% mgd **{ab['mgd_win_rate']}%** "
-                            f"vs fixed **{ab['fixed_win_rate']}%** · avg "
-                            f"{ab['avg_stop_moves']} stop-moves · mean MFE "
-                            f"{ab['mean_mfe_pct']:+.2f}%")
-                        verdict = ("smarter ✅" if delta > 0 else
-                                   "not yet better ⚠️" if delta < 0 else "even")
-                        st.caption(f"Management looks **{verdict}** on this sample. "
-                                   "Small n — collect more before concluding "
-                                   "(see algolab/LEARNINGS.md H5).")
-                except Exception:
-                    pass
-
-                hist = [p for p in book if p["status"] == "closed"]
-                st.markdown(f"**Trade history ({len(hist)})**")
-                h_rows = [{
-                    "closed": _fmt_ts(p.get("closed_ts") or p.get("closed")),
-                    "ticker": p["ticker"],
-                    "trader": p["trader"], "reason": p.get("close_reason"),
-                    "stake $": p.get("stake", 1000.0),
-                    "entry": p["entry"], "exit": p.get("exit_price"),
-                    "P&L %": p.get("pnl_pct"), "P&L $": p.get("pnl_usd"),
-                    "score": p.get("snapshot", {}).get("score"),
-                    "setup": p.get("snapshot", {}).get("setup"),
-                } for p in reversed(hist)]
-                st.dataframe(
-                    _pnl_style(pd.DataFrame(h_rows),
-                               pct_cols=["P&L %"], usd_cols=["P&L $"],
-                               price_cols=["stake $", "entry", "exit"]),
-                    use_container_width=True, height=240)
-            st.caption("Manual buys = trader **me** · bots: **bot-GO** (strict GO only) · "
-                       "**bot-70** (score ≥70, ignores the GO gate) · **bot-BRK** (armed "
-                       "breakout orders) — compare win rates to see which rules earn their "
-                       "place in the algorithm. Virtual money only.")
+            _portfolio_reports(book, s, tot, wr)
 
     _folio()
+
+
+@st.fragment
+def _portfolio_reports(book, s, tot, wr) -> None:
+    """Opening reports reruns only this view, without repeating trading checks."""
+    if st.toggle("Show closed-trade analytics and history", key="portfolio_reports_open"):
+        _render_portfolio_reports(book, s, tot, wr)
+
+
+def _render_portfolio_reports(book, s, tot, wr) -> None:
+    closed_n = s["totals"]["n"]
+    if closed_n:
+        st.markdown("**📊 Algorithm evidence** _(closed trades)_")
+        c = st.columns(max(2, min(4, len(s["traders"]) + 1)))
+        c[0].metric("All traders", wr,
+                    f"{closed_n} trades · ${tot['total_pnl_usd']:+,.0f}",
+                    delta_color="off")
+        for i, (name, a) in enumerate(s["traders"].items(), start=1):
+            if i >= len(c):
+                break
+            twr = f"{a['win_rate']}%" if a["win_rate"] is not None else "—"
+            c[i].metric(name, twr,
+                        f"{a['n']} trades · ${a['total_pnl_usd']:+,.0f}",
+                        delta_color="off")
+        band_rows = [{"score band": k, **v} for k, v in s["bands"].items()]
+        setup_rows = [{"setup": k, **v} for k, v in s["setups"].items()]
+        b1, b2 = st.columns(2)
+        with b1:
+            st.caption("By score band — does a higher score win more?")
+            st.dataframe(_pnl_style(pd.DataFrame(band_rows),
+                                    pct_cols=["avg_pnl_pct"],
+                                    usd_cols=["total_pnl_usd"]),
+                         use_container_width=True)
+        with b2:
+            st.caption("By setup — which patterns deliver?")
+            st.dataframe(_pnl_style(pd.DataFrame(setup_rows),
+                                    pct_cols=["avg_pnl_pct"],
+                                    usd_cols=["total_pnl_usd"]),
+                         use_container_width=True)
+
+        # Algorithm correctness — the deduped view. The book copies one
+        # idea across bot-GO/bot-70/bot-BRK/me, which inflates the sample;
+        # this collapses each plan to a single idea so the numbers judge
+        # the engine's CALLS, not how many bots echoed them.
+        try:
+            algo = virtualbook.algorithm_correctness(user_id=st.session_state.auth_user_id)
+            at = algo["totals"]
+            if at["n_ideas"]:
+                st.markdown(
+                    f"**🧭 Algorithm correctness** — {at['n_ideas']} distinct "
+                    f"ideas (from {at['n_trades']} bot-trades) · "
+                    f"idea win-rate **{at['win_rate']}%** · "
+                    f"avg **{at['avg_pnl_pct']:+.2f}%** per idea")
+                idea_setup = [{"setup": k, "ideas": v["n_ideas"],
+                               "wins": v["wins"], "losses": v["losses"],
+                               "win_rate": v["win_rate"],
+                               "avg_pnl_pct": v["avg_pnl_pct"]}
+                              for k, v in algo["setups"].items()]
+                idea_band = [{"score band": k, "ideas": v["n_ideas"],
+                              "win_rate": v["win_rate"],
+                              "avg_pnl_pct": v["avg_pnl_pct"]}
+                             for k, v in algo["bands"].items()]
+                a1, a2 = st.columns(2)
+                with a1:
+                    st.caption("By setup — one vote per idea")
+                    st.dataframe(_pnl_style(pd.DataFrame(idea_setup),
+                                            pct_cols=["avg_pnl_pct"]),
+                                 use_container_width=True)
+                with a2:
+                    st.caption("By score band — does a higher score win more?")
+                    st.dataframe(_pnl_style(pd.DataFrame(idea_band),
+                                            pct_cols=["avg_pnl_pct"]),
+                                 use_container_width=True)
+                st.caption("Same idea taken by several bots counts once "
+                           "here — so a duplicated call can't masquerade as "
+                           "a winning streak. Compare with the per-trader "
+                           "cards above to see which bot *rule* earns its place.")
+        except Exception:
+            pass
+
+        # Managed vs fixed — is the Gap-and-Go bot SMARTER? Paired on the
+        # same ORB entry (shared cohort_id), so this isolates the exit
+        # policy: breakeven/EMA8-trail/test-don't-dump vs fixed stop/target.
+        try:
+            ab = virtualbook.managed_vs_fixed(
+                user_id=st.session_state.auth_user_id)
+            if ab["n_pairs"]:
+                delta = ab["mean_delta_pct"]
+                st.markdown(
+                    f"**🤖 Managed vs fixed (Gap-and-Go)** — {ab['n_pairs']} "
+                    f"matched pair(s) · mean Δ **{delta:+.2f}%** "
+                    f"(managed − fixed) · win% mgd **{ab['mgd_win_rate']}%** "
+                    f"vs fixed **{ab['fixed_win_rate']}%** · avg "
+                    f"{ab['avg_stop_moves']} stop-moves · mean MFE "
+                    f"{ab['mean_mfe_pct']:+.2f}%")
+                verdict = ("smarter ✅" if delta > 0 else
+                           "not yet better ⚠️" if delta < 0 else "even")
+                st.caption(f"Management looks **{verdict}** on this sample. "
+                           "Small n — collect more before concluding "
+                           "(see algolab/LEARNINGS.md H5).")
+        except Exception:
+            pass
+
+        hist = [p for p in book if p["status"] == "closed"]
+        st.markdown(f"**Trade history ({len(hist)})**")
+        h_rows = [{
+            "closed": _fmt_ts(p.get("closed_ts") or p.get("closed")),
+            "ticker": p["ticker"],
+            "trader": p["trader"], "reason": p.get("close_reason"),
+            "stake $": p.get("stake", 1000.0),
+            "entry": p["entry"], "exit": p.get("exit_price"),
+            "P&L %": p.get("pnl_pct"), "P&L $": p.get("pnl_usd"),
+            "score": p.get("snapshot", {}).get("score"),
+            "setup": p.get("snapshot", {}).get("setup"),
+        } for p in reversed(hist)]
+        st.dataframe(
+            _pnl_style(pd.DataFrame(h_rows),
+                       pct_cols=["P&L %"], usd_cols=["P&L $"],
+                       price_cols=["stake $", "entry", "exit"]),
+            use_container_width=True, height=240)
+    st.caption("Manual buys = trader **me** · bots: **bot-GO** (strict GO only) · "
+               "**bot-70** (score ≥70, ignores the GO gate) · **bot-BRK** (armed "
+               "breakout orders) — compare win rates to see which rules earn their "
+               "place in the algorithm. Virtual money only.")
 
 
 def _journal_panel() -> None:
@@ -2734,7 +2745,8 @@ def _live_heartbeat(ticks) -> None:
     fig.update_layout(height=150, margin=dict(l=10, r=10, t=4, b=4), template="plotly_dark",
                       showlegend=False, xaxis_rangeslider_visible=False,
                       xaxis_visible=False, uirevision="heartbeat")
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False},
+                    key=f"live-heartbeat-{st.session_state.get('rt_ticker', '')}")
     st.caption(caption)
 
 
@@ -2902,14 +2914,15 @@ def _signals_section(result) -> None:
 
 def _render_tabs(ticker, result) -> None:
     st.subheader("Charts")
-    tabs = st.tabs([tf.value for tf in result.reports])
+    tabs = st.tabs([tf.value for tf in result.reports], key=f"charts-{ticker}")
     for tab, (tf, rep) in zip(tabs, result.reports.items()):
         with tab:
             st.markdown(timeframe_caption(tf.value, rep))
             if tf in (Timeframe.D1, Timeframe.D5):
                 st.caption("🌅🌙 Shaded bands = pre-market & after-hours (extended trading).")
             st.plotly_chart(candlestick_figure(rep, title=f"{ticker} — {tf.value}"),
-                            use_container_width=True, config=_PLOTLY_CFG)
+                            use_container_width=True, config=_PLOTLY_CFG,
+                            key=f"chart-{ticker}-{tf.value}")
             with st.expander("ℹ️ What is this telling me?"):
                 st.write(f"Trend (structure): {_badge(rep.trend.direction)} — {rep.trend.evidence}")
                 if rep.levels:
@@ -3000,7 +3013,9 @@ def _start_keep_alive() -> None:
 if __name__ == "__main__" or _running_in_streamlit():
     _start_keep_alive()
     if _require_login():
-        main()
+        ui_common.steady_dashboard()
+        with st.container(key="dashboard"):
+            main()
         started = st.session_state.pop("_login_started", None)
         if started is not None:
             st.session_state["_login_ms"] = (time.perf_counter() - started) * 1000

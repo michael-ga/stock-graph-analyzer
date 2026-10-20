@@ -94,6 +94,40 @@ def test_worker_assignment_scope_stays_limited_to_the_original_radar(database):
     assert SwingWatchRepository().list_assignments() == [(user.id, "MSFT")]
 
 
+def test_closed_reports_load_on_demand_and_keep_all_history(database):
+    import ast
+    from streamlit.testing.v1 import AppTest
+
+    user = owner()
+    for index in range(3):
+        TradeRepository().insert(user.id, trade(f"closed-{index}"), {"score": 75, "setup": "test"})
+    # Exercise the real report fragment in isolation. AppTest cannot round-trip
+    # the full page's passive keyed expanders; browser checks cover that page.
+    tree = ast.parse((Path(__file__).resolve().parents[1] / "app.py").read_text())
+    helpers = "\n\n".join(ast.unparse(node) for node in tree.body
+                            if isinstance(node, ast.FunctionDef) and node.name in {
+                                "_fmt_ts", "_portfolio_reports", "_render_portfolio_reports"})
+    script = ("import time\nimport pandas as pd\nimport streamlit as st\n"
+              "import ui_common\nfrom stockanalyzer import virtualbook\n"
+              "_pnl_style = ui_common.pnl_style\n" + helpers +
+              f"\nst.session_state.auth_user_id = {user.id!r}\n"
+              "book = virtualbook.load(user_id=st.session_state.auth_user_id)\n"
+              "s = virtualbook.stats(book)\ntot = s['totals']\nwr = str(tot['win_rate'])\n"
+              "_portfolio_reports(book, s, tot, wr)\n")
+    app = AppTest.from_string(script).run(timeout=60)
+    assert not app.exception
+    assert not app.dataframe
+
+    app.toggle(key="portfolio_reports_open").set_value(True).run(timeout=30)
+    assert not app.exception
+    assert any("Trade history (3)" in element.value for element in app.markdown)
+    assert len(app.dataframe[-1].value) == 3
+
+    app.toggle(key="portfolio_reports_open").set_value(False).run(timeout=30)
+    assert not app.exception
+    assert not app.dataframe
+
+
 def test_complete_export_is_lossless_scoped_and_has_no_pagination_limit(database):
     user, other = owner("first"), owner("other")
     TradeRepository().insert(user.id, trade(), {"setup": "test", "signals": [{"evidence": "detail"}]})

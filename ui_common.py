@@ -8,6 +8,8 @@ persistence.
 from __future__ import annotations
 
 import time
+import hashlib
+import json
 
 import pandas as pd
 import streamlit as st
@@ -21,6 +23,23 @@ PLOTLY_CFG = {
     "doubleClick": "reset+autosize",
     "modeBarButtonsToAdd": ["resetScale2d"],
 }
+
+
+def steady_dashboard() -> None:
+    """Keep the last rendered frame visible during automatic fragment checks.
+
+    This changes only Streamlit's pending-frame opacity. Fragment timers and
+    their work still run, and incoming values replace the previous frame.
+    Limit the rule to the authenticated dashboard; spinners and app status
+    still provide feedback, and the sign-in screen is unaffected.
+    """
+    st.html("""
+        <style>
+        .st-key-dashboard [data-testid="stElementContainer"][data-stale="true"] {
+            opacity: 1;
+        }
+        </style>
+    """)
 
 
 def apply_focus(fig, focus) -> None:
@@ -51,7 +70,11 @@ def pnl_style(df, pct_cols=(), usd_cols=(), price_cols=(), r_cols=()):
             return "background-color:rgba(229,57,53,0.22);color:#a01711;font-weight:600"
         return "color:gray"
 
-    sty = df.style
+    # A random Styler UUID changes the dataframe's frontend identity on every
+    # timer tick. Keep it stable for the same table schema and formatting.
+    identity = json.dumps([list(map(str, df.columns)), list(pct_cols),
+                           list(usd_cols), list(price_cols), list(r_cols)])
+    sty = df.style.set_uuid(hashlib.sha256(identity.encode()).hexdigest()[:12])
     color_cols = [c for c in (list(pct_cols) + list(usd_cols) + list(r_cols))
                   if c in df.columns]
     if color_cols:
