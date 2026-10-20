@@ -24,6 +24,21 @@ deduped **idea-level** view (`store.algorithm_correctness`, grouped by
 `cohort_id`), and the *bots* on `store.trade_stats`. Do not re-weight the score or
 kill a setup on a single session's data — see the guardrails in `LEARNINGS.md`.
 
+## Local run — always start BOTH processes
+
+The Streamlit app only displays radar results; the **radar worker** is the only
+process that writes them. Starting the app alone leaves Swing radar stuck on
+"preparing analysis". When running the app locally (no Docker), always start both
+with the same environment:
+
+```
+APP_ENV=development DATABASE_URL=sqlite:///.local/dev.db .venv/Scripts/python.exe -m streamlit run app.py --server.port=8501
+APP_ENV=development DATABASE_URL=sqlite:///.local/dev.db RADAR_WORKER_HEARTBEAT=.local/radar-worker-heartbeat .venv/Scripts/python.exe -m stockanalyzer.radar_worker
+```
+
+Use `.local/dev.db`, never the real `trades.db`. Migrate first with
+`python -m alembic upgrade head` under the same `DATABASE_URL`.
+
 ## Tests
 
 `pytest` (uses `STOCKANALYZER_DB` env for DB isolation — never writes the real

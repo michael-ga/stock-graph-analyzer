@@ -25,7 +25,8 @@ legacy/
 .local/
 exports/
 # Editor/agent config and the copyrighted source PDF (rules are encoded in code)
-.claude/
+.claude/*
+!.claude/skills/
 *.pdf
 # Local scratch output
 /Test
