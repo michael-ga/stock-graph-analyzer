@@ -288,3 +288,77 @@ one plan copied across bots.
 counterfactual fire/WR/expR ranking now; let the live bots accrue paired closed
 ideas for the real read. No baseline was reset (all additive), so existing swing
 and Gap-and-Go measurements are unaffected.
+
+---
+
+### 2026-07-26 — interactive replay simulator (observation surface, no algorithm change)
+
+**Why:** we could analyse *now* and backtest *offline*, but there was no way to sit
+inside a past session and watch it develop. `daytrade_backtest.py` already replayed
+a day bar-by-bar with strict no-lookahead — it just printed a table at the end. You
+couldn't see the chart move, pause on a bar, or take the trade yourself. That makes
+two things hard: judging a setup without hindsight bias, and *learning* the tape.
+
+**This entry changes NO algorithm behaviour.** `orb.py`, `reversal.py`, `swing.py`,
+`engine.py`, `daycard.py` and `store.py` are untouched, `SCHEMA_VERSION` stays at 5,
+and no live gate, weight or threshold moved. It is a new way to *observe* the engine.
+
+**What changed (code):**
+1. **`stockanalyzer/analysis/asof.py`** — the as-of reconstruction (`asof_intraday`,
+   `asof_daily`, `asof_reports`, `decision_rep`, `higher_trend`, …) **moved** out of
+   `daytrade_backtest.py`. The CLI now imports it under its old private names, so its
+   body is unchanged (verified: the `--variants` run reproduces the prior output).
+   This extends the H5/H6 "one pure as-of function, no drift" rule to a third
+   consumer. `tests/test_asof.py` pins it with an **import-identity test** — a future
+   edit cannot silently re-copy the logic and let the two versions drift.
+2. **`stockanalyzer/replay.py`** — headless engine. `precompute_day` walks 09:45 →
+   15:55 and freezes each bar's complete decision (swing plan scalars + all four
+   reversal variants + the ORB verdict + the blocking gate) into an immutable
+   `ReplayBar`. `apply_bar` runs the book forward one bar: `manage` → `mark`
+   (low → high → close, so an ambiguous bar resolves stop-first using the store's
+   own fill logic) → auto-place *after* marking, so a position is never judged
+   against the bar that opened it.
+3. **`replay_page.py` + `ui_common.py`** — the Streamlit page and the shared
+   presentation helpers extracted so `app.py` can import the page without a cycle.
+   `explain/snapshot.py` likewise now holds the three snapshot builders, so the
+   radar, the bots and the replay all store identically-shaped context (a divergent
+   builder would silently degrade `trade_stats`' `by_setup` grouping to "?").
+
+**Measured (AMD, 2026-07-22, this machine):** `analyze_timeframe` 29–39 ms ·
+`asof_reports` (5 calls) **121 ms/bar** · full-day precompute (75 bars) **9.6 s** ·
+`candlestick_figure` at 384 bars **200 ms build + 60 ms serialize**. The *chart* is
+4× the per-bar *decision*, which is why the day is precomputed once and why faster
+playback advances more bars per tick rather than ticking faster (the same lesson
+live mode learned at `_LIVE_FAST_S`).
+
+**Isolation.** Practice trades go to `.replay/<TICKER>-<YYYYMMDD>-<n>.db`, never
+`trades.db`, so `trade_stats` / `algorithm_correctness` over the real book are
+unaffected. The **subdirectory is load-bearing**: `store._ensure_schema` seeds a
+brand-new DB from `<db_path>.parent/.virtualbook.json`, so a replay book at the repo
+root would silently inherit ~100 real trades. Pinned by
+`test_replay_db_does_not_absorb_legacy_json`, which also asserts the failure mode
+still exists (a book placed beside the JSON *does* inherit it) so the test can't go
+vacuous. Bots keep their **live trader names** — isolation is by file, and identical
+names make a replay scorecard comparable row-for-row with the live one.
+
+**The no-lookahead invariant** is the flagship test
+(`test_bar_state_is_identical_whether_stepped_or_truncated`): the state at bar *i*
+must be identical whether the engine walked there or whether every later bar was
+physically deleted from the input. If anything in the stack peeked forward, deleting
+those bars would change the answer.
+
+**New open observation (do NOT "fix" without a deliberate decision):**
+`orb.opening_range` measures the gap from `_session_bars(df)["open"].iloc[0]`, which
+with `prepost=True` intraday data is the **pre-market open, not the 09:30 open**.
+On AMD 2026-07-22 that is 533.24 vs a regular open of 526.875 — a ~1.2 pp difference
+in the measured gap, i.e. it can flip the 2% `GAP_MIN_PCT` gate near the boundary.
+The live radar and the backtest share this behaviour, so the replay reproduces it
+faithfully rather than diverging. Whether the gap *should* be measured from the
+regular open is a real question — but it is an algorithm change, needs its own
+entry, and must be judged on ideas, not on one session.
+
+**How we'll know it worked:** the replay is a measurement instrument, so the test is
+usage — load a day, run the bots, and check that the fired/blocked verdicts match
+what `daytrade_backtest.py <ticker> --verbose` prints for the same day. Any
+disagreement means the shared as-of path has drifted, which is exactly what the
+import-identity test exists to prevent.
