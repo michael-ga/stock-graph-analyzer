@@ -62,6 +62,20 @@ def _conn(db_path: Path = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+
+def release(db_path: Path) -> None:
+    """Close this thread's cached connection to ``db_path`` and forget its schema.
+
+    For short-lived books (the replay scan opens one per ticker-day): without it
+    every book leaks a connection, and on Windows the open handle stops its
+    temporary directory from being deleted."""
+    key = str(db_path)
+    conn = (getattr(_local, "connections", None) or {}).pop(key, None)
+    if conn is not None:
+        conn.close()
+    with _schema_lock:
+        _schema_ready.discard(key)
+
 # ── schema ────────────────────────────────────────────────────────────────── #
 
 _DDL = """

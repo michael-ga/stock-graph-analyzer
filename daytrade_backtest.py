@@ -28,124 +28,38 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from stockanalyzer.analysis import orb, reversal
+from stockanalyzer import replay
+from stockanalyzer.analysis import asof, orb, reversal
 from stockanalyzer.analysis.daycard import build_day_card
-from stockanalyzer.analysis.engine import analyze_timeframe
 from stockanalyzer.analysis.indicators import relative_volume
 from stockanalyzer.data.providers import get_provider
-from stockanalyzer.data.schema import Timeframe, validate_ohlcv
+from stockanalyzer.data.schema import Timeframe
 from stockanalyzer.explain.swing import build_swing_plan
 from stockanalyzer.explain.usecase import UseCase
 from stockanalyzer.strategy import SwingPace
 from stockanalyzer.verdict.aggregate import build_verdict
 
-_ET = "America/New_York"
-_REG_START, _OR_END, _REG_END = "09:30", "09:45", "16:00"
+_ET = asof.ET
+_REG_START, _OR_END, _REG_END = asof.REG_START, asof.OR_END, asof.REG_END
 
-# Setups that are momentum plays — a mean-reversion/value veto on one of these is a
-# "contradiction" (the thing the setup-isolation bypass would target).
-_MOMENTUM_SETUPS = {"gap_and_go_orb", "Momentum / gap", "Breakout (volume)"}
-# Score checks that are mean-reversion / value in spirit.
-_MEANREV_CHECKS = ("Bollinger", "overextended", "No chase", "Buying low",
-                   "Trend strength")
+# The as-of reconstruction and the plan/judging helpers live in `analysis.asof` and
+# `stockanalyzer.replay`, so this CLI, the live radar and the interactive replay all
+# run the *same* no-lookahead code — no drift (see algolab/LEARNINGS.md).
+_naive_dates = asof.naive_dates
+_trading_days = asof.trading_days
+_asof_intraday = asof.asof_intraday
+_day_bars = asof.day_bars
+_session_upto = asof.session_upto
+_asof_daily = asof.asof_daily
+_asof_reports = asof.asof_reports
+_decision_rep = asof.decision_rep
+_higher_trend = asof.higher_trend
 
-
-# --------------------------------------------------------------------------- #
-# Data fetch (5-min + 30-min intraday, plus daily frames).
-# --------------------------------------------------------------------------- #
-def _yf_intraday(ticker: str, interval: str, period: str = "1mo") -> pd.DataFrame:
-    """Raw intraday OHLCV from yfinance (with pre/post), ET index."""
-    import yfinance as yf
-
-    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False,
-                     progress=False, threads=False, prepost=True)
-    if df is None or len(df) == 0:
-        raise RuntimeError(f"no {interval} data for {ticker}")
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df.rename(columns=str.lower)
-    idx = pd.DatetimeIndex(df.index)
-    df.index = idx.tz_convert(_ET) if idx.tz is not None else idx.tz_localize("UTC").tz_convert(_ET)
-    return validate_ohlcv(df[["open", "high", "low", "close", "volume"]])
-
-
-def _naive_dates(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    """ET wall-clock dates as a tz-naive index (so it compares to the daily frames)."""
-    idx = index.tz_localize(None) if index.tz is not None else index
-    return idx.normalize()
-
-
-def _trading_days(intraday5: pd.DataFrame) -> list[pd.Timestamp]:
-    """Distinct ET dates that actually opened a regular session (have a 09:30 bar)."""
-    reg = intraday5.between_time(_REG_START, _REG_END, inclusive="left")
-    return sorted(set(_naive_dates(reg.index)))
-
-
-# --------------------------------------------------------------------------- #
-# As-of frame reconstruction (no lookahead).
-# --------------------------------------------------------------------------- #
-def _asof_intraday(intraday: pd.DataFrame, t: pd.Timestamp, days: int) -> pd.DataFrame:
-    """Bars up to and including t, trailing `days` calendar days (mirrors the live
-    fixed-period intraday window)."""
-    lo = t - pd.Timedelta(days=days)
-    return intraday[(intraday.index > lo) & (intraday.index <= t)]
-
-
-def _day_bars(intraday: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
-    """All bars whose ET date == day (day is a tz-naive normalized date)."""
-    return intraday[_naive_dates(intraday.index) == day]
-
-
-def _session_upto(intraday5: pd.DataFrame, day: pd.Timestamp, t: pd.Timestamp) -> pd.DataFrame:
-    """Regular-session bars of `day` from the open through t."""
-    d = _day_bars(intraday5, day).between_time(_REG_START, _REG_END, inclusive="left")
-    return d[d.index <= t]
-
-
-def _asof_daily(daily_prior: pd.DataFrame, session_bars: pd.DataFrame,
-                day: pd.Timestamp) -> pd.DataFrame:
-    """Daily frame = completed prior days + today's PARTIAL bar built from the
-    session so far. This is what the live daily frame looks like intraday, so the
-    Bollinger/overextension/chase guards see the gap (the whole point)."""
-    if session_bars.empty:
-        return daily_prior
-    today = pd.DataFrame({
-        "open": [float(session_bars["open"].iloc[0])],
-        "high": [float(session_bars["high"].max())],
-        "low": [float(session_bars["low"].min())],
-        "close": [float(session_bars["close"].iloc[-1])],
-        "volume": [float(session_bars["volume"].sum())],
-    }, index=[day])
-    return pd.concat([daily_prior, today])
-
-
-def _asof_reports(intraday5, intraday30, daily, day, t) -> dict:
-    """The full multi-timeframe view the radar would have had at bar t."""
-    sess = _session_upto(intraday5, day, t)
-    reports: dict = {}
-    d1 = _asof_intraday(intraday5, t, days=2)
-    if len(d1) >= 20:
-        reports[Timeframe.D1] = analyze_timeframe(d1)
-    d5 = _asof_intraday(intraday30, t, days=5)
-    if len(d5) >= 20:
-        reports[Timeframe.D5] = analyze_timeframe(d5)
-    for tf in (Timeframe.M1, Timeframe.M6, Timeframe.Y1):
-        base = daily.get(tf)
-        if base is None:
-            continue
-        prior = base[_naive_dates(base.index) < day]
-        frame = _asof_daily(prior, sess, day)
-        if len(frame) >= 20:
-            reports[tf] = analyze_timeframe(frame)
-    return reports
-
-
-def _decision_rep(reports: dict):
-    """Same preference the radar uses (D5 → D1 → M1)."""
-    for tf in (Timeframe.D5, Timeframe.D1, Timeframe.M1):
-        if reports.get(tf) is not None:
-            return reports[tf]
-    return None
+_yf_intraday = replay.yf_intraday
+_swing_block = replay.swing_block
+_contradiction = replay.contradiction
+_score_breakdown = replay.score_breakdown
+_judge_intraday = replay.judge_intraday
 
 
 # --------------------------------------------------------------------------- #
@@ -172,59 +86,6 @@ class BarTrace:
     denom: int = 0
 
 
-def _swing_block(plan) -> str:
-    """The binding reason a non-GO swing plan didn't fire, from its own fields."""
-    if plan.go:
-        return "GO"
-    g = plan.guidance.lower()
-    if plan.kind == "breakout_wait":
-        return "armed breakout (not immediate) — waits for a close past the trigger"
-    if plan.kind == "no_trade":
-        if "2σ" in plan.guidance or "spent" in g:
-            return "no_trade: leg spent / 2σ-extended (Bollinger blowoff)"
-        if "reach" in g or "away" in g:
-            return "no_trade: workable wall beyond the horizon's reach"
-        return f"no_trade: {plan.guidance[:60]}"
-    if "volume" in g:
-        return "vol_ok: breakout needs volume confirmation (rvol ≤ 1.5×)"
-    if "indicator says don't" in g or "bollinger" in g:
-        return "veto: overextended / adverse indicator (Bollinger / ADX / MACD)"
-    if "r:r" in g or "risk" in g:
-        return f"rr < {plan.rr:.1f} below the 1.5 floor"
-    if "minimum" in g:
-        return "aim below the pace minimum move"
-    if "earnings" in g:
-        return "earnings inside the horizon"
-    if "crash" in g:
-        return "crash-rebound regime"
-    if plan.setup == "No setup":
-        return "no valid setup detected"
-    return "blocked (see guidance)"
-
-
-def _contradiction(plan) -> str | None:
-    """Flag a momentum setup vetoed by a mean-reversion / value gate."""
-    if plan.setup not in _MOMENTUM_SETUPS:
-        return None
-    # Geometry-level veto (leg_spent) shows as no_trade + a 2σ guidance.
-    if plan.kind == "no_trade" and ("2σ" in plan.guidance or "spent" in plan.guidance.lower()):
-        return f"{plan.setup} vetoed by the 2σ Bollinger 'leg spent' rule"
-    failed = [c.name for c in plan.checks
-              if not c.ok and not c.na and any(k in c.name for k in _MEANREV_CHECKS)]
-    if failed:
-        return f"{plan.setup} loses points to mean-reversion gates: {', '.join(failed[:3])}"
-    return None
-
-
-def _score_breakdown(plan) -> tuple[int, int, list[tuple[str, int]]]:
-    """(earned, denom, [(failed_check, weight_lost), ...]) behind the headline score."""
-    denom = sum(int(c.weight / 2) if c.na else c.weight for c in plan.checks if c.weight)
-    earned = sum(c.weight for c in plan.checks if c.weight and c.ok and not c.na)
-    lost = sorted(((c.name, c.weight) for c in plan.checks
-                   if c.weight and not c.ok and not c.na), key=lambda x: -x[1])
-    return earned, denom, lost
-
-
 def _eval_bar(reports, orange, price, t) -> BarTrace | None:
     dec = _decision_rep(reports)
     if dec is None:
@@ -249,6 +110,7 @@ def _eval_bar(reports, orange, price, t) -> BarTrace | None:
 # One ticker-day.
 # --------------------------------------------------------------------------- #
 def run_day(ticker: str, intraday5, intraday30, daily, day, verbose: bool) -> list[BarTrace]:
+    daily = replay.daily_for_day(daily, day)        # same daily view the replay sees
     m1 = daily.get(Timeframe.M1)
     prior = m1[m1.index.normalize() < day] if m1 is not None else None
     prev_close = float(prior["close"].iloc[-1]) if prior is not None and len(prior) else None
@@ -405,19 +267,6 @@ def _variant_trade(v: Variant, intraday5, prev_close, day) -> dict | None:
     return None
 
 
-def _judge_intraday(rest, entry, stop, target, rr_floor) -> tuple[str, float]:
-    """Stop-first conservative judging over the remaining bars; EOD close otherwise."""
-    for _, row in rest.iterrows():
-        if float(row["low"]) <= stop:
-            return "stop", -1.0
-        if float(row["high"]) >= target:
-            return "target", rr_floor
-    if len(rest):
-        r = (float(rest["close"].iloc[-1]) - entry) / (entry - stop)
-        return "eod", round(r, 2)
-    return "open", 0.0
-
-
 def run_variants(tickers, per_ticker_data) -> None:
     print("\n" + "=" * 74)
     print("RELAXED DAY-TRADE VARIANTS — hard R:R, relaxed entry (counterfactual)")
@@ -449,19 +298,11 @@ def run_variants(tickers, per_ticker_data) -> None:
 # --------------------------------------------------------------------------- #
 # Reversal-at-support variants — same pure engine the live radar calls.
 # --------------------------------------------------------------------------- #
-def _higher_trend(reports: dict):
-    """The prevailing (daily) trend direction the reversal engine gates on."""
-    for tf in (Timeframe.M1, Timeframe.D5, Timeframe.M6):
-        rep = reports.get(tf)
-        if rep is not None:
-            return rep.trend.direction
-    return None
-
-
 def _reversal_contexts(i5, i30, daily, prev_close, day):
     """Per-bar (t, price, card, higher_trend, intraday_df) for bars sitting in a
     candidate reversal zone (near the running session low). The heavy as-of
     reconstruction runs once per day; every variant then reuses these contexts."""
+    daily = replay.daily_for_day(daily, day)
     sess = _day_bars(i5, day).between_time(_REG_START, _REG_END, inclusive="left")
     if sess.empty:
         return sess, []
@@ -540,20 +381,8 @@ def run_reversal_variants(tickers, per_ticker_data) -> None:
 
 # --------------------------------------------------------------------------- #
 def _load(ticker: str, provider) -> dict:
-    i5 = _yf_intraday(ticker, "5m", "1mo")
-    i30 = _yf_intraday(ticker, "30m", "1mo")
-    daily = {tf: provider.fetch_cached(ticker, tf) for tf in
-             (Timeframe.M1, Timeframe.M6, Timeframe.Y1)}
-    for tf, df in daily.items():                     # normalize to tz-naive dates
-        if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-    tdays = _trading_days(i5)
-    m1 = daily[Timeframe.M1]
-    prev_close = {}
-    for day in tdays:
-        prior = m1[_naive_dates(m1.index) < day]
-        prev_close[day] = float(prior["close"].iloc[-1]) if len(prior) else None
-    return {"i5": i5, "i30": i30, "daily": daily, "days": tdays, "prev_close": prev_close}
+    """The ~60-day intraday + daily bundle. Shared with the interactive replay."""
+    return replay.load_history(ticker, provider)
 
 
 def main() -> None:

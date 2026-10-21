@@ -20,6 +20,12 @@ trades.db.bak-*
 backups/
 legacy/
 .last-deploy
+# Replay simulator practice books — one SQLite file per attempt, never the real book
+.replay/
 # Editor/agent config and the copyrighted source PDF (rules are encoded in code)
-.claude/
+.claude/*
+!.claude/skills/
 *.pdf
+# Local scratch output
+/Test
+/out_toc.txt
