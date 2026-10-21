@@ -9,6 +9,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from stockanalyzer.data.schema import Timeframe
 from stockanalyzer.pipeline import _fallback_quote
@@ -83,6 +84,61 @@ def test_regular_session_uses_daily_closes_and_no_extended_move():
     assert q.regular_close == 105.0 and q.prev_close == 100.0
     assert q.day_change == 5.0 and q.day_change_pct == 5.0
     assert q.ext_change == 0.0 and q.ext_change_pct == 0.0   # no extended session
+
+
+def test_daily_frame_missing_the_latest_session_is_corrected_from_intraday():
+    """Reproduces the real INTC bug: the daily-bar feed skips a session (Friday),
+    so `iloc[-2]` silently becomes 2 trading days back instead of 1, and the
+    printed 'day change' is roughly double the real one-day move.
+
+    Daily frame here jumps Thu -> Mon (Friday's row missing). The 5D intraday
+    frame (30-min bars) still has Friday's regular session, so the quote must
+    use Friday's close as prev_close, not Thursday's.
+    """
+    thu, fri, mon = "2026-07-23", "2026-07-24", "2026-07-27"
+    intraday = pd.DataFrame({
+        "open":   [104.6, 100.2, 93.0, 92.5],
+        "high":   [105.2, 101.0, 94.0, 90.5],
+        "low":    [104.3, 99.5, 91.0, 88.5],
+        "close":  [104.61, 100.23, 91.535, 89.17],   # Thu close, Fri OR bar, Fri close, Mon (partial)
+        "volume": [1000, 1200, 1300, 1400],
+    }, index=pd.to_datetime([f"{thu} 15:55", f"{fri} 10:00",
+                             f"{fri} 15:55", f"{mon} 10:00"]))
+    # The daily feed never got Friday's row — jumps straight Thu -> Mon.
+    daily = pd.DataFrame({
+        "open":   [101.1, 92.5],
+        "high":   [104.2, 95.0],
+        "low":    [99.2, 86.9],
+        "close":  [104.61, 89.17],
+        "volume": [140_000, 60_000],
+    }, index=pd.to_datetime([thu, mon]))
+
+    q = _fallback_quote({Timeframe.D5: _report(intraday), Timeframe.M1: _report(daily)})
+
+    assert q is not None
+    assert q.prev_close == 91.535                  # Friday's real close, not Thursday's
+    assert q.regular_close == 89.17
+    # The real single-day move (Mon vs Fri), not the gapped 2-day one (Mon vs Thu).
+    assert q.day_change_pct == pytest.approx(-2.58, abs=0.01)
+
+
+def test_daily_frame_with_no_gap_is_left_untouched():
+    """The common case: the daily frame's last row already matches the most
+    recent session the intraday frame knows about — nothing should change."""
+    idx = pd.to_datetime(["2026-06-19 10:00", "2026-06-19 10:05"])
+    intraday = pd.DataFrame({
+        "open": [104.0, 104.5], "high": [104.8, 105.2], "low": [103.8, 104.3],
+        "close": [104.5, 105.0], "volume": [1000, 1100],
+    }, index=idx)
+    daily = pd.DataFrame({
+        "open": [99.0, 104.0], "high": [101.0, 105.6], "low": [98.0, 103.5],
+        "close": [100.0, 105.0], "volume": [5_000_000, 6_000_000],
+    }, index=pd.to_datetime(["2026-06-18", "2026-06-19"]))
+
+    q = _fallback_quote({Timeframe.D1: _report(intraday), Timeframe.M1: _report(daily)})
+
+    assert q.regular_close == 105.0 and q.prev_close == 100.0
+    assert q.day_change_pct == 5.0
 
 
 def test_pct_from_prev_tracks_a_live_price():
