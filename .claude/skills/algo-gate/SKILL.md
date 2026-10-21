@@ -68,6 +68,11 @@ Confirmed mode fails on any of:
 
 ## Reporting
 
+**Any change that is not `PASS: no algorithm change` goes in its own PR titled
+`[ALGO] …`, with a `## ⚠️ ALGORITHM CHANGE` section first in the description**
+(see "Pull requests that change the algorithm" in `CLAUDE.md` for the required
+contents). This includes indirect changes, such as a fix to a price or quote input.
+
 Paste the report's verdict line and reasons into chat or the PR. For a PR, add the full
 report as a PR comment only if the user asks. Remember the sample is about 200 frozen
 points: a metric move is a signal to review, not proof. Follow the statistical
