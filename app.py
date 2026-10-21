@@ -31,7 +31,7 @@ import streamlit as st
 import replay_page
 import ui_common
 from stockanalyzer import papertrade, replay, session, swingwatch, virtualbook, watchlist
-from stockanalyzer.auth import AuthError, AuthService
+from stockanalyzer.auth import AuthError, AuthService, dev_login_username
 from stockanalyzer.user_management import UserManagementService
 from stockanalyzer.config import ConfigurationError, Settings
 from stockanalyzer.db.repositories.analysis_history import AnalysisHistoryRepository
@@ -117,6 +117,20 @@ def _require_login() -> bool:
         return False
 
     now = time.time()
+    # Local development only: DEV_AUTO_LOGIN signs in that account without a
+    # password (never in production or on PostgreSQL; see dev_login_username).
+    dev_username = dev_login_username(
+        settings.app_env, settings.database_url, os.environ.get("DEV_AUTO_LOGIN"))
+    if (dev_username and not st.session_state.get("auth_user_id")
+            and not st.session_state.get("_dev_login_off")):
+        dev_user = AuthService().active_user(dev_username)
+        if dev_user is not None:
+            st.session_state["auth_user_id"] = dev_user.id
+            st.session_state["auth_username"] = dev_user.username
+            st.session_state["auth_last_activity"] = now
+            st.session_state["auth_session_revision"] = dev_user.session_revision
+            st.session_state["auth_is_admin"] = bool(dev_user.is_admin)
+            st.session_state["auth_must_change_password"] = bool(dev_user.must_change_password)
     user_id = st.session_state.get("auth_user_id")
     last_activity = float(st.session_state.get("auth_last_activity", 0))
     current_user = None
@@ -134,10 +148,13 @@ def _require_login() -> bool:
         with st.sidebar:
             st.caption(f"Signed in as **{st.session_state.get('auth_username', 'user')}**")
             st.caption(f"Engineering version: {_engineering_version()}")
+            if dev_username:
+                st.caption("Local development sign-in (no password)")
             if st.button("Log out", use_container_width=True):
                 for key in list(st.session_state):
                     if key.startswith("auth_"):
                         del st.session_state[key]
+                st.session_state["_dev_login_off"] = True   # show the sign-in form
                 st.rerun()
         if current_user.must_change_password:
             st.title("Change your password")

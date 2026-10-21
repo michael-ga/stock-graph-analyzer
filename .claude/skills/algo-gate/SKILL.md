@@ -78,6 +78,12 @@ report as a PR comment only if the user asks. Remember the sample is about 200 f
 points: a metric move is a signal to review, not proof. Follow the statistical
 discipline in `CLAUDE.md`.
 
+## Checking a change in the running app
+
+To look at a change in the app itself, start the app and the radar worker as in
+`CLAUDE.md` ("Local run") with `DEV_AUTO_LOGIN=<local account>`, so no password is
+needed (development + SQLite only).
+
 ## When it runs
 
 - Before opening or merging any PR.

@@ -64,6 +64,13 @@ APP_ENV=development DATABASE_URL=sqlite:///.local/dev.db RADAR_WORKER_HEARTBEAT=
 Use `.local/dev.db`, never the real `trades.db`. Migrate first with
 `python -m alembic upgrade head` under the same `DATABASE_URL`.
 
+**Skip the password locally:** add `DEV_AUTO_LOGIN=<username>` to the app's
+environment and the app signs that existing account in without the form. It works
+only with `APP_ENV=development` **and** a SQLite `DATABASE_URL`; production and
+PostgreSQL always ask for the password (`auth.dev_login_username`). "Log out"
+shows the normal sign-in form for the rest of that browser session. Never set
+`DEV_AUTO_LOGIN` on the NUC or in any shared environment.
+
 ## Tests
 
 `pytest` (uses `STOCKANALYZER_DB` env for DB isolation — never writes the real
