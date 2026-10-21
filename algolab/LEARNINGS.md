@@ -364,3 +364,40 @@ code. `daytrade_backtest.py SNDK --date 2026-10-16` now prints `gap -3.3% (open
 $1348.82 …)`. Next: count how many ORB fires the corrected gate added/removed once
 a few weeks of live data exist. Plan with the related L2 overnight-hold issue:
 `docs/plans/2026-10-21-sndk-snapshot-review.md` (on the daychart branch).
+
+---
+
+### 2026-10-22 — [ALGO] measured impact of the 09:30 gap reference + skipped-session prev close
+
+**Why this entry:** the two entries above ship together in one [ALGO] PR into `main`.
+This records what they do to real trades, and corrects two claims made earlier.
+
+**Corrections to earlier entries (data, not opinion):**
+1. The 2026-07-27 quote fix is labelled "no algorithm change". That is wrong for live
+   trading: `Quote.prev_close` feeds `orb.opening_range` (the Gap-and-Go gap) and
+   `reversal.reversal_signal` in both `app.py` and `radar_worker.py`. On a day the
+   daily feed skips a session, it changes the gap and can change trades. It is an
+   **indirect** algorithm change. Replay does not exercise it (replay takes
+   `prev_close` from the daily frame), so the A/B below cannot show it.
+2. The 2026-10-21 entry says the pre-market gap was off "always toward zero". Over
+   6 tickers × 22 sessions it is off in **both** directions: INTC 2026-09-30 read
+   +5.06% from the 04:00 open against a real +0.10%; TSLA 2026-10-16 +3.93% vs +1.82%.
+
+**Measured (real-history replay A/B, every bot on):** INTC AMD NVDA TSLA PLTR SMCI,
+2026-09-22 → 2026-10-21, 132 ticker-days, identical yfinance bars on both trees.
+- Gap-ups ≥ +2%: 8 days by the old measure, 16 by the 09:30 open. Median gap error of
+  the old measure: 0.88 points against a 2-point threshold.
+- Swing (`bot-GO`, `bot-BRK`) and reversal bots: **identical** trades.
+- Gap-and-Go (`bot-gap-fixed` + `bot-gap-mgd`): **0 → 8 trades** — exactly the days that
+  newly pass the gate (AMD, INTC, SMCI 2026-10-02; TSLA 2026-10-21). 1 win, 3 losses
+  per pair; net R for the whole book −2.35 → −4.81.
+- 6 other days newly pass the gap gate but fail later ORB checks: no trade.
+
+**Statistical discipline:** 4 Gap-and-Go ideas is not a sample. This PR fixes a
+measurement bug; it does not claim Gap-and-Go is profitable. Judge the bot on
+`store.algorithm_correctness` (idea level) after several weeks of live data, and do
+not compare ORB/reversal stats across 2026-10-21.
+
+**How we'll know it worked:** the unit tests in the two entries above; the gap shown
+on the replay page matches the 09:30 open; and a re-run of the replay A/B on a later
+month shows Gap-and-Go firing only on days whose 09:30 gap is ≥ +2%.
