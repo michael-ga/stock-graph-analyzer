@@ -169,6 +169,8 @@ stockanalyzer/
   data/        providers (yfinance / Twelve Data), Finnhub, OHLCV schema, cache
   analysis/    the engine: trend, levels, trendlines, indicators, candles,
                patterns, volume, trend-change scoring
+  setups/      intraday setups, one file each (Gap-and-Go ORB, reversal, Silver
+               Bullet, double bottom) + the bar-by-bar backtest harness
   sentiment/   analyst + price-target + VADER news → sentiment score
   vision/      image fallback: classify, chart_reader (OpenCV), info_reader (OCR)
   charting/    plotly candlestick + annotations
