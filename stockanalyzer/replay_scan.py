@@ -39,7 +39,7 @@ _PKG = Path(__file__).resolve().parent
 
 # The code that decides what a day's bots do. Editing any of it invalidates the
 # cache; presentation code (charting, ui) deliberately does not.
-_ENGINE_SOURCES = ("analysis", "explain", "verdict", "replay.py", "strategy.py",
+_ENGINE_SOURCES = ("analysis", "setups", "explain", "verdict", "replay.py", "strategy.py",
                    "virtualbook.py", "data/store.py")
 
 ALL_BOTS = {key: True for key in replay.BOT_KEYS}

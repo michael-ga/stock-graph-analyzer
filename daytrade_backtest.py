@@ -13,7 +13,7 @@ Fidelity notes (parity with the live radar):
   DAILY frame, whose last bar live is *today's partial bar*. We rebuild that partial
   bar from the session so far (`_asof_daily`) — this is what makes a +8% gap trip the
   2σ Bollinger veto, so the diagnosis is faithful.
-- The Gap-and-Go decision reuses `analysis.orb` verbatim (same code as the app).
+- The Gap-and-Go decision reuses `setups.orb` verbatim (same code as the app).
 
 Run:
   .venv\\Scripts\\python.exe daytrade_backtest.py INTC AMD [--date YYYY-MM-DD]
@@ -29,7 +29,8 @@ import numpy as np
 import pandas as pd
 
 from stockanalyzer import replay
-from stockanalyzer.analysis import asof, orb, reversal
+from stockanalyzer.analysis import asof
+from stockanalyzer.setups import orb, reversal
 from stockanalyzer.analysis.daycard import build_day_card
 from stockanalyzer.analysis.indicators import relative_volume
 from stockanalyzer.data.providers import get_provider

@@ -13,7 +13,7 @@ shape matters: `store.trade_stats` groups by ``snapshot["setup"]`` and
 """
 from __future__ import annotations
 
-from stockanalyzer.analysis.orb import ORB_TARGET_R
+from stockanalyzer.setups.orb import ORB_TARGET_R
 
 # Indicator columns worth freezing at entry time (last non-NaN value of each).
 _SNAP_INDICATORS = (

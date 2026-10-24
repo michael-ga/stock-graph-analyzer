@@ -1,4 +1,4 @@
-"""Intraday reversal-at-support decisions (stockanalyzer.analysis.reversal).
+"""Intraday reversal-at-support decisions (stockanalyzer.setups.reversal).
 
 These pin the pure reversal logic the live radar and daytrade_backtest.py both
 call: the guard order (at-support → trend/strength → reversal print → geometry →
@@ -9,7 +9,7 @@ from __future__ import annotations
 import pandas as pd
 
 from stockanalyzer.analysis.daycard import BattleZone, DayCard
-from stockanalyzer.analysis.reversal import (
+from stockanalyzer.setups.reversal import (
     REV_MIN_AIM,
     REVERSAL_VARIANTS,
     ReversalConfig,

@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from stockanalyzer import replay, virtualbook
-from stockanalyzer.analysis import orb, reversal
+from stockanalyzer.setups import orb, reversal
 from stockanalyzer.data import store
 
 _DAY = pd.Timestamp("2026-06-18")
