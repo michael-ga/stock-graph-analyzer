@@ -110,7 +110,10 @@ that doesn't beat it has no timing edge, whatever its average says.
   and an Open-hypotheses row with its keep/kill rule.
 - **Never** wire a setup into the live bots (`app.py`, `radar_worker.py`,
   `replay.py`) in the same change. That changes bot decisions, so it is its own
-  `[ALGO]` PR with the user's explicit approval (run the `algo-gate` skill where
-  it exists, and add `setups/` to its core paths if missing).
+  `[ALGO]` PR with the user's explicit approval. In that PR add the module to
+  `LIVE_SETUPS` in `scripts/algo_gate.py`, so the gate treats it as core decision
+  code from then on, and run the `algo-gate` skill.
+- A PR that only adds a backtest-only setup should get `PASS` from the gate: the
+  file shows under `backtest` and no bot decision changes.
 - Run the full `pytest` before declaring done; compare failures with the base
   branch rather than assuming they are yours or not.

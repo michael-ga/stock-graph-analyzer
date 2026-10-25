@@ -17,6 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_paths_are_classified_by_their_role_in_a_decision():
     assert gate._area("stockanalyzer/explain/swing.py") == "core"
     assert gate._area("stockanalyzer/analysis/orb.py") == "core"
+    assert gate._area("stockanalyzer/setups/orb.py") == "core"          # live setups
+    assert gate._area("stockanalyzer/setups/reversal.py") == "core"
+    assert gate._area("stockanalyzer/setups/double_bottom.py") == "backtest"
+    assert gate._area("stockanalyzer/setups/harness.py") == "backtest"
     assert gate._area("stockanalyzer/pipeline.py") == "inputs"
     assert gate._area("stockanalyzer/data/providers.py") == "inputs"
     assert gate._area("app.py") == "execution"
@@ -24,6 +28,45 @@ def test_paths_are_classified_by_their_role_in_a_decision():
     assert gate._area("stockanalyzer/replay.py") == "simulator"
     assert gate._area("docs/local-setup.md") is None
     assert gate._area("stockanalyzer/ui/history.py") is None
+
+
+def _repo(tmp_path: Path) -> tuple[Path, str]:
+    """A throwaway git repo with one core file committed; returns (root, base sha)."""
+    def run(*args):
+        return gate.git("-c", "user.name=t", "-c", "user.email=t@t", *args, cwd=tmp_path)
+    run("init", "-q")
+    src = tmp_path / "stockanalyzer" / "analysis" / "orb.py"
+    src.parent.mkdir(parents=True)
+    helpers = "".join(f"\n\ndef helper_{i}(p):\n    return p * {i} + {i}\n" for i in range(12))
+    src.write_text("from .daycard import x\n\nGAP = 0.02\n\ndef signal(p):\n    return p > GAP\n"
+                   + helpers, encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-q", "-m", "base")
+    return tmp_path, run("rev-parse", "HEAD")
+
+
+def test_a_moved_decision_file_is_compared_with_its_old_path(tmp_path):
+    root, base = _repo(tmp_path)
+    new = root / "stockanalyzer" / "setups" / "orb.py"
+    new.parent.mkdir(parents=True)
+    old = root / "stockanalyzer" / "analysis" / "orb.py"
+    new.write_text(old.read_text(encoding="utf-8").replace(
+        "from .daycard", "from ..analysis.daycard"), encoding="utf-8")
+    old.unlink()
+    gate.git("add", "-A", cwd=root)
+    [item] = gate.static_scan(root, base)
+    assert item["path"] == "stockanalyzer/setups/orb.py"
+    assert item["moved_from"] == "stockanalyzer/analysis/orb.py"
+    assert item["area"] == "core" and item["functions"] == []   # imports only: no change
+
+    new.write_text(new.read_text(encoding="utf-8").replace("0.02", "0.03"), encoding="utf-8")
+    [item] = gate.static_scan(root, base)
+    assert item["functions"] == ["GAP (changed)"]                 # a move can't hide an edit
+
+    new.write_text("def signal(p):\n    return True\n", encoding="utf-8")   # a rewrite:
+    items = {i["path"]: i for i in gate.static_scan(root, base)}          # delete + add
+    assert "signal (removed)" in items["stockanalyzer/analysis/orb.py"]["functions"]
+    assert "signal (added)" in items["stockanalyzer/setups/orb.py"]["functions"]
 
 
 def test_defs_see_function_and_constant_changes_but_not_formatting():

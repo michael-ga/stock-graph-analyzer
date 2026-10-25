@@ -28,10 +28,13 @@ From the repo root (or a worktree), with the project venv:
 
 It does three things:
 1. **Static scan.** Changed files and top-level functions are classified as one of:
-   - `core`: `analysis/`, `explain/`, `verdict/`, `sentiment/`, `strategy.py`.
+   - `core`: `analysis/`, `explain/`, `verdict/`, `sentiment/`, `strategy.py`, and the setups the live bots run (`setups/orb.py`, `setups/reversal.py`; `LIVE_SETUPS` in the script).
    - `inputs`: `data/`, `pipeline.py`, `session.py`.
    - `execution`: `app.py`, `radar_worker.py`, `virtualbook.py` and others. Changes to bot entry points, trade-placing calls or cadence constants are flagged **sensitive**.
    - `simulator`: `replay.py`, `backtest.py`, `daytrade_backtest.py`.
+   - `backtest`: the rest of `setups/` (backtest-only setups, the harness). Listed, never blocks: wiring one into a bot edits `execution`/`simulator` code, which is flagged. Add it to `LIVE_SETUPS` in that PR.
+
+   A moved file is compared with its old path, so a pure move shows no change and an edit inside a move still shows.
 2. **Behavioral probe** (`scripts/algo_probe.py`). This runs on a temporary checkout of the base and on the change, using frozen in-repo data:
    - Swing plans and swing-bot rules: 20 tickers × 5 points × 2 paces.
    - Every replay bar, covering Gap-and-Go, the reversal variants and the swing bots.
