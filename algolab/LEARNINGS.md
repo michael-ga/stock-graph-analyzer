@@ -70,6 +70,12 @@ again without materially more data:**
   book. Any "perf fix" that changes which timeframes reach `build_verdict` must be
   treated as a scoring change and measured as one. (The long frames are cached on
   disk for 6–24h anyway, so they are rarely the actual cost — measure first.)
+- ❌ **Failed-breakdown, second-chance retest and resistance→support longs on
+  2x single-stock ETFs (5-min, as specced 2026-10-25).** Negative in the 40-session
+  screen *and* the 20-session holdout, across opposite regimes: failed breakdown
+  −0.40R net over 155 trades / 105 underlying-days, second chance −0.30R / 92,
+  resistance→support −0.29R / 38. Re-test only with a materially different spec
+  (e.g. 1-min bars), not by nudging thresholds on the same data.
 
 ---
 
@@ -82,6 +88,10 @@ again without materially more data:**
 | H3 | **"Support test (uptrend)" is the real edge; with-trend > counter-trend.** | Support-test 6/6; Breakout(volume) 6/8; counter-trend Pullback/Momentum poor. | Watch only (n too small). | Track idea-level win-rate per setup over time. |
 | H4 | **The throwback/breakout model doesn't beat immediate entries.** | breakout_wait 9/15 (60%) vs immediate 8/13 (62%), but immediate captured ~2× profit/trade. | Watch only. | Compare idea-level avg_pnl breakout_wait vs immediate at larger n. |
 | H5 | **Active exit management beats a fixed stop/target** on identical Gap-and-Go entries. | None yet — instrumentation shipped 2026-06-21. | **Collecting.** Do NOT conclude until pairs accumulate. | `store.managed_vs_fixed()`: pair `bot-gap-mgd` vs `bot-gap-fixed` by `cohort_id`; positive mean Δ at n≥~30 pairs = management earns its place. |
+| H8 | **Extension-fade double bottom (`xfade-dbl-bottom`) has a small edge on 2x single-stock ETFs** — and it pays on whichever leg of the pair is trending up. | 2026-10-25: 60 sessions, 82 trades / 48 dates, +0.19R net, positive in both windows and both halves, beats a random-entry null (p=0.005). Cluster t vs zero 1.7: not significant. Leg split is post-hoc. | **Collecting** (backtest only, not a bot). | Re-run the harness on *new* sessions only. Keep if avg net R > 0 at ≥ 100 distinct dates and still > 0 without the best date; kill if ≤ 0 there. A daily-bias filter is a new variant, pre-registered before it's run. |
+| H9 | **ICT Silver Bullet, long mirror (`sb-am-bias`)** has an edge. | 2026-10-25: 12 trades in 60 sessions, +0.78R net, null p=0.045. n is an anecdote. | **Collecting** (backtest only). | Same keep/kill rule as H8 at ≥ 50 distinct dates. To accrue faster, add tickers, chosen before running. |
+
+(H7 is reserved for the `rev-gapfill` proposal in `docs/plans/2026-10-21-sndk-snapshot-review.md`.)
 
 ---
 
@@ -400,3 +410,90 @@ gate from a scan grid — use it to pick days, then judge with `algorithm_correc
 replay shows for that day with all three bot toggles on and the day revealed —
 `tests/test_replay_scan.py` pins that the summary is built from the same
 `apply_bar → force_flat → scorecard` path.
+
+---
+
+### 2026-10-25 — `setups/` package, setup-lab skill, 12-idea screen on SNXX/SNDQ/NBIZ/NBIC (no algorithm change)
+
+**No live bot changed.** `orb.py` and `reversal.py` moved verbatim from
+`analysis/` to `stockanalyzer/setups/` (only their relative imports changed);
+callers import from the new path. The two new setups are backtest-only.
+
+**What changed (code):**
+1. `stockanalyzer/setups/`: one file per setup. `orb.py`, `reversal.py` (moved);
+   `silver_bullet.py`, `double_bottom.py` (new); `base.py`, the contract new setups
+   follow (`signal(SetupContext, cfg) -> SetupDecision`; `fire()` refuses stop ≥
+   entry and targets < 1R); `harness.py`, the bar-by-bar backtest
+   (`python -m stockanalyzer.setups.harness TICKERS --days 40 [--offset N] [--null 200]`).
+   Judging reuses `replay.judge_intraday` (stop-first, flat at the 15:55 close),
+   minus $0.02/share round trip.
+2. `replay_scan._ENGINE_SOURCES` now includes `setups`. Without it, an edit to
+   `orb.py`/`reversal.py` after the move would have served stale scan rows.
+3. `.claude/skills/setup-lab/`: the idea → spec card → module → tests →
+   backtest → record loop, with a jargon → code glossary (FVG, CE, sweep, MSS…).
+
+**The screen (rules and pass rule written before the first run).** 12 pasted
+ideas (ICT Silver Bullet, prev-PM Judas swing, London raid, ORG PM reversion,
+lunch raid, prev-AM draw, range break, second chance, extension double bottom,
+failed breakout, ABC + EMA9, resistance → support) coded to common rules: 5-min
+bars, long only (the inverse ETF is the short side), entry at the trigger bar's
+close or a resting order's level, 0.1% stop buffer, skip < 1R, stop-first, flat
+at 15:55, one trade per idea per ticker-day, $0.02/share. Tickers: SNXX (2x long
+SNDK), SNDQ (2x short SNDK), NBIZ (2x short NBIS), NBIS standing in for **NBIC**
+(Corgi 2x long NBIS: median 9 of 78 five-minute bars trade, ~8k shares/day,
+untradeable intraday). Pick on the latest 40 sessions (2026-08-28..10-23),
+confirm on the 20 before (07-31..08-27). Pass rule: ≥ 8 trades; avg net R > 0 in
+both halves, with the best day removed, and on both underlyings.
+The ideas the source states as shorts were coded as their long mirror. Not
+modelled: SMT vs NQ/ES/YM, news pauses, the London session (stocks don't trade
+it; the pre-market range stood in), 1-min triggers.
+
+| Idea | 40d n | avg net R | holdout n | avg net R |
+|---|--:|--:|--:|--:|
+| I1 Silver Bullet (long mirror) | 9 | +0.50 | 3 | +1.44 |
+| I2 Judas swing, prev PM range | 10 | +0.54 *(2nd half −0.25)* | 1 | −1.15 |
+| I3 pre-market raid (London adapted) | 6 | −0.38 | 2 | −1.03 |
+| I4 opening-range gap, PM reversion | 14 | −0.15 | 7 | −0.78 |
+| I5 NY lunch raid | 45 | −0.13 | 22 | +0.31 |
+| I6 prev AM draw (mirror) | 15 | −0.37 | 3 | −0.61 |
+| I7 consolidation range break | 118 | +0.02 | 63 | −0.05 |
+| I8 second chance (break & retest) | 57 | −0.23 | 35 | −0.42 |
+| I9 extension fade, double bottom | 57 | +0.18 | 25 | +0.11 |
+| I10 failed breakdown | 99 | −0.52 | 56 | −0.19 |
+| I11 ABC + EMA9 trail | 7 | +0.00 | 9 | −0.38 |
+| I12 resistance → support | 22 | −0.35 | 16 | −0.22 |
+
+Passed: **I1** and **I9**, now `silver_bullet.py` and `double_bottom.py`. The
+production harness reproduces the screen trade for trade (same 57 + 9 entries).
+Harness numbers, NBIS costed at its own price:
+
+| Setup | 40d (dates) | win % | avg net R | halves | best day removed | holdout 20d | 60d | null p |
+|---|--:|--:|--:|---|--:|--:|--:|--:|
+| `xfade-dbl-bottom` | 57 (34) | 63 | +0.21 | +0.22 / +0.20 | +0.18 | +0.13 (25) | +0.19 (82 / 48) | 0.005 |
+| `sb-am-bias` | 9 (9) | 44 | +0.55 | +1.26 / +0.34 | +0.17 | +1.49 (3) | +0.78 (12) | 0.045 |
+
+Null = every trade re-entered at a random bar of the same ticker-day with the
+same risk % and R target (200 reps); its mean was −0.10R and −0.16R.
+
+**Read this honestly:**
+- The two windows had **opposite regimes**: Aug SNDK +16% / NBIS +16%;
+  Sep–Oct SNDK −17% / NBIS −27% (SNXX −37%, NBIZ +48%). The double bottom was
+  positive in both, each time mostly on the leg trending up (Aug: SNXX +0.20,
+  NBIS +0.17; Sep–Oct: NBIZ +0.50, SNDQ +0.51; the down-trending legs ≈ 0). So it
+  behaves like a with-trend dip buy. That split was found after the fact, so it is
+  H8's next pre-registered variant, not a rule.
+- The edge is small: +0.2R on a 1R target at ~61% wins; cluster t ≈ 1.7. One
+  bad week erases a month.
+- Silver Bullet, the best known of the 12, has the best average per trade, but
+  12 trades in 60 sessions is an anecdote (H9).
+- Judas swing (I2) looked good on its average and failed the rule: the second
+  half and the best-day-removed checks were negative. The rule did its job.
+- The source ideas assume 1-min triggers for several setups; all of this is
+  5-min.
+
+**Not done (on purpose):** no live wiring, no replay bot, no threshold sweep. A
+bot for either setup is its own `[ALGO]` PR with the user's approval.
+
+**Next session, start here:** after ~20 new sessions (late Nov 2026) run
+`python -m stockanalyzer.setups.harness SNXX SNDQ NBIZ NBIS --days 20` on only the
+sessions after 2026-10-23. That is the first true out-of-sample read for H8/H9.

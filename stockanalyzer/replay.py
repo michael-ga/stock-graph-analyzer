@@ -24,7 +24,8 @@ from pathlib import Path
 import pandas as pd
 
 from stockanalyzer import virtualbook
-from stockanalyzer.analysis import asof, orb, reversal
+from stockanalyzer.analysis import asof
+from stockanalyzer.setups import orb, reversal
 from stockanalyzer.analysis.daycard import DayCard, build_day_card
 from stockanalyzer.data.schema import Timeframe, validate_ohlcv
 from stockanalyzer.explain import snapshot

@@ -4,7 +4,9 @@ Compares the working tree (the change) against the merge-base with a base branch
 in three layers, so it catches changes that never edit an "algorithm" file:
 
 1. **Static** — which changed files/functions sit on the decision path:
-   core decision code, its inputs, bot execution, or the simulators.
+   core decision code (incl. the live setups), its inputs, bot execution, or the
+   simulators; backtest-only setups are listed but never block. A moved file is
+   compared with its old path.
 2. **Behavioral** — ``scripts/algo_probe.py`` runs the real decision stack on
    frozen in-repo data for BOTH trees; any different plan, bot verdict or
    backtest outcome is an algorithm change, whatever file caused it.
@@ -36,13 +38,19 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 # What counts as "the algorithm".
 # --------------------------------------------------------------------------- #
+# The intraday setups the live bots run. The rest of setups/ is backtest-only until
+# a bot calls it, and wiring one in edits app.py / radar_worker.py / replay.py,
+# which this gate flags anyway. Add a setup (and any setups/ helper a live setup
+# imports) here in the PR that wires it.
+LIVE_SETUPS = ("stockanalyzer/setups/orb.py", "stockanalyzer/setups/reversal.py")
 CORE = ("stockanalyzer/analysis/", "stockanalyzer/explain/", "stockanalyzer/verdict/",
-        "stockanalyzer/sentiment/", "stockanalyzer/strategy.py")
+        "stockanalyzer/sentiment/", "stockanalyzer/strategy.py", *LIVE_SETUPS)
 INPUTS = ("stockanalyzer/data/", "stockanalyzer/pipeline.py", "stockanalyzer/session.py")
 EXECUTION = ("app.py", "stockanalyzer/radar_worker.py", "stockanalyzer/virtualbook.py",
              "stockanalyzer/papertrade.py", "stockanalyzer/swingwatch.py",
              "stockanalyzer/manage.py", "stockanalyzer/db/repositories/swingwatch.py")
 SIMULATORS = ("stockanalyzer/replay.py", "backtest.py", "daytrade_backtest.py")
+BACKTEST = ("stockanalyzer/setups/",)       # listed in the report, never blocks
 
 # Functions pinned by tests/test_bot_execution_restore.py plus the other entry
 # points that open, manage or mark positions.
@@ -73,7 +81,7 @@ def git(*args: str, cwd: Path | None = None) -> str:
 
 def _area(path: str) -> str | None:
     for name, prefixes in (("core", CORE), ("inputs", INPUTS), ("execution", EXECUTION),
-                           ("simulator", SIMULATORS)):
+                           ("simulator", SIMULATORS), ("backtest", BACKTEST)):
         if any(path == p or path.startswith(p) for p in prefixes):
             return name
     return None
@@ -104,18 +112,35 @@ def _defs(source: str | None) -> dict[str, tuple[str, str]]:
     return out
 
 
+def _changed(root: Path, merge_base: str) -> dict[str, str]:
+    """Changed path -> its path at the merge-base. A moved file keeps its old path,
+    so it is compared with what it was, not reported as all-new code."""
+    out = {}
+    for line in git("diff", "--name-status", "-M", merge_base, cwd=root).splitlines():
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[0][:1] in ("R", "C"):
+            out[parts[2]] = parts[1]
+        elif len(parts) >= 2:
+            out[parts[1]] = parts[1]
+    return out
+
+
 def static_scan(root: Path, merge_base: str) -> list[dict]:
-    changed = [p for p in git("diff", "--name-only", merge_base, cwd=root).splitlines() if p]
+    changed = _changed(root, merge_base)
     untracked = git("ls-files", "--others", "--exclude-standard", cwd=root).splitlines()
+    changed.update({p: p for p in untracked if p.endswith(".py")})
     findings = []
-    for path in sorted(set(changed) | {p for p in untracked if p.endswith(".py")}):
-        area = _area(path)
+    for path in sorted(changed):
+        was = changed[path]
+        area = _area(path) or _area(was)
         if area is None:
             continue
         item = {"path": path, "area": area, "functions": [], "sensitive": []}
+        if was != path:
+            item["moved_from"] = was
         if path.endswith(".py"):
             try:
-                old = git("show", f"{merge_base}:{path}", cwd=root)
+                old = git("show", f"{merge_base}:{was}", cwd=root)
             except subprocess.CalledProcessError:
                 old = None
             new_file = root / path
@@ -267,7 +292,8 @@ def render(ctx: dict) -> str:
     for f in ctx["static"]:
         flag = " ⚠️ **sensitive: " + ", ".join(f["sensitive"]) + "**" if f["sensitive"] else ""
         fns = ", ".join(f["functions"]) or "(no top-level code change)"
-        L.append(f"- `{f['path']}` [{f['area']}]: {fns}{flag}")
+        moved = f" (moved from `{f['moved_from']}`)" if f.get("moved_from") else ""
+        L.append(f"- `{f['path']}`{moved} [{f['area']}]: {fns}{flag}")
     L.append("")
 
     cmp_ = ctx["compare"]

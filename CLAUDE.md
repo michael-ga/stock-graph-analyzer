@@ -4,6 +4,8 @@ Personal technical-analysis app (Python / Streamlit). Entry point `app.py`;
 engine in `stockanalyzer/` (`analysis/`, `explain/swing.py`, `verdict/`); virtual
 paper-trading book + all persistence in `stockanalyzer/data/store.py` (SQLite
 `trades.db`). Indicators are hand-rolled in `stockanalyzer/analysis/indicators.py`.
+Intraday setups live one per file in `stockanalyzer/setups/`; to add one from an
+idea, use the `setup-lab` skill (`.claude/skills/setup-lab/SKILL.md`).
 
 ## Before changing the trading algorithm — READ `algolab/LEARNINGS.md`
 

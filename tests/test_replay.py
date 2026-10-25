@@ -14,7 +14,8 @@ import pandas as pd
 import pytest
 
 from stockanalyzer import replay
-from stockanalyzer.analysis import asof, orb, reversal
+from stockanalyzer.analysis import asof
+from stockanalyzer.setups import orb, reversal
 from stockanalyzer.data.schema import Timeframe
 
 # Six weekday sessions; 2026-06-18 (Thu) is the one we replay. There is history
