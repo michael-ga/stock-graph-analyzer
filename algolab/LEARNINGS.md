@@ -413,11 +413,15 @@ replay shows for that day with all three bot toggles on and the day revealed —
 
 ---
 
-### 2026-10-25 — `setups/` package, setup-lab skill, 12-idea screen on SNXX/SNDQ/NBIZ/NBIC (no algorithm change)
+### 2026-10-25 — `setups/` package, setup-lab skill, 12-idea screen on SNXX/SNDQ/NBIZ/NBIC (algorithm change: two setups added)
 
-**No live bot changed.** `orb.py` and `reversal.py` moved verbatim from
-`analysis/` to `stockanalyzer/setups/` (only their relative imports changed);
-callers import from the new path. The two new setups are backtest-only.
+**Algorithm change: two setups added** (`silver_bullet`, `double_bottom`). Since
+2026-10-31 adding or removing a setup counts as an algorithm change even before a
+bot trades it, because the net result depends on which setups exist (`CLAUDE.md`,
+the `algo-gate` setup inventory). **No bot trades them yet**, and every existing
+bot decides as before: the gate's behavioral probe shows 0 changes. `orb.py` and
+`reversal.py` moved verbatim from `analysis/` to `stockanalyzer/setups/` (only
+their relative imports changed); callers import from the new path.
 
 **What changed (code):**
 1. `stockanalyzer/setups/`: one file per setup. `orb.py`, `reversal.py` (moved);

@@ -6,7 +6,10 @@ description: Gate a change or PR against trading-algorithm regressions. Runs eve
 # algo-gate — algorithm-regression gate
 
 The trading algorithm is the swing plan and score, the Gap-and-Go, reversal and
-swing bots, and how and when they execute. A regression can come from a file
+swing bots, how and when they execute, and **the set of setups**. The book's net
+result depends on which setups exist, so adding, removing or renaming a setup in
+`stockanalyzer/setups/` (or one of its variants) is an algorithm change, even
+before any bot trades it. A regression can come from a file
 that never looks like "algorithm" code, as with the `74d23d0` incident in
 `docs/bot-execution-rollback.md`. This gate therefore compares **behavior**, not
 just paths.
@@ -28,13 +31,18 @@ From the repo root (or a worktree), with the project venv:
 
 It does three things:
 1. **Static scan.** Changed files and top-level functions are classified as one of:
-   - `core`: `analysis/`, `explain/`, `verdict/`, `sentiment/`, `strategy.py`, and the setups the live bots run (`setups/orb.py`, `setups/reversal.py`; `LIVE_SETUPS` in the script).
+   - `core`: `analysis/`, `explain/`, `verdict/`, `sentiment/`, `strategy.py`, and all of `setups/` (every setup, whether a bot trades it or not, plus `base.py` and the `SETUPS` registry).
    - `inputs`: `data/`, `pipeline.py`, `session.py`.
    - `execution`: `app.py`, `radar_worker.py`, `virtualbook.py` and others. Changes to bot entry points, trade-placing calls or cadence constants are flagged **sensitive**.
-   - `simulator`: `replay.py`, `backtest.py`, `daytrade_backtest.py`.
-   - `backtest`: the rest of `setups/` (backtest-only setups, the harness). Listed, never blocks: wiring one into a bot edits `execution`/`simulator` code, which is flagged. Add it to `LIVE_SETUPS` in that PR.
+   - `simulator`: `replay.py`, `backtest.py`, `daytrade_backtest.py`, `setups/harness.py`.
 
    A moved file is compared with its old path, so a pure move shows no change and an edit inside a move still shows.
+
+   **Setup inventory.** The gate lists every setup (module in `setups/`, or the old
+   `analysis/orb.py` / `analysis/reversal.py`) and its variants (`*VARIANTS` rows)
+   on both sides. Any setup or variant added, removed or renamed is reported by name
+   under "Setups added or removed" and **blocks** on its own. Moving a setup is not a
+   change.
 2. **Behavioral probe** (`scripts/algo_probe.py`). This runs on a temporary checkout of the base and on the change, using frozen in-repo data:
    - Swing plans and swing-bot rules: 20 tickers × 5 points × 2 paces.
    - Every replay bar, covering Gap-and-Go, the reversal variants and the swing bots.

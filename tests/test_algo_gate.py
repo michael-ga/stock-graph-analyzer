@@ -17,10 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_paths_are_classified_by_their_role_in_a_decision():
     assert gate._area("stockanalyzer/explain/swing.py") == "core"
     assert gate._area("stockanalyzer/analysis/orb.py") == "core"
-    assert gate._area("stockanalyzer/setups/orb.py") == "core"          # live setups
-    assert gate._area("stockanalyzer/setups/reversal.py") == "core"
-    assert gate._area("stockanalyzer/setups/double_bottom.py") == "backtest"
-    assert gate._area("stockanalyzer/setups/harness.py") == "backtest"
+    assert gate._area("stockanalyzer/setups/orb.py") == "core"          # every setup,
+    assert gate._area("stockanalyzer/setups/double_bottom.py") == "core"  # traded or not
+    assert gate._area("stockanalyzer/setups/base.py") == "core"
+    assert gate._area("stockanalyzer/setups/harness.py") == "simulator"
     assert gate._area("stockanalyzer/pipeline.py") == "inputs"
     assert gate._area("stockanalyzer/data/providers.py") == "inputs"
     assert gate._area("app.py") == "execution"
@@ -67,6 +67,44 @@ def test_a_moved_decision_file_is_compared_with_its_old_path(tmp_path):
     items = {i["path"]: i for i in gate.static_scan(root, base)}          # delete + add
     assert "signal (removed)" in items["stockanalyzer/analysis/orb.py"]["functions"]
     assert "signal (added)" in items["stockanalyzer/setups/orb.py"]["functions"]
+
+
+_REVERSAL = ('REVERSAL_VARIANTS: list[C] = [\n    C("rev-trend-touch", "with_trend", "touch"),\n'
+             '    C("rev-strong-touch", "strong_support", "touch"),\n]\n')
+
+
+def test_variants_are_read_from_every_variants_list():
+    assert gate._variants(_REVERSAL) == ["rev-strong-touch", "rev-trend-touch"]
+    assert gate._variants('VARIANTS = [Cfg("sb-am-bias")]\n') == ["sb-am-bias"]
+    assert gate._variants("GAP_MIN_PCT = 0.02\n") == []                 # orb: no variants
+
+
+def test_adding_or_removing_a_setup_or_variant_is_reported_but_a_move_is_not():
+    base = gate.setup_inventory({"stockanalyzer/analysis/orb.py": "X = 1\n",
+                                 "stockanalyzer/analysis/reversal.py": _REVERSAL})
+    moved = gate.setup_inventory({"stockanalyzer/setups/orb.py": "X = 1\n",
+                                  "stockanalyzer/setups/reversal.py": _REVERSAL,
+                                  "stockanalyzer/setups/base.py": "MIN_RR = 1.0\n",
+                                  "stockanalyzer/setups/harness.py": "",
+                                  "stockanalyzer/setups/__init__.py": ""})
+    assert gate.inventory_diff(base, moved) == []                      # support files aren't setups
+
+    grown = {**moved, "silver_bullet": ["sb-am-bias"], "reversal": ["rev-trend-touch"]}
+    assert gate.inventory_diff(base, grown) == [
+        "setup added: `silver_bullet` (variants: sb-am-bias)",
+        "`reversal` variants removed: rev-strong-touch"]
+    assert gate.inventory_diff(base, {"reversal": base["reversal"]}) == ["setup removed: `orb`"]
+
+
+def test_setup_changes_compares_the_merge_base_with_the_working_tree(tmp_path):
+    root, base = _repo(tmp_path)
+    (root / "stockanalyzer" / "setups").mkdir(parents=True)
+    gate.git("mv", "stockanalyzer/analysis/orb.py", "stockanalyzer/setups/orb.py", cwd=root)
+    assert gate.setup_changes(root, base) == []                        # a move adds nothing
+    (root / "stockanalyzer" / "setups" / "double_bottom.py").write_text(
+        'VARIANTS = [Cfg("xfade-dbl-bottom")]\n', encoding="utf-8")     # untracked new file
+    assert gate.setup_changes(root, base) == [
+        "setup added: `double_bottom` (variants: xfade-dbl-bottom)"]
 
 
 def test_defs_see_function_and_constant_changes_but_not_formatting():

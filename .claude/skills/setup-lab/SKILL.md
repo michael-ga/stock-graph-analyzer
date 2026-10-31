@@ -108,12 +108,15 @@ that doesn't beat it has no timing edge, whatever its average says.
   is too small (< ~30 days) to conclude anything.
 - Add a dated `algolab/LEARNINGS.md` entry: the spec, the numbers, the verdict,
   and an Open-hypotheses row with its keep/kill rule.
-- **Never** wire a setup into the live bots (`app.py`, `radar_worker.py`,
-  `replay.py`) in the same change. That changes bot decisions, so it is its own
-  `[ALGO]` PR with the user's explicit approval. In that PR add the module to
-  `LIVE_SETUPS` in `scripts/algo_gate.py`, so the gate treats it as core decision
-  code from then on, and run the `algo-gate` skill.
-- A PR that only adds a backtest-only setup should get `PASS` from the gate: the
-  file shows under `backtest` and no bot decision changes.
+- **Adding, removing or renaming a setup or a variant is an algorithm change**,
+  even when no bot trades it yet: the book's net result depends on which setups
+  exist. The PR is `[ALGO]` with the `## ⚠️ ALGORITHM CHANGE` section from
+  `CLAUDE.md`, and the `algo-gate` skill will report `BLOCKED` with the setup
+  named under "Setups added or removed". Run confirmed mode only after the user
+  confirms the change is meant to alter the algorithm. Never merge without their
+  approval of that PR.
+- Wiring a setup into the live bots (`app.py`, `radar_worker.py`, `replay.py`) is a
+  further step with its own `[ALGO]` PR: it changes which trades are taken, not
+  just which setups exist.
 - Run the full `pytest` before declaring done; compare failures with the base
   branch rather than assuming they are yours or not.

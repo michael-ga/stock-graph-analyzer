@@ -35,8 +35,11 @@ kill a setup on a single session's data — see the guardrails in `LEARNINGS.md`
 A change affects the algorithm if it can change any bot decision, **directly or
 indirectly**: the swing plan or score, any bot's gates or thresholds, Gap-and-Go,
 reversal or swing-bot rules, when or how bots execute, or any *input* those read
-(prices, quotes, `prev_close`, sessions, the data feed, `pipeline.py`). When in
-doubt, run the `algo-gate` skill; a `BLOCKED` verdict means it affects the algorithm.
+(prices, quotes, `prev_close`, sessions, the data feed, `pipeline.py`). **Adding,
+removing or renaming a setup** in `stockanalyzer/setups/` (or one of its variants)
+is an algorithm change too, even before a bot trades it: the net result depends on
+which setups exist. When in doubt, run the `algo-gate` skill; a `BLOCKED` verdict
+means it affects the algorithm.
 
 Every such PR, whoever opens it:
 

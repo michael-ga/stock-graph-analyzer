@@ -4,9 +4,9 @@ Compares the working tree (the change) against the merge-base with a base branch
 in three layers, so it catches changes that never edit an "algorithm" file:
 
 1. **Static** — which changed files/functions sit on the decision path:
-   core decision code (incl. the live setups), its inputs, bot execution, or the
-   simulators; backtest-only setups are listed but never block. A moved file is
-   compared with its old path.
+   core decision code (incl. every setup in ``setups/``), its inputs, bot
+   execution, or the simulators. A moved file is compared with its old path. Any
+   setup or variant added, removed or renamed is an algorithm change by itself.
 2. **Behavioral** — ``scripts/algo_probe.py`` runs the real decision stack on
    frozen in-repo data for BOTH trees; any different plan, bot verdict or
    backtest outcome is an algorithm change, whatever file caused it.
@@ -38,19 +38,21 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 # What counts as "the algorithm".
 # --------------------------------------------------------------------------- #
-# The intraday setups the live bots run. The rest of setups/ is backtest-only until
-# a bot calls it, and wiring one in edits app.py / radar_worker.py / replay.py,
-# which this gate flags anyway. Add a setup (and any setups/ helper a live setup
-# imports) here in the PR that wires it.
-LIVE_SETUPS = ("stockanalyzer/setups/orb.py", "stockanalyzer/setups/reversal.py")
+# Every setup is part of the algorithm. The book's net result depends on which
+# setups exist, so adding, removing or renaming a setup or one of its variants is
+# an algorithm change, even before a bot trades it (user policy, 2026-10-31). All
+# of setups/ is core decision code; only its backtest harness is a simulator.
+SETUPS_DIR = "stockanalyzer/setups/"
+SETUP_SUPPORT = {"__init__.py", "base.py", "harness.py"}       # in setups/, not setups
+LEGACY_SETUPS = ("stockanalyzer/analysis/orb.py", "stockanalyzer/analysis/reversal.py")
 CORE = ("stockanalyzer/analysis/", "stockanalyzer/explain/", "stockanalyzer/verdict/",
-        "stockanalyzer/sentiment/", "stockanalyzer/strategy.py", *LIVE_SETUPS)
+        "stockanalyzer/sentiment/", "stockanalyzer/strategy.py", SETUPS_DIR)
 INPUTS = ("stockanalyzer/data/", "stockanalyzer/pipeline.py", "stockanalyzer/session.py")
 EXECUTION = ("app.py", "stockanalyzer/radar_worker.py", "stockanalyzer/virtualbook.py",
              "stockanalyzer/papertrade.py", "stockanalyzer/swingwatch.py",
              "stockanalyzer/manage.py", "stockanalyzer/db/repositories/swingwatch.py")
-SIMULATORS = ("stockanalyzer/replay.py", "backtest.py", "daytrade_backtest.py")
-BACKTEST = ("stockanalyzer/setups/",)       # listed in the report, never blocks
+SIMULATORS = ("stockanalyzer/replay.py", "backtest.py", "daytrade_backtest.py",
+              "stockanalyzer/setups/harness.py")
 
 # Functions pinned by tests/test_bot_execution_restore.py plus the other entry
 # points that open, manage or mark positions.
@@ -80,11 +82,80 @@ def git(*args: str, cwd: Path | None = None) -> str:
 
 
 def _area(path: str) -> str | None:
+    if path in SIMULATORS:              # exact files first: the harness sits in setups/
+        return "simulator"
     for name, prefixes in (("core", CORE), ("inputs", INPUTS), ("execution", EXECUTION),
-                           ("simulator", SIMULATORS), ("backtest", BACKTEST)):
+                           ("simulator", SIMULATORS)):
         if any(path == p or path.startswith(p) for p in prefixes):
             return name
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Setup inventory — which setups and variants exist on each side.
+# --------------------------------------------------------------------------- #
+def _is_setup(path: str) -> bool:
+    if path in LEGACY_SETUPS:
+        return True
+    rest = path[len(SETUPS_DIR):] if path.startswith(SETUPS_DIR) else None
+    return bool(rest and rest.endswith(".py") and "/" not in rest
+                and rest not in SETUP_SUPPORT)
+
+
+def _variants(source: str) -> list[str]:
+    """Variant names a setup module declares: the first string of each row in any
+    top-level ``*VARIANTS`` list (``ReversalConfig("rev-trend-touch", ...)``)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ["<unparseable>"]
+    names = []
+    for node in tree.body:
+        targets = (node.targets if isinstance(node, ast.Assign)
+                   else [node.target] if isinstance(node, ast.AnnAssign) else [])
+        if not any(isinstance(t, ast.Name) and t.id.endswith("VARIANTS") for t in targets):
+            continue
+        for row in getattr(node.value, "elts", []):
+            first = row.args[0] if isinstance(row, ast.Call) and row.args else None
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                names.append(first.value)
+    return sorted(names)
+
+
+def setup_inventory(files: dict[str, str]) -> dict[str, list[str]]:
+    """{setup name: [variant names]} from {path: source}. A setup is keyed by its
+    module name, so moving it (analysis/orb.py -> setups/orb.py) is not a change."""
+    return {Path(p).stem: _variants(src) for p, src in files.items() if _is_setup(p)}
+
+
+def inventory_diff(base: dict[str, list[str]], change: dict[str, list[str]]) -> list[str]:
+    """Plain-English lines for every setup or variant added or removed."""
+    out = []
+    for name in sorted(set(change) - set(base)):
+        rows = f" (variants: {', '.join(change[name])})" if change[name] else ""
+        out.append(f"setup added: `{name}`{rows}")
+    for name in sorted(set(base) - set(change)):
+        out.append(f"setup removed: `{name}`")
+    for name in sorted(set(base) & set(change)):
+        added = sorted(set(change[name]) - set(base[name]))
+        gone = sorted(set(base[name]) - set(change[name]))
+        if added:
+            out.append(f"`{name}` variants added: {', '.join(added)}")
+        if gone:
+            out.append(f"`{name}` variants removed: {', '.join(gone)}")
+    return out
+
+
+def setup_changes(root: Path, merge_base: str) -> list[str]:
+    """Compare the setup inventory at the merge-base with the working tree."""
+    base_paths = git("ls-tree", "-r", "--name-only", merge_base, cwd=root).splitlines()
+    base = setup_inventory({p: git("show", f"{merge_base}:{p}", cwd=root)
+                            for p in base_paths if _is_setup(p)})
+    now_paths = set(git("ls-files", cwd=root).splitlines()) | set(
+        git("ls-files", "--others", "--exclude-standard", cwd=root).splitlines())
+    change = setup_inventory({p: (root / p).read_text(encoding="utf-8")
+                              for p in now_paths if _is_setup(p) and (root / p).exists()})
+    return inventory_diff(base, change)
 
 
 # --------------------------------------------------------------------------- #
@@ -295,6 +366,9 @@ def render(ctx: dict) -> str:
         moved = f" (moved from `{f['moved_from']}`)" if f.get("moved_from") else ""
         L.append(f"- `{f['path']}`{moved} [{f['area']}]: {fns}{flag}")
     L.append("")
+    L += ["### Setups added or removed", ""]
+    L += _bullets(ctx.get("setups") or []) or ["None: the same setups and variants on both sides."]
+    L.append("")
 
     cmp_ = ctx["compare"]
     L += ["## 2. Behavioral: base vs change on frozen data", "",
@@ -388,9 +462,13 @@ def main() -> int:
             sec["changed"] for sec in cmp_["sections"].values())
         direct = [f for f in static if f["area"] in ("core", "inputs") and f["functions"]]
         sensitive = [f for f in static if f["sensitive"]]
-        algo_change = behavior_changed or bool(direct) or bool(sensitive)
+        setups = setup_changes(root, merge_base)
+        algo_change = behavior_changed or bool(direct) or bool(sensitive) or bool(setups)
 
         reasons: list[str] = []
+        if setups:
+            reasons.append("The set of setups changed (adding, removing or renaming a setup "
+                           "or variant is an algorithm change): " + "; ".join(setups) + ".")
         if direct:
             reasons.append("Direct edits to decision code or its inputs: "
                            + ", ".join(f"`{f['path']}`" for f in direct) + ".")
@@ -404,7 +482,7 @@ def main() -> int:
 
         ctx = {"base": base, "merge_base": merge_base, "branch": git("branch", "--show-current", cwd=root)
                or "detached", "confirmed": args.confirmed_algo_change, "static": static,
-               "compare": cmp_, "reasons": reasons}
+               "compare": cmp_, "reasons": reasons, "setups": setups}
 
         new_fail: list[str] = []
         if args.full_suite or args.confirmed_algo_change:
