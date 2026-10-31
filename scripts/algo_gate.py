@@ -408,6 +408,10 @@ def render(ctx: dict) -> str:
             L.append(f"- Already failing on base (ignored): {', '.join(f'`{t}`' for t in pre)}")
         L.append("")
 
+    if ctx.get("history"):
+        body = ctx["history"]["report"].replace("\n## ", "\n#### ").replace("# Replay A/B:", "Verdict:", 1)
+        L += ["## 4. Real-history A/B: non-swing bots and setups", "", body, ""]
+
     L += ["## Not covered", "",
           "- Network backtests (`daytrade_backtest.py`, `backtest.py` live fetch): their "
           "offline equivalents above run on frozen data, so base and change see identical inputs.",
@@ -416,6 +420,27 @@ def render(ctx: dict) -> str:
           "- Sample size: ~200 frozen points. A metric move is a signal to review, not proof "
           "(see the statistical discipline in `CLAUDE.md`)."]
     return "\n".join(L) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# Layer 4 — real-history A/B (non-swing bots + every setup).
+# --------------------------------------------------------------------------- #
+def run_history(root: Path, merge_base: str, mode: str, scratch: Path) -> dict:
+    """Run ``algo_replay_ab.py`` (base = merge-base, change = this working tree)."""
+    out = scratch / "history.json"
+    script = Path(__file__).resolve().with_name("algo_replay_ab.py")
+    proc = subprocess.run([sys.executable, str(script), "--base", merge_base, "--mode", mode,
+                           "--json", str(out)], cwd=root, capture_output=True, text=True,
+                          encoding="utf-8")
+    if proc.returncode == 2 or not out.exists():
+        raise RuntimeError(f"real-history A/B could not run:\n{proc.stderr[-2000:]}")
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def history_moves(history: dict) -> list[str]:
+    """Bots/setups that exist on the base and whose real-history trades changed."""
+    base_bots = (history.get("bots") or [{}])[0]
+    return sorted(b for b in history.get("changed_bots") or [] if b in base_bots)
 
 
 # --------------------------------------------------------------------------- #
@@ -431,7 +456,11 @@ def main() -> int:
                          "--confirmed-algo-change; does NOT confirm anything)")
     ap.add_argument("--report", help="also write the markdown report here")
     ap.add_argument("--keep-json", help="directory to keep both probe JSON files")
+    ap.add_argument("--history", choices=("fast", "full"),
+                    help="also replay real history for the non-swing bots and every setup "
+                         "(scripts/algo_replay_ab.py); confirmed mode runs `fast` by default")
     args = ap.parse_args()
+    history_mode = args.history or ("fast" if args.confirmed_algo_change else None)
 
     root = Path(git("rev-parse", "--show-toplevel")).resolve()
     base = args.base
@@ -480,9 +509,19 @@ def main() -> int:
             reasons.append(f"Behavior differs from base on frozen data ({n} outputs changed"
                            + (", probe errors" if cmp_["errors"] else "") + ").")
 
+        history = None
+        if history_mode:
+            print(f"[algo-gate] real-history A/B ({history_mode}) …", file=sys.stderr)
+            history = run_history(root, merge_base, history_mode, scratch)
+            moved = history_moves(history)
+            if moved:
+                algo_change = True
+                reasons.append("Real-history trades differ for existing bots/setups: "
+                               + ", ".join(f"`{b}`" for b in moved) + ".")
+
         ctx = {"base": base, "merge_base": merge_base, "branch": git("branch", "--show-current", cwd=root)
                or "detached", "confirmed": args.confirmed_algo_change, "static": static,
-               "compare": cmp_, "reasons": reasons, "setups": setups}
+               "compare": cmp_, "reasons": reasons, "setups": setups, "history": history}
 
         new_fail: list[str] = []
         if args.full_suite or args.confirmed_algo_change:
@@ -520,6 +559,9 @@ def main() -> int:
                 problems.append("No dated `algolab/LEARNINGS.md` entry (required by CLAUDE.md).")
             if cmp_["errors"]:
                 problems.append("The probe errored on one side; behavior could not be compared.")
+            if history and history["regressions"]:
+                problems.append("Real-history regression (net R + win % rule): "
+                                + "; ".join(history["regressions"]) + ".")
             if problems:
                 ctx["verdict"] = "FAIL: confirmed algorithm change regresses"
                 reasons.extend(problems)
@@ -530,7 +572,9 @@ def main() -> int:
             else:
                 ctx["verdict"] = "PASS: confirmed algorithm change, no regression"
                 reasons.append("All tests pass (no new failures vs base), no backtest headline "
-                               "metric got worse, and LEARNINGS.md is updated.")
+                               "metric got worse"
+                               + (", the real-history A/B shows no regression" if history else "")
+                               + ", and LEARNINGS.md is updated.")
 
         report = render(ctx)
         sys.stdout.buffer.write(report.encode("utf-8"))
