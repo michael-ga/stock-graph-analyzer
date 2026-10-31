@@ -542,11 +542,12 @@ def _buy_form(sess, bar, rows) -> None:
 
     if st.button(f"📒 Buy at {bar.clock}", type="primary", use_container_width=True,
                  disabled=not (entry > stop and target > entry)):
-        virtualbook.open_position(
-            ticker=sess.ticker, trader="me", entry=entry, stop=stop, target=target,
-            kind="immediate", horizon_days=1, stake=amount, init_stop=stop,
-            snapshot={**bar.snapshot, "manual_levels": True, "replay_source": src},
-            now=bar.epoch, path=ss.rp_db)
+        with replay.book(ss.rp_db) as owner:
+            virtualbook.open_position(
+                ticker=sess.ticker, trader="me", entry=entry, stop=stop, target=target,
+                kind="immediate", horizon_days=1, stake=amount, init_stop=stop,
+                snapshot={**bar.snapshot, "manual_levels": True, "replay_source": src},
+                now=bar.epoch, user_id=owner)
         st.toast(f"Bought {sess.ticker} at {bar.clock} — ${entry:.2f}", icon="📒")
         st.rerun(scope="fragment")
 
@@ -571,8 +572,9 @@ def _position_card(sess, bar, row) -> None:
                      f"opened {_bar_clock(sess, row)}")
         if row["trader"] == "me" and act.button(
                 "Close", key=f"rp_close_{row['id']}", use_container_width=True):
-            virtualbook.close_position(row["id"], bar.close, reason="manual",
-                                       now=bar.epoch, path=ss.rp_db)
+            with replay.book(ss.rp_db) as owner:
+                virtualbook.close_position(row["id"], bar.close, reason="manual",
+                                           now=bar.epoch, user_id=owner)
             st.rerun(scope="fragment")
 
 
@@ -697,7 +699,7 @@ def _tape_body(sess, period: float, per_tick: int) -> None:
     reviewing = ss.rp_i < ss.rp_applied
 
     _transport(sess, bar)
-    rows = virtualbook.load(path=ss.rp_db)
+    rows = replay.load_book(ss.rp_db)
     rows = [r for r in rows if (r.get("ticker") or "").upper() == sess.ticker]
 
     left, right = st.columns([2.4, 1])
