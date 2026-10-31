@@ -93,4 +93,4 @@ jobs:
           alembic check
 
       - name: Pytest (PostgreSQL)
-        run: python -m pytest -q -rs tests/test_postgres_integration.py
+        run: python -m pytest -q -rs tests/test_postgres_integration.py tests/test_book_concurrency.py

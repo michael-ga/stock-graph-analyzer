@@ -11,8 +11,10 @@ freezes each bar's decision into an immutable ``ReplayBar``. Stepping, scrubbing
 and playback are then pure lookups, which is what makes the chart animate
 smoothly instead of stalling on ~120 ms of indicator math per frame.
 
-Trades go to a **separate** SQLite book (see ``replay_db_path``) so practice runs
-can never contaminate the real trade record the algorithm is judged on.
+Trades go to a **separate** sandbox book (see ``replay_db_path`` and
+``db/sandbox.py``) — the same repositories as the live book, bound to a throwaway
+SQLite file — so practice runs can never contaminate the real trade record the
+algorithm is judged on.
 
 No Streamlit import lives here on purpose — everything below is unit-testable.
 """
@@ -27,6 +29,7 @@ from stockanalyzer import virtualbook
 from stockanalyzer.analysis import asof, orb, reversal
 from stockanalyzer.analysis.daycard import DayCard, build_day_card
 from stockanalyzer.data.schema import Timeframe, validate_ohlcv
+from stockanalyzer.db.sandbox import sandbox_book
 from stockanalyzer.explain import snapshot
 from stockanalyzer.explain.swing import build_swing_plan, is_extended
 from stockanalyzer.explain.usecase import UseCase
@@ -45,7 +48,7 @@ _MEANREV_CHECKS = ("Bollinger", "overextended", "No chase", "Buying low",
                    "Trend strength")
 
 # Bot identities. Deliberately the *same* trader names the live radar uses
-# (app.py) — isolation comes from the separate DB file, so identical names make a
+# (app.py) — isolation comes from the sandbox book, so identical names make a
 # replay scorecard directly comparable, row for row, with the live one.
 GAP_BOTS = (("bot-gap-fixed", False), ("bot-gap-mgd", True))
 
@@ -413,15 +416,12 @@ def precompute_day(i5, i30, daily, day, prev_close, ticker: str = "",
 
 
 # --------------------------------------------------------------------------- #
-# The replay book (an isolated sandbox — never the real trades.db).
+# The replay book (an isolated sandbox — never the real database).
 # --------------------------------------------------------------------------- #
 def replay_db_path(root: Path, ticker: str, day, attempt: int = 1) -> Path:
-    """Where one practice attempt is recorded.
-
-    The subdirectory is load-bearing, not cosmetic. ``store._ensure_schema`` seeds
-    a brand-new DB from ``<db_path>.parent/.virtualbook.json`` — so a replay book
-    at the project root would silently inherit the real trade history and wreck
-    the scorecard. Keeping it one level down means the migration finds no JSON.
+    """Where one practice attempt is recorded: one sandbox SQLite file per
+    ticker-day-attempt under ``<root>/.replay`` (git-ignored), kept as a practice
+    log. Open it with ``book(path)``; nothing here ever reaches ``DATABASE_URL``.
     """
     d = pd.Timestamp(day).strftime("%Y%m%d")
     folder = Path(root) / ".replay"
@@ -451,21 +451,34 @@ def next_attempt(root: Path, ticker: str, day) -> int:
     return n
 
 
+def book(db: Path):
+    """``with replay.book(db) as user_id:`` — bind ``virtualbook`` to the practice
+    book at ``db`` (see ``db/sandbox.py``) and get its owner id."""
+    return sandbox_book(db)
+
+
+def load_book(db: Path) -> list[dict]:
+    """Every row in the practice book at ``db`` (newest first)."""
+    with book(db) as owner:
+        return virtualbook.load(user_id=owner)
+
+
 def _open(trader: str, ticker: str, bar: ReplayBar, db: Path, *, entry: float,
           stop: float, target: float, snap: dict, kind: str = "immediate",
           trigger=None, horizon_days: int = 1, managed: bool = False,
           entry_rvol=None, stake: float | None = None) -> dict | None:
     """Open one position in the replay book, at the *bar's* clock. Returns the row
     (or None when this trader already holds the ticker)."""
-    if virtualbook.has_open(ticker, trader, path=db):
-        return None
-    kw = dict(ticker=ticker, trader=trader, entry=entry, stop=stop, target=target,
-              kind=kind, trigger=trigger, horizon_days=horizon_days,
-              managed=managed, entry_rvol=entry_rvol, init_stop=stop,
-              snapshot=snap, now=bar.epoch, path=db)
-    if stake is not None:
-        kw["stake"] = stake
-    return virtualbook.open_position(**kw)
+    with book(db) as owner:
+        if virtualbook.has_open(ticker, trader, user_id=owner):
+            return None
+        kw = dict(ticker=ticker, trader=trader, entry=entry, stop=stop, target=target,
+                  kind=kind, trigger=trigger, horizon_days=horizon_days,
+                  managed=managed, entry_rvol=entry_rvol, init_stop=stop,
+                  snapshot=snap, now=bar.epoch, user_id=owner)
+        if stake is not None:
+            kw["stake"] = stake
+        return virtualbook.open_position(**kw)
 
 
 def apply_bar(sess: ReplaySession, i: int, bots: dict, db: Path) -> list[dict]:
@@ -474,8 +487,8 @@ def apply_bar(sess: ReplaySession, i: int, bots: dict, db: Path) -> list[dict]:
     Order is not negotiable. ``manage`` runs before ``mark`` so a stop tightened on
     this bar can close on it (the live radar enforces the same). Marking walks
     low → high → close, which makes an ambiguous bar resolve stop-first — the
-    conservative reading, and it reuses the store's own fill logic rather than
-    inventing a second judge.
+    conservative reading, and it reuses the live book's own fill logic
+    (``TradeRepository.mark``) rather than inventing a second judge.
 
     Auto-placement happens *after* marking, so a position opened here is never
     judged against the bar it was opened on.
@@ -485,12 +498,13 @@ def apply_bar(sess: ReplaySession, i: int, bots: dict, db: Path) -> list[dict]:
     reports = {Timeframe.D1: bar.d1} if bar.d1 is not None else None
     events: list[dict] = []
 
-    virtualbook.manage(tk, bar.close, reports,
-                       bar.d1.trend_change if bar.d1 is not None else None,
-                       now=ts, path=db)
-    for px in (bar.low, bar.high, bar.close):
-        for changed in virtualbook.mark(tk, px, now=ts, path=db):
-            events.append({"bar": i, "t": bar.clock, "kind": "mark", "row": changed})
+    with book(db) as owner:
+        virtualbook.manage(tk, bar.close, reports,
+                           bar.d1.trend_change if bar.d1 is not None else None,
+                           now=ts, user_id=owner)
+        for px in (bar.low, bar.high, bar.close):
+            for changed in virtualbook.mark(tk, px, now=ts, user_id=owner):
+                events.append({"bar": i, "t": bar.clock, "kind": "mark", "row": changed})
 
     if bots.get("orb") and bar.bots.orb.fired:
         g = bar.bots.orb
@@ -533,12 +547,13 @@ def force_flat(sess: ReplaySession, db: Path, reason: str = "eod") -> list[dict]
         return []
     last = sess.bars[-1]
     closed = []
-    for row in virtualbook.load(path=db):
-        if row.get("status") in ("open", "pending"):
-            out = virtualbook.close_position(row["id"], last.close, reason=reason,
-                                             now=last.epoch, path=db)
-            if out:
-                closed.append(out)
+    with book(db) as owner:
+        for row in virtualbook.load(user_id=owner):
+            if row.get("status") in ("open", "pending"):
+                out = virtualbook.close_position(row["id"], last.close, reason=reason,
+                                                 now=last.epoch, user_id=owner)
+                if out:
+                    closed.append(out)
     return closed
 
 
@@ -561,7 +576,7 @@ def trade_r(row: dict) -> float | None:
 def excursions(sess: ReplaySession, row: dict, upto: int) -> tuple[float, float]:
     """(MFE%, MAE%) for one position, from the session bars it has been held.
 
-    The store only maintains ``mfe_pct``/``mae_pct`` for managed rows, so a manual
+    The book only maintains ``mfe_pct``/``mae_pct`` for managed rows, so a manual
     trade would otherwise read 0/0. Computed here instead — read-only, no schema
     change.
     """
@@ -583,14 +598,14 @@ def scorecard(sess: ReplaySession, db: Path) -> dict:
     the idea-level view answers "was the *algorithm* right" — four reversal
     variants taking one plan is one idea, not four (see CLAUDE.md).
     """
-    book = virtualbook.load(path=db)
-    rows = [r for r in book if (r.get("ticker") or "").upper() == sess.ticker.upper()]
-    return {
-        "book": rows,
-        # stats() with no argument reads the REAL trades.db — always pass the list.
-        "stats": virtualbook.stats(rows),
-        "ideas": virtualbook.algorithm_correctness(path=db),
-    }
+    with book(db) as owner:
+        rows = [r for r in virtualbook.load(user_id=owner)
+                if (r.get("ticker") or "").upper() == sess.ticker.upper()]
+        return {
+            "book": rows,
+            "stats": virtualbook.stats(rows),
+            "ideas": virtualbook.algorithm_correctness(user_id=owner),
+        }
 
 
 def missed_signals(sess: ReplaySession, db: Path) -> list[dict]:
@@ -599,7 +614,7 @@ def missed_signals(sess: ReplaySession, db: Path) -> list[dict]:
     This is the honest-evaluation half of the exercise: not "did I make money"
     but "what did standing aside cost me".
     """
-    taken = {float(r["entry"]) for r in virtualbook.load(path=db)
+    taken = {float(r["entry"]) for r in load_book(db)
              if r.get("trader") == "me" and r.get("entry")}
     out: list[dict] = []
     for i in sess.fired_bars:
