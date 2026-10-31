@@ -106,3 +106,40 @@ def test_postgres_concurrent_admin_disables_cannot_remove_all_admins(postgres_da
 
     assert sorted(outcomes) == [False, True]
     assert sum(bool(auth.session_user(user.id)) for user in (first, second)) == 1
+
+
+def test_postgres_virtual_book_lifecycle_and_analytics(postgres_database):
+    from stockanalyzer import papertrade, virtualbook as vb
+
+    owner = AuthService().create_user("book-pg-owner", "correct horse battery staple").id
+    snap = {"score": 72, "setup": "Pullback to 20-EMA",
+            "timeframes": {"6M": {"signals": [{"name": "MACD cross", "direction": "bear",
+                                               "strength": 0.5, "category": "momentum"}],
+                                  "indicators": {"rsi": 41.0}, "bias_score": 0.2}},
+            "checks": [{"name": "Engine bias agrees", "ok": False, "weight": 2}]}
+    for trader in ("bot-GO", "me"):                       # one idea, two bots
+        vb.open_position(ticker="NOK", trader=trader, entry=14.0, stop=13.3,
+                         target=14.8, snapshot=snap, now=1_000_000.0, user_id=owner)
+    changed = vb.mark("NOK", 13.2, now=1_000_100.0, user_id=owner)
+    assert {c["close_reason"] for c in changed} == {"stop_hit"}
+
+    managed = vb.open_position(ticker="AAA", trader="bot-gap-mgd", entry=100.0,
+                               stop=98.0, target=104.0, managed=True, init_stop=98.0,
+                               snapshot={"setup": "gap_and_go_orb"}, now=1_000_000.0,
+                               user_id=owner)
+    vb.manage("AAA", 102.0, now=1_000_100.0, friday_flat=False, user_id=owner)
+    assert {t["id"]: t for t in vb.load(user_id=owner)}[managed["id"]]["stop"] == 100.02
+
+    ideas = vb.algorithm_correctness(user_id=owner)["totals"]
+    assert ideas["n_ideas"] == 1 and ideas["n_trades"] == 2
+    patterns = vb.losing_trade_patterns(user_id=owner)
+    assert patterns["n"] == 2
+    assert patterns["failed_checks"] == {"Engine bias agrees": 2}
+    assert patterns["common_signals"] == {"MACD cross:bear": 2}
+    assert patterns["avg_indicators"]["avg_rsi"] == 41.0
+    assert vb.stats(user_id=owner)["traders"]["me"]["losses"] == 1
+
+    rec = {"ts": 1_000_000.0, "ticker": "NOK", "level": 70, "entry": 14.0,
+           "stop": 13.3, "target": 14.8}
+    assert papertrade.record(rec, user_id=owner) is True
+    assert papertrade.record(dict(rec), user_id=owner) is False

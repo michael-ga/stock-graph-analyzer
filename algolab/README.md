@@ -23,10 +23,12 @@ re-blaming a setup whose losses were really one bad market day.
   session log. This is the file to read and to append to.
 - **`analyze.py`** — the post-mortem. Run it to see the current state:
   ```
-  python algolab/analyze.py
+  DATABASE_URL=postgresql+psycopg://... python algolab/analyze.py [--user USERNAME]
+  # on the NUC:
+  docker compose exec app python algolab/analyze.py --user admin
   ```
-  It prints three views (see below). Point it at another DB with
-  `STOCKANALYZER_DB=/path/to/x.db`.
+  It prints the views below for **one owner's** book (`--user` is optional when
+  exactly one active user exists). Point it at another DB with `--database-url`.
 
 ## Two ways to read the book (this is the key idea)
 
@@ -35,15 +37,15 @@ The virtual book runs several bots over the **same** plan: `bot-GO` (strict GO),
 (manual). So one decision can become 3–4 rows — which *inflates the sample* and
 makes a single idea look like a winning (or losing) streak.
 
-- **Per-bot view** (`store.trade_stats`) answers *"which trading RULE earns its
+- **Per-bot view** (`virtualbook.stats` → `TradeRepository.stats`) answers *"which trading RULE earns its
   keep?"* — compare bot-GO vs bot-70 vs bot-BRK.
-- **Algorithm view** (`store.algorithm_correctness`) answers *"were the engine's
+- **Algorithm view** (`virtualbook.algorithm_correctness`) answers *"were the engine's
   CALLS right?"* It collapses every bot that took one plan into a single **idea**
   via `cohort_id`, so each decision counts once. **This is the honest sample** for
   judging setups and score bands.
 
 `cohort_id` = a stable hash of `(ticker, setup, kind, entry, stop, target, day)`,
-assigned in `store._cohort_id` at insert time. Same idea across bots → same
+assigned in `db/repositories/trades.py` `_cohort_id` at insert time. Same idea across bots → same
 cohort. Different day or different levels → different cohort.
 
 ## The development loop
@@ -69,7 +71,10 @@ cohort. Different day or different levels → different cohort.
 
 ## Where the data lives
 
-`trades.db` (SQLite, repo root). Schema and all analytics:
-`stockanalyzer/data/store.py`. Decision context for every trade (signals,
+PostgreSQL (the `db` service in `compose.yaml`), one book per user. Schema:
+`stockanalyzer/db/models.py` + Alembic migrations in `alembic/versions/`; all book
+analytics: `stockanalyzer/db/repositories/trades.py` (`TradeRepository`), wrapped by
+`stockanalyzer/virtualbook.py`. Decision context for every trade (signals,
 indicators incl. ADX/DMI/Bollinger, verdict, swing-checks, cohort) is stored at
-open time by `store.insert_trade`, so every closed trade can be re-examined.
+open time by `TradeRepository.insert`, so every closed trade can be re-examined.
+(The old SQLite `trades.db` is import-only now: `scripts/migrate_legacy_data.py`.)

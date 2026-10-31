@@ -33,14 +33,15 @@ import time
 import pandas as pd
 
 from stockanalyzer import replay
-from stockanalyzer.data import store
+from stockanalyzer.db import sandbox
 
 _PKG = Path(__file__).resolve().parent
 
 # The code that decides what a day's bots do. Editing any of it invalidates the
 # cache; presentation code (charting, ui) deliberately does not.
 _ENGINE_SOURCES = ("analysis", "explain", "verdict", "replay.py", "strategy.py",
-                   "virtualbook.py", "data/store.py")
+                   "virtualbook.py", "manage.py", "db/repositories/trades.py",
+                   "db/sandbox.py")
 
 ALL_BOTS = {key: True for key in replay.BOT_KEYS}
 
@@ -201,20 +202,20 @@ def summarize(sess: replay.ReplaySession, db: Path) -> DayResult:
 
 def scan_day(hist: dict, ticker: str, day) -> DayResult:
     """Precompute one day from a ``replay.load_history`` bundle and summarize it
-    on a throwaway book. Never touches ``trades.db`` or a practice book."""
+    on a throwaway sandbox book. Never touches the application database or a
+    practice book."""
     day = pd.Timestamp(day).normalize()
     if day not in set(replay.replayable_days(hist)):
         return DayResult(ticker, f"{day:%Y-%m-%d}",
                          error="no 5-minute data for this session")
     sess = replay.precompute_day(hist["i5"], hist["i30"], hist["daily"], day,
                                  hist["prev_close"].get(day), ticker=ticker)
-    # A bare temp dir: no .virtualbook.json beside the DB for the store to seed from.
     with tempfile.TemporaryDirectory(prefix="replay-scan-") as tmp:
         db = Path(tmp) / "scan.db"
         try:
             return summarize(sess, db)
         finally:
-            store.release(db)
+            sandbox.release(db)
 
 
 # --------------------------------------------------------------------------- #
