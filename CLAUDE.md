@@ -93,3 +93,5 @@ declaring a change done.
   runs upgrade → downgrade → upgrade → `alembic check` on PostgreSQL, so models
   and migrations must not drift.
 - Never add a SQLite-only code path; SQLite is for tests only.
+- Everything committed is in English: code, comments, docs, skills, commit
+  messages, PR titles/descriptions and GitHub comments.
