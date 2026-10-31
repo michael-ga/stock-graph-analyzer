@@ -13,7 +13,6 @@ import pandas as pd
 import pytest
 
 from stockanalyzer import replay, virtualbook
-from stockanalyzer import replay, virtualbook
 from stockanalyzer.db import session as db_session
 from stockanalyzer.setups import orb, reversal
 

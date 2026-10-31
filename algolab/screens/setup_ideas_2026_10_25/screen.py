@@ -331,7 +331,7 @@ def i9_extension_double_bottom(D):
     P1; a second low P2 within 0.25 of that drop; buy-stop at the neckline (high
     between); stop under the lower low; target 1R."""
     s = D.s
-    hi, lo, cl = s["high"].values, s["low"].values, s["close"].values
+    hi, lo = s["high"].values, s["low"].values
     for p1 in window(s, "09:50", "14:30"):
         if p1 < 24:
             base = med_range(s.iloc[:p1]) if p1 >= 6 else None
