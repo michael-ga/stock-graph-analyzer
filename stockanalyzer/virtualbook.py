@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 import uuid
 
-from .db.repositories.trades import TradeRepository, trade_stats
+from .db.repositories.trades import TradeRepository, _agg, trade_stats
 
 STAKE_USD = 1000.0
 
@@ -118,6 +118,88 @@ def stats(positions: list[dict] | None = None, *, user_id: str | None = None) ->
     if positions is not None:
         return trade_stats(positions)
     return _REPOSITORY.stats(_owner(user_id))
+
+
+# What each trader's rule is — shown beside its row so the report card reads on
+# its own. Unknown traders still get a row (labelled "?"), never dropped.
+TRADER_RULES = {
+    "me": "manual 📒 Virtual BUY",
+    "bot-GO": "swing plan, strict GO only",
+    "bot-70": "swing plan, score ≥70 immediate (not GO)",
+    "bot-BRK": "swing plan, armed breakout_wait orders",
+    "bot-gap-fixed": "Gap-and-Go ORB, fixed stop/target",
+    "bot-gap-mgd": "Gap-and-Go ORB, managed exit",
+    "rev-trend-touch": "reversal @ support, daily uptrend, first touch",
+    "rev-trend-confirm": "reversal @ support, daily uptrend, confirmed reclaim",
+    "rev-strong-touch": "reversal @ strong support, any trend, first touch",
+    "rev-strong-confirm": "reversal @ strong support, any trend, confirmed reclaim",
+}
+
+
+def _month(ts) -> str:
+    try:
+        return time.strftime("%Y-%m", time.localtime(float(ts)))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def unrealized_usd(position: dict, price: float | None) -> float | None:
+    """Mark-to-market $ of an OPEN position; None when unpriced or not open.
+
+    Pending (armed) orders hold no shares yet, so they carry no unrealized P&L."""
+    if position.get("status") != "open" or not price:
+        return None
+    return round((price - position["entry"]) * position["shares"], 2)
+
+
+def bot_report(positions: list[dict], prices: dict[str, float] | None = None) -> dict:
+    """Complete per-trader picture of the book — every trader, nothing truncated.
+
+    ``rows``: one per trader with closed results (cancelled excluded from
+    win/loss, counted separately), live open/armed counts, unrealized $ on
+    priced open positions and realized + unrealized total.
+    ``months``: realized $ per trader per close month (``YYYY-MM``).
+    ``unpriced``: open positions with no fresh price (their unrealized is
+    unknown, not zero)."""
+    prices = prices or {}
+    by_trader: dict[str, list[dict]] = {}
+    for p in positions:
+        by_trader.setdefault(p["trader"], []).append(p)
+
+    rows: list[dict] = []
+    months: dict[str, dict[str, float]] = {}
+    unpriced = 0
+    for trader, items in sorted(by_trader.items()):
+        closed = [p for p in items if p["status"] == "closed"
+                  and p.get("close_reason") != "cancelled"]
+        cancelled = sum(1 for p in items if p["status"] == "closed"
+                        and p.get("close_reason") == "cancelled")
+        live = [p for p in items if p["status"] == "open"]
+        armed = [p for p in items if p["status"] == "pending"]
+        unreal = 0.0
+        for p in live:
+            u = unrealized_usd(p, prices.get(p["ticker"]))
+            if u is None:
+                unpriced += 1
+            else:
+                unreal += u
+        agg = _agg(closed)
+        last = max((p.get("closed_ts") or 0 for p in closed), default=0)
+        rows.append(dict(
+            trader=trader, rule=TRADER_RULES.get(trader, "?"),
+            closed=agg["n"], wins=agg["wins"], losses=agg["losses"],
+            win_rate=agg["win_rate"], avg_pnl_pct=agg["avg_pnl_pct"],
+            realized_usd=agg["total_pnl_usd"],
+            open=len(live), armed=len(armed), cancelled=cancelled,
+            unrealized_usd=round(unreal, 2),
+            total_usd=round(agg["total_pnl_usd"] + unreal, 2),
+            last_close=_month(last) if last else None,
+        ))
+        for p in closed:
+            m = _month(p.get("closed_ts") or p.get("opened_ts"))
+            cell = months.setdefault(trader, {})
+            cell[m] = round(cell.get(m, 0.0) + p["pnl_usd"], 2)
+    return dict(rows=rows, months=months, unpriced=unpriced)
 
 
 def algorithm_correctness(*, user_id: str) -> dict:
