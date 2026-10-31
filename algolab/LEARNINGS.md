@@ -90,6 +90,7 @@ again without materially more data:**
 | H5 | **Active exit management beats a fixed stop/target** on identical Gap-and-Go entries. | None yet — instrumentation shipped 2026-06-21. | **Collecting.** Do NOT conclude until pairs accumulate. | `store.managed_vs_fixed()`: pair `bot-gap-mgd` vs `bot-gap-fixed` by `cohort_id`; positive mean Δ at n≥~30 pairs = management earns its place. |
 | H8 | **Extension-fade double bottom (`xfade-dbl-bottom`) has a small edge on 2x single-stock ETFs** — and it pays on whichever leg of the pair is trending up. | 2026-10-25: 60 sessions, 82 trades / 48 dates, +0.19R net, positive in both windows and both halves, beats a random-entry null (p=0.005). Cluster t vs zero 1.7: not significant. Leg split is post-hoc. | **Collecting** (backtest only, not a bot). | Re-run the harness on *new* sessions only. Keep if avg net R > 0 at ≥ 100 distinct dates and still > 0 without the best date; kill if ≤ 0 there. A daily-bias filter is a new variant, pre-registered before it's run. |
 | H9 | **ICT Silver Bullet, long mirror (`sb-am-bias`)** has an edge. | 2026-10-25: 12 trades in 60 sessions, +0.78R net, null p=0.045. n is an anecdote. | **Collecting** (backtest only). | Same keep/kill rule as H8 at ≥ 50 distinct dates. To accrue faster, add tickers, chosen before running. |
+| H10 | **Afternoon base breakout (`pm-base-brk-1r` / `pm-base-brk-2r`)**: after a ≥ 5% morning flush and a ≥ 90-minute base with higher lows, a close above the base high between 14:00 and 15:25 has an edge. | 2026-11-01, drawn from SNDQ 2026-10-07. Latest 40 sessions: 2 trades on SNXX/SNDQ/NBIZ/NBIS (−0.12R, null p 0.80) and 6 on 51 stocks (−0.22R, null p 0.87); holdouts 0 and 3 trades. **Fails the ≥ 8-trade rule: too rare to conclude, not disproved.** | **Collecting** (backtest only, not a bot). | Re-run on sessions after 2026-10-30 only, same tickers, rules unchanged. Keep at ≥ 30 distinct dates if avg net R > 0, null p < 0.10 and > 0 without the best date; kill if ≤ 0 there, or if still < 15 dates after 120 more sessions. At ~9 trades per 60 sessions that is about a year: a wider universe, chosen before running, is the only way to speed it up. |
 
 (H7 is reserved for the `rev-gapfill` proposal in `docs/plans/2026-10-21-sndk-snapshot-review.md`.)
 
@@ -540,3 +541,76 @@ replay now matches live instead of the retired SQLite path):
 signals / indicators / verdict / swing-checks, so view 3 (losing-trade patterns)
 covers imported history too. No baseline reset — no score, setup or exit rule
 was touched.
+
+---
+
+### 2026-11-01 — afternoon base breakout (`base_breakout`): backtest-only setup, fails the pass rule on n (algorithm change: one setup added)
+
+**Algorithm change: one setup added** (`stockanalyzer/setups/base_breakout.py`, variants
+`pm-base-brk-1r` and `pm-base-brk-2r`). Since 2026-10-31 that counts even though **no bot
+trades it**; every existing bot decides as before and nothing is wired into `app.py`,
+`radar_worker.py` or `replay.py`. **Gate:** `scripts/algo_gate.py --base origin/feat/setups-dir-idea-skill` → **BLOCKED** on the setup inventory alone ("setup added: `base_breakout` (variants: pm-base-brk-1r, pm-base-brk-2r)"). Behavioral layer: swing plans 200/200, `_BOTS` table 24/24, replay intraday bars 68/68, walk-forward backtest 200/200 — **0 changed, 0 decision flips**, backtest headline identical (32 traded, 75.0% WR). Confirmed mode not run: it needs the user's explicit confirmation. Full suite: 434 passed, 7 skipped.
+
+**Why.** SNDQ, 2026-10-07: the 2x short-SNDK ETF flushed −11% by 12:20, traded $10.62–10.88
+for 2.5 hours without a new low, closed above $10.88 at 15:00 and finished at $11.21. A
+replay of that day through the bots showed why none of them took it: `rev-strong-touch`
+bought the 09:55 dip at $11.59, which then fell to $10.65, and every reversal variant was
+blocked all afternoon: "price $10.78 not within 0.4% of support $10.62" (they only buy a touch
+of support, in the lower 35% of the day's range), "daily trend not up", "support only 1
+confirmation", "aim 1.6% < 2.5%". A breakout is price moving *away* from support. Gap-and-Go
+only trades 09:45–11:30, and the swing plan read $10.88 as resistance ("bounce room is only
++0.5%").
+
+**Spec (pre-registered 2026-11-01, before any run; also in the module docstring).** 5-min
+bars, long only (the inverse ETF is the short side).
+
+| Part | Rule |
+|---|---|
+| Flush | session low so far ≥ 5% under the open, made no later than the 13:00 bar |
+| Base | ≥ 18 bars (90 min) after that low with no new low, range ≤ 3% of the base low, higher lows (second-half low not under the first-half low) |
+| Trigger | a bar labelled 14:00–15:25 whose **close** is above the base high; only the first such close of the day |
+| Entry / stop | that close / base midpoint − 0.1% (not the base low: a base-height target would never be 1R away) |
+| Target | 1R (`pm-base-brk-1r`) or 2R (`pm-base-brk-2r`) |
+| Exit, cost | harness: stop-first, flat at the 15:55 close; $0.02/share round trip |
+| Filters | none: a flush day is against the trend by definition |
+
+Pass rule (the setup-lab default): ≥ 8 trades; avg net R > 0 in both halves, with the best
+day removed, and on each underlying; then > 0 on the holdout. Window: the latest 40 sessions
+(2026-09-04..10-30), holdout the 20 before (2026-08-07..09-03). Primary tickers SNXX, SNDQ,
+NBIZ, NBIS. A second set (51 stocks chosen before running: the bots' own tickers plus
+liquid high-beta names) was planned alongside as a larger-n check, not as a way to rescue a
+failed primary.
+
+**Results** (harness, `--null 200`):
+
+| Set | Window | n (dates) | win % | avg net R | halves | best day removed | null p |
+|---|---|--:|--:|--:|---|--:|--:|
+| SNXX/SNDQ/NBIZ/NBIS | latest 40 | 2 (2) | 50 | −0.12 | +0.83 / −1.07 | −1.07 | 0.80 (1R) / 0.65 (2R) |
+| SNXX/SNDQ/NBIZ/NBIS | holdout 20 | 0 | – | – | – | – | – |
+| 51 stocks | latest 40 | 6 (6) | 50 | −0.22 | −0.13 / −0.30 | −0.34 | 0.865 |
+| 51 stocks | holdout 20 | 3 (3) | 67 | +0.26 (1R) / +0.16 (2R) | −1.07 / +0.93 | −0.09 / −0.15 | not run |
+
+The ETF trades: SNDQ 2026-10-07 15:00, entry 10.979, stop 10.724, ended at the close for
++0.91R gross (+0.83 net; the 1R target at 11.233 was 2 cents above the 11.21 close) and SNDQ
+2026-10-27 14:05, entry 17.715, stopped for −1.00R. Of the 8 trades in the latest 40 sessions
+**none reached its 1R target**, so the two variants cannot be told apart (identical in 40d,
+0.10R apart in the holdout).
+
+**Verdict: does not pass, and cannot yet.** n is 2 and 6 against the required 8, and neither
+set beats the random-entry null. The rule needs a ≥ 5% flush by 13:00, a 90-minute base and a
+breakout inside a 90-minute window; on the four ETFs that happened on 2 of ~160 ticker-
+sessions, on the 51 stocks on 6 of ~2,040. That is "too rare to conclude", not "disproved".
+The motivating day (+0.83R) is the one the rule was drawn from and counts as nothing.
+
+**Not modelled:** the MACD / RSI / SMA20-SMA50 turn visible on the SNDQ chart (too many
+knobs for 40 sessions), a volume expansion on the breakout (bar volume against a trailing mean
+is a time-of-day clock, 2026-10-21), news, 1-min triggers.
+
+**Not done, on purpose:** no live wiring, no replay bot, no threshold or variant changes
+after seeing the numbers (a lower flush for ordinary stocks would be a new variant,
+pre-registered before it is run). A bot for this is its own `[ALGO]` PR with the user's
+approval, and only after H10 holds up on new sessions.
+
+**Next session, start here:** after ~20 new sessions run
+`python -m stockanalyzer.setups.harness SNXX SNDQ NBIZ NBIS --setup base_breakout --days 20`
+on only the sessions after 2026-10-30, and the same for the 51-stock list. Rules unchanged.
