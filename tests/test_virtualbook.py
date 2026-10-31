@@ -4,27 +4,25 @@ from __future__ import annotations
 from stockanalyzer import virtualbook as vb
 
 
-def _open(p, **kw):
+def _open(owner, **kw):
     base = dict(ticker="NOK", trader="me", entry=14.0, stop=13.3, target=14.8,
-                kind="immediate", horizon_days=3, now=1_000_000.0, path=p,
+                kind="immediate", horizon_days=3, now=1_000_000.0, user_id=owner,
                 snapshot={"score": 72, "setup": "Pullback to 20-EMA"})
     base.update(kw)
     return vb.open_position(**base)
 
 
-def test_open_and_has_open(tmp_path):
-    p = tmp_path / "book.json"
-    pos = _open(p)
+def test_open_and_has_open(owner):
+    pos = _open(owner)
     assert pos["status"] == "open"
     assert pos["shares"] == round(vb.STAKE_USD / 14.0, 4)
-    assert vb.has_open("nok", "me", p) is True
-    assert vb.has_open("NOK", "bot-GO", p) is False
+    assert vb.has_open("nok", "me", user_id=owner) is True
+    assert vb.has_open("NOK", "bot-GO", user_id=owner) is False
 
 
-def test_mark_stop_hit_is_conservative(tmp_path):
-    p = tmp_path / "book.json"
-    _open(p)
-    changed = vb.mark("NOK", 13.2, now=1_000_100.0, path=p)
+def test_mark_stop_hit_is_conservative(owner):
+    _open(owner)
+    changed = vb.mark("NOK", 13.2, now=1_000_100.0, user_id=owner)
     assert len(changed) == 1
     c = changed[0]
     assert c["status"] == "closed" and c["close_reason"] == "stop_hit"
@@ -32,92 +30,84 @@ def test_mark_stop_hit_is_conservative(tmp_path):
     assert c["pnl_usd"] < 0
 
 
-def test_mark_target_hit(tmp_path):
-    p = tmp_path / "book.json"
-    _open(p)
-    changed = vb.mark("NOK", 14.9, now=1_000_100.0, path=p)
+def test_mark_target_hit(owner):
+    _open(owner)
+    changed = vb.mark("NOK", 14.9, now=1_000_100.0, user_id=owner)
     assert changed[0]["close_reason"] == "target_hit"
     assert changed[0]["pnl_pct"] == round((14.8 / 14.0 - 1) * 100, 2)
 
 
-def test_mark_expiry_at_market(tmp_path):
-    p = tmp_path / "book.json"
-    _open(p)
+def test_mark_expiry_at_market(owner):
+    _open(owner)
     week_later = 1_000_000.0 + 6 * 86400          # > 3d × 1.5 cushion
-    changed = vb.mark("NOK", 14.1, now=week_later, path=p)
+    changed = vb.mark("NOK", 14.1, now=week_later, user_id=owner)
     assert changed[0]["close_reason"] == "expired"
     assert changed[0]["exit_price"] == 14.1
 
 
-def test_pending_breakout_confirms_then_fills_on_retest(tmp_path):
+def test_pending_breakout_confirms_then_fills_on_retest(owner):
     # Two-phase throwback: confirm the break, THEN fill on the pullback to entry.
-    p = tmp_path / "book.json"
-    pos = _open(p, kind="breakout_wait", trigger=14.2, entry=14.2, target=15.0)
+    pos = _open(owner, kind="breakout_wait", trigger=14.2, entry=14.2, target=15.0)
     assert pos["status"] == "pending"
     # Below the trigger: nothing.
-    assert vb.mark("NOK", 14.1, now=1_000_050.0, path=p) == []
+    assert vb.mark("NOK", 14.1, now=1_000_050.0, user_id=owner) == []
     # A bare touch of the wall is not a confirmed break (needs the margin).
-    assert vb.mark("NOK", 14.21, now=1_000_060.0, path=p) == []
+    assert vb.mark("NOK", 14.21, now=1_000_060.0, user_id=owner) == []
     # A real break clears the trigger — but does NOT fill yet (await the retest).
-    assert vb.mark("NOK", 14.35, now=1_000_100.0, path=p) == []
+    assert vb.mark("NOK", 14.35, now=1_000_100.0, user_id=owner) == []
     # The throwback to the entry fills the order.
-    changed = vb.mark("NOK", 14.2, now=1_000_150.0, path=p)
+    changed = vb.mark("NOK", 14.2, now=1_000_150.0, user_id=owner)
     assert changed[0]["status"] == "open" and changed[0]["entry"] == 14.2
     # Then the target.
-    changed = vb.mark("NOK", 15.1, now=1_000_200.0, path=p)
+    changed = vb.mark("NOK", 15.1, now=1_000_200.0, user_id=owner)
     assert changed[0]["close_reason"] == "target_hit"
 
 
-def test_breakout_that_runs_away_is_missed_not_chased(tmp_path):
+def test_breakout_that_runs_away_is_missed_not_chased(owner):
     # Confirms the break then only rises — never retests. We do NOT chase; the
     # order expires unfilled (the honest cost of waiting for the pullback).
-    p = tmp_path / "book.json"
-    _open(p, kind="breakout_wait", trigger=14.2, entry=14.2, target=15.0)
-    assert vb.mark("NOK", 14.35, now=1_000_100.0, path=p) == []   # broke out
-    assert vb.mark("NOK", 14.9, now=1_000_200.0, path=p) == []    # ran away, no retest
+    _open(owner, kind="breakout_wait", trigger=14.2, entry=14.2, target=15.0)
+    assert vb.mark("NOK", 14.35, now=1_000_100.0, user_id=owner) == []   # broke out
+    assert vb.mark("NOK", 14.9, now=1_000_200.0, user_id=owner) == []    # ran away, no retest
     week_later = 1_000_000.0 + 6 * 86400
-    changed = vb.mark("NOK", 14.95, now=week_later, path=p)
+    changed = vb.mark("NOK", 14.95, now=week_later, user_id=owner)
     assert changed[0]["status"] == "closed"
     assert changed[0]["close_reason"] == "cancelled"              # never filled
 
 
-def test_breakout_then_failed_collapse_is_cancelled_not_stopped(tmp_path):
+def test_breakout_then_failed_collapse_is_cancelled_not_stopped(owner):
     # Break confirms, then price collapses straight through the stop before any
     # retest fill — a failed breakout. We were never filled, so it's cancelled,
     # NOT a stop-loss (that's the loss the throwback model avoids).
-    p = tmp_path / "book.json"
-    _open(p, kind="breakout_wait", trigger=14.2, entry=14.2, stop=14.0, target=15.0)
-    assert vb.mark("NOK", 14.35, now=1_000_100.0, path=p) == []   # broke out
-    changed = vb.mark("NOK", 13.9, now=1_000_150.0, path=p)       # collapses < stop
+    _open(owner, kind="breakout_wait", trigger=14.2, entry=14.2, stop=14.0, target=15.0)
+    assert vb.mark("NOK", 14.35, now=1_000_100.0, user_id=owner) == []   # broke out
+    changed = vb.mark("NOK", 13.9, now=1_000_150.0, user_id=owner)       # collapses < stop
     assert changed[0]["status"] == "closed"
     assert changed[0]["close_reason"] == "cancelled"
     assert changed[0]["pnl_pct"] == 0.0                           # never held → no loss
 
 
-def test_pending_cancelled_when_break_never_comes(tmp_path):
-    p = tmp_path / "book.json"
-    _open(p, kind="breakout_wait", trigger=14.2)
+def test_pending_cancelled_when_break_never_comes(owner):
+    _open(owner, kind="breakout_wait", trigger=14.2)
     week_later = 1_000_000.0 + 6 * 86400
-    changed = vb.mark("NOK", 14.0, now=week_later, path=p)        # never broke out
+    changed = vb.mark("NOK", 14.0, now=week_later, user_id=owner)        # never broke out
     assert changed[0]["status"] == "closed"
     assert changed[0]["close_reason"] == "cancelled"
 
 
-def test_manual_close(tmp_path):
-    p = tmp_path / "book.json"
-    pos = _open(p)
-    closed = vb.close_position(pos["id"], 14.4, now=1_000_100.0, path=p)
+def test_manual_close(owner):
+    pos = _open(owner)
+    closed = vb.close_position(pos["id"], 14.4, now=1_000_100.0, user_id=owner)
     assert closed["close_reason"] == "manual"
     assert closed["pnl_pct"] == round((14.4 / 14.0 - 1) * 100, 2)
-    assert vb.has_open("NOK", "me", p) is False
+    assert vb.has_open("NOK", "me", user_id=owner) is False
 
 
-def test_custom_stake_scales_pnl(tmp_path):
-    p = tmp_path / "book.json"
-    pos = _open(p, stake=2500.0)
+def test_custom_stake_scales_pnl(owner):
+    pos = _open(owner, stake=2500.0)
     assert pos["stake"] == 2500.0
     assert pos["shares"] == round(2500.0 / 14.0, 4)
-    changed = vb.mark("NOK", 14.9, now=1_000_100.0, path=p)   # target hit
+    changed = vb.mark("NOK", 14.9, now=1_000_100.0, user_id=owner)   # target hit
     c = changed[0]
     # P&L $ scales with the stake: 2.5× the default-$1000 position.
     expected = round((14.8 - 14.0) * (2500.0 / 14.0), 2)
@@ -125,14 +115,13 @@ def test_custom_stake_scales_pnl(tmp_path):
     assert c["pnl_pct"] == round((14.8 / 14.0 - 1) * 100, 2)   # % unchanged by stake
 
 
-def test_stats_by_trader_band_setup(tmp_path):
-    p = tmp_path / "book.json"
-    a = _open(p, trader="me", snapshot={"score": 82, "setup": "Pullback to 20-EMA"})
-    b = _open(p, trader="bot-GO", ticker="INTC",
+def test_stats_by_trader_band_setup(owner):
+    a = _open(owner, trader="me", snapshot={"score": 82, "setup": "Pullback to 20-EMA"})
+    b = _open(owner, trader="bot-GO", ticker="INTC",
               snapshot={"score": 65, "setup": "Breakout (volume)"})
-    vb.close_position(a["id"], 14.8, now=1_000_100.0, path=p)     # win
-    vb.close_position(b["id"], 13.4, now=1_000_100.0, path=p)     # loss
-    s = vb.stats(vb.load(p))
+    vb.close_position(a["id"], 14.8, now=1_000_100.0, user_id=owner)     # win
+    vb.close_position(b["id"], 13.4, now=1_000_100.0, user_id=owner)     # loss
+    s = vb.stats(vb.load(user_id=owner))
     assert s["totals"]["n"] == 2 and s["totals"]["win_rate"] == 50
     assert s["traders"]["me"]["wins"] == 1
     assert s["traders"]["bot-GO"]["losses"] == 1
@@ -140,9 +129,33 @@ def test_stats_by_trader_band_setup(tmp_path):
     assert s["setups"]["Pullback to 20-EMA"]["win_rate"] == 100
 
 
-def test_cancelled_excluded_from_stats(tmp_path):
-    p = tmp_path / "book.json"
-    pos = _open(p, kind="breakout_wait", trigger=14.2)
-    vb.close_position(pos["id"], 0, path=p)        # pending → cancelled
-    s = vb.stats(vb.load(p))
+def test_bot_report_covers_every_trader_with_live_and_unrealized(owner):
+    traders = ["me", "bot-GO", "bot-70", "bot-BRK", "rev-strong-touch"]
+    for i, t in enumerate(traders):
+        pos = _open(owner, trader=t, ticker=f"T{i}")
+        vb.close_position(pos["id"], 14.7 if i % 2 else 13.5, now=1_000_100.0,
+                          user_id=owner)
+    _open(owner, trader="rev-trend-confirm", ticker="LIVE")         # open, priced
+    _open(owner, trader="rev-trend-confirm", ticker="NOPX")         # open, unpriced
+    _open(owner, trader="bot-BRK", ticker="ARM", kind="breakout_wait", trigger=14.2)
+    rep = vb.bot_report(vb.load(user_id=owner), {"LIVE": 15.0})
+    rows = {r["trader"]: r for r in rep["rows"]}
+    # Every trader appears — no truncation, even one with only live trades.
+    assert set(rows) == set(traders) | {"rev-trend-confirm"}
+    rc = rows["rev-trend-confirm"]
+    assert rc["closed"] == 0 and rc["open"] == 2
+    assert rc["unrealized_usd"] == round((15.0 - 14.0) * vb.STAKE_USD / 14.0, 2)
+    assert rep["unpriced"] == 1                                      # NOPX unknown, not $0
+    assert rows["bot-BRK"]["armed"] == 1 and rows["bot-BRK"]["closed"] == 1
+    assert rows["bot-GO"]["total_usd"] == rows["bot-GO"]["realized_usd"]
+    assert rows["rev-strong-touch"]["rule"] != "?"
+    month = vb._month(1_000_100.0)
+    assert abs(sum(m[month] for m in rep["months"].values())
+               - sum(r["realized_usd"] for r in rep["rows"])) < 0.01
+
+
+def test_cancelled_excluded_from_stats(owner):
+    pos = _open(owner, kind="breakout_wait", trigger=14.2)
+    vb.close_position(pos["id"], 0, user_id=owner)        # pending → cancelled
+    s = vb.stats(vb.load(user_id=owner))
     assert s["totals"]["n"] == 0

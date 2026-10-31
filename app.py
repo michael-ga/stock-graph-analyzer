@@ -28,8 +28,10 @@ from dotenv import load_dotenv
 
 import streamlit as st
 
-from stockanalyzer import papertrade, session, swingwatch, virtualbook, watchlist
-from stockanalyzer.auth import AuthError, AuthService
+import replay_page
+import ui_common
+from stockanalyzer import papertrade, replay, session, swingwatch, virtualbook, watchlist
+from stockanalyzer.auth import AuthError, AuthService, dev_login_username
 from stockanalyzer.user_management import UserManagementService
 from stockanalyzer.config import ConfigurationError, Settings
 from stockanalyzer.db.repositories.analysis_history import AnalysisHistoryRepository
@@ -37,7 +39,8 @@ from stockanalyzer.db.session import configure_engine
 from stockanalyzer.analysis import reversal
 from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
 from stockanalyzer.analysis.engine import CATEGORY_WEIGHTS, analyze_timeframe
-from stockanalyzer.explain.swing import _MIN_RR, build_swing_plan
+from stockanalyzer.explain.swing import (_MIN_RR, build_swing_plan,
+                                         is_extended as swing_is_extended)
 from stockanalyzer.manage import _SPREAD_PER_SHARE
 from stockanalyzer.analysis.signals import Direction
 from stockanalyzer.charting import candlestick_figure
@@ -45,6 +48,7 @@ from stockanalyzer.data.realtime import RealtimeStream, summarize, ticks_to_cand
 from stockanalyzer.data.resample import available_intervals, resample_ohlcv
 from stockanalyzer.data.schema import Timeframe
 from stockanalyzer.explain import UseCase, build_recommendation, timeframe_caption
+from stockanalyzer.explain import snapshot
 from stockanalyzer.explain.glossary import explain_signal
 from stockanalyzer.live import assess, make_tick
 from stockanalyzer.live_events import LiveState, diff_states
@@ -113,6 +117,20 @@ def _require_login() -> bool:
         return False
 
     now = time.time()
+    # Local development only: DEV_AUTO_LOGIN signs in that account without a
+    # password (never in production or on PostgreSQL; see dev_login_username).
+    dev_username = dev_login_username(
+        settings.app_env, settings.database_url, os.environ.get("DEV_AUTO_LOGIN"))
+    if (dev_username and not st.session_state.get("auth_user_id")
+            and not st.session_state.get("_dev_login_off")):
+        dev_user = AuthService().active_user(dev_username)
+        if dev_user is not None:
+            st.session_state["auth_user_id"] = dev_user.id
+            st.session_state["auth_username"] = dev_user.username
+            st.session_state["auth_last_activity"] = now
+            st.session_state["auth_session_revision"] = dev_user.session_revision
+            st.session_state["auth_is_admin"] = bool(dev_user.is_admin)
+            st.session_state["auth_must_change_password"] = bool(dev_user.must_change_password)
     user_id = st.session_state.get("auth_user_id")
     last_activity = float(st.session_state.get("auth_last_activity", 0))
     current_user = None
@@ -130,10 +148,13 @@ def _require_login() -> bool:
         with st.sidebar:
             st.caption(f"Signed in as **{st.session_state.get('auth_username', 'user')}**")
             st.caption(f"Engineering version: {_engineering_version()}")
+            if dev_username:
+                st.caption("Local development sign-in (no password)")
             if st.button("Log out", use_container_width=True):
                 for key in list(st.session_state):
                     if key.startswith("auth_"):
                         del st.session_state[key]
+                st.session_state["_dev_login_off"] = True   # show the sign-in form
                 st.rerun()
         if current_user.must_change_password:
             st.title("Change your password")
@@ -186,15 +207,13 @@ def _require_login() -> bool:
 
 
 _DIR_EMOJI = {Direction.BULL: "🟢", Direction.BEAR: "🔴", Direction.NEUTRAL: "⚪"}
-# Pan on left-drag (dragmode set per-figure), wheel zooms, double-click resets +
-# autoscales. Reset/autoscale buttons stay in the modebar for one-click clearing.
-_PLOTLY_CFG = {
-    "scrollZoom": True,
-    "displayModeBar": True,
-    "displaylogo": False,
-    "doubleClick": "reset+autosize",
-    "modeBarButtonsToAdd": ["resetScale2d"],
-}
+# Presentation helpers shared with the replay page live in `ui_common` (a leaf
+# module, so app.py can import replay_page without a cycle).
+_PLOTLY_CFG = ui_common.PLOTLY_CFG
+_apply_focus = ui_common.apply_focus
+_pnl_style = ui_common.pnl_style
+_timed = ui_common.Timed
+_perf_panel = ui_common.perf_panel
 _SEED_TICKERS = ["AAPL", "MSFT", "NVDA"]
 _USECASE_BY_LABEL = {uc.label: uc for uc in UseCase}
 _STRATEGY_BY_LABEL = {s.label: s for s in Strategy}
@@ -299,7 +318,7 @@ def main() -> None:
                    "Analysis of the Financial Markets*). Rule-based, no AI. **Not financial advice.**")
     with head_r:
         # Mode switcher (top-right) — more modes will live here later.
-        if ss.page == "movers":
+        if ss.page != "analyze":
             if st.button("📊 Analyzer", use_container_width=True,
                          help="Back to the full analyzer"):
                 ss.page = "analyze"
@@ -308,6 +327,11 @@ def main() -> None:
             if st.button("🔥 Top movers", use_container_width=True,
                          help="Today's 10 most-active stocks — suggested swing candidates"):
                 ss.page = "movers"
+                st.rerun()
+        if ss.page != "replay":
+            if st.button("🎬 Replay", use_container_width=True,
+                         help="Trade a past session bar by bar, with the future hidden"):
+                ss.page = "replay"
                 st.rerun()
 
     mode, prefer, usecase, strategy, pace, uploaded, live_on, buy_price = _sidebar()
@@ -320,6 +344,12 @@ def main() -> None:
         return
     if ss.page == "users" and st.session_state.get("auth_is_admin"):
         _users_page()
+        return
+
+    # Before the radar/portfolio panels on purpose: their 5s/30s fragments would
+    # fetch quotes and redraw beside a 0.5s animation frame, stuttering the tape.
+    if ss.page == "replay":
+        replay_page.render()
         return
 
     flash = ss.pop("vb_flash", None)
@@ -592,55 +622,11 @@ def _sidebar():
 # --------------------------------------------------------------------------- #
 # Virtual paper-trading book.
 # --------------------------------------------------------------------------- #
-def _plan_snapshot(plan, reports=None, verdict=None, rec=None) -> dict:
-    """Full decision context stored with every virtual trade — signals,
-    indicators, verdict, swing checks, recommendation — for post-hoc analysis."""
-    snap = dict(
-        score=plan.score, label=plan.score_label, setup=plan.setup,
-        kind=plan.kind, rr=plan.rr, daily_atr_pct=plan.daily_atr_pct,
-        guidance=plan.guidance,
-        failed_checks=[c.name for c in plan.checks if c.weight and not c.ok and not c.na],
-        checks=[dict(name=c.name, ok=c.ok, na=c.na, detail=c.detail, weight=c.weight)
-                for c in plan.checks],
-        reasons=list(plan.reasons),
-        bias=plan.bias.value,
-        confidence=getattr(plan, "confidence", None),
-        entry_note=plan.entry_note,
-        atr_source=plan.atr_source,
-        fast_mover=plan.fast_mover,
-    )
-    if reports:
-        tf_data = {}
-        for tf, rep in reports.items():
-            tf_key = tf.value if hasattr(tf, "value") else str(tf)
-            sigs = [dict(name=s.name, direction=s.direction.value,
-                         strength=round(s.strength, 3), category=s.category,
-                         evidence=s.evidence)
-                    for s in rep.signals]
-            indicators = {}
-            for col in ("close", "sma20", "sma50", "sma200", "ema20",
-                        "rsi", "macd", "macd_signal", "macd_hist",
-                        "stoch_k", "stoch_d", "atr",
-                        "adx", "plus_di", "minus_di", "bb_upper", "bb_lower"):
-                if col in rep.df.columns:
-                    series = rep.df[col].dropna()
-                    if not series.empty:
-                        indicators[col] = round(float(series.iloc[-1]), 4)
-            tf_data[tf_key] = dict(signals=sigs, bias_score=rep.bias_score,
-                                   trend_dir=rep.trend.direction.value,
-                                   indicators=indicators)
-        snap["timeframes"] = tf_data
-    if verdict:
-        snap["verdict"] = dict(
-            label=verdict.label, direction=verdict.direction.value,
-            score=verdict.score, confidence=verdict.confidence,
-            per_timeframe=verdict.per_timeframe)
-    if rec:
-        snap["recommendation"] = dict(
-            go_score=rec.go_score, light_color=rec.light_color,
-            preset=rec.preset.label if hasattr(rec.preset, "label") else str(rec.preset),
-            bullish_pct=rec.bullish_pct)
-    return snap
+# Snapshot builders live in `explain.snapshot` — pure dicts, no UI — so the radar,
+# the bots and the replay simulator all store identically-shaped context.
+_plan_snapshot = snapshot.plan_snapshot
+_gap_snapshot = snapshot.gap_snapshot
+_reversal_snapshot = snapshot.reversal_snapshot
 
 
 def _price_of(res) -> float | None:
@@ -727,10 +713,8 @@ def _virtual_buy_button(plan, ticker: str, key_suffix: str = "",
                "panel at the top with your stake and P&L.")
 
 
-def _is_extended(p) -> bool:
-    """The plan's own 'too stretched / not real demand' verdict (emerging path)."""
-    es = getattr(p, "emerging", None)
-    return bool(es and (es.extended or "distribution_risk" in es.flags))
+# Shared with the replay simulator's bot roster — see explain/swing.py.
+_is_extended = swing_is_extended
 
 
 # --------------------------------------------------------------------------- #
@@ -820,20 +804,6 @@ def _opening_range(tk: str, res) -> dict | None:
     return stored
 
 
-def _gap_snapshot(tk: str, orange: dict, rvol: float | None,
-                  entry: float, stop: float, target: float) -> dict:
-    """Minimal decision snapshot for a Gap-and-Go trade. The shared setup/kind +
-    identical entry/stop/target make ``bot-gap-mgd`` and ``bot-gap-fixed`` collapse
-    to one ``cohort_id`` (the A/B pairing)."""
-    rr = round((target - entry) / (entry - stop), 1) if entry > stop else _ORB_TARGET_R
-    return dict(
-        setup="gap_and_go_orb", kind="immediate", score=None, label="Gap-and-Go",
-        rr=rr, daily_atr_pct=None,
-        guidance=(f"ORB break of ${orange['high']:.2f} on "
-                  f"{(rvol or 0):.1f}×vol — hard stop below OR-low ${orange['low']:.2f}, "
-                  f"target ${target:.2f} (2R)."))
-
-
 def _run_gap_bots(tk: str, reports, orange: dict | None, price: float | None) -> None:
     """Open the Gap-and-Go pair when the ORB rules line up: a real gap-up, inside
     the 9:45–11:30 window, price breaking the opening-range HIGH on >1.5× volume.
@@ -846,7 +816,7 @@ def _run_gap_bots(tk: str, reports, orange: dict | None, price: float | None) ->
     if not dec.fired:
         return
     entry, init_stop, target, rvol = dec.entry, dec.stop, dec.target, dec.rvol
-    snap = _gap_snapshot(tk, orange, rvol, entry, init_stop, target)
+    snap = _gap_snapshot(orange, rvol, entry, init_stop, target)
     for trader, managed in (("bot-gap-fixed", False), ("bot-gap-mgd", True)):
         try:
             if not virtualbook.has_open(
@@ -904,16 +874,6 @@ def _run_bots(ticker: str, plan, reports=None, verdict=None, rec=None,
                          f"(score {plan.score}%)", icon="🤖")
         except Exception:
             pass
-
-
-def _reversal_snapshot(dec) -> dict:
-    """Minimal decision snapshot for a reversal-at-support day trade — one row per
-    variant so each risk profile is its own cohort in the trade book."""
-    return dict(
-        setup="reversal_support", kind="immediate", score=None,
-        label=f"Reversal @ support ({dec.variant})", rr=dec.rr, daily_atr_pct=None,
-        guidance=(f"{dec.variant}: {dec.reason} — hard stop ${dec.stop:.2f}, "
-                  f"target ${dec.target:.2f}."))
 
 
 def _run_reversal_bots(tk: str, res, price: float | None, phase=None) -> None:
@@ -1370,41 +1330,6 @@ def _movers_page() -> None:
                "rule-based, **not financial advice.**")
 
 
-def _pnl_style(df, pct_cols=(), usd_cols=(), price_cols=()):
-    """Return a pandas Styler: green for gains, red for losses on P&L columns."""
-
-    def _bg(v):
-        try:
-            x = float(v)
-        except (TypeError, ValueError):
-            return ""
-        if pd.isna(x):
-            return ""
-        if x > 0:
-            return "background-color:rgba(27,158,62,0.22);color:#0b6b2a;font-weight:600"
-        if x < 0:
-            return "background-color:rgba(229,57,53,0.22);color:#a01711;font-weight:600"
-        return "color:gray"
-
-    sty = df.style
-    color_cols = [c for c in (list(pct_cols) + list(usd_cols)) if c in df.columns]
-    if color_cols:
-        sty = sty.map(_bg, subset=color_cols)
-    fmt = {}
-    for c in pct_cols:
-        if c in df.columns:
-            fmt[c] = lambda v: "" if pd.isna(v) else f"{v:+.2f}%"
-    for c in usd_cols:
-        if c in df.columns:
-            fmt[c] = lambda v: "" if pd.isna(v) else f"${v:+,.2f}"
-    for c in price_cols:
-        if c in df.columns:
-            fmt[c] = lambda v: "" if pd.isna(v) else f"${v:,.2f}"
-    if fmt:
-        sty = sty.format(fmt, na_rep="—")
-    return sty
-
-
 def _portfolio_panel() -> None:
     """💼 Virtual holdings — compact summary line + collapsible detail, refreshing
     every ~30s so unrealized P&L stays current."""
@@ -1436,13 +1361,16 @@ def _portfolio_panel() -> None:
         live = [p for p in book if p["status"] in ("open", "pending")]
         s = virtualbook.stats(book)
         tot = s["totals"]
-        unreal = sum((prices.get(p["ticker"], p["entry"]) - p["entry"]) * p["shares"]
-                     for p in live if p["status"] == "open")
+        report = virtualbook.bot_report(book, prices)
+        unreal = sum(r["unrealized_usd"] for r in report["rows"])
+        unpriced = (f" ({report['unpriced']} unpriced)" if report["unpriced"] else "")
         wr = f"{tot['win_rate']}%" if tot["win_rate"] is not None else "—"
         pnl_color = "🟢" if tot["total_pnl_usd"] + unreal >= 0 else "🔴"
+        # "\$": two bare dollar signs in one markdown line render as LaTeX math
+        # (that garbled "Won +8, 929 ∗∗·Lost∗∗" in the bottom line).
         head = (f"💼 Virtual portfolio — {len(live)} live · "
-                f"realized ${tot['total_pnl_usd']:+,.0f} · unrealized ${unreal:+,.0f} "
-                f"{pnl_color} · win rate {wr}")
+                f"realized \\${tot['total_pnl_usd']:+,.0f} · unrealized \\${unreal:+,.0f}"
+                f"{unpriced} {pnl_color} · win rate {wr}")
         with st.expander(head, expanded=False):
             # 💰 Bottom line — gross $ won, $ lost, and net, in plain dollars.
             done = [p for p in book if p["status"] == "closed"
@@ -1450,12 +1378,15 @@ def _portfolio_panel() -> None:
             won = sum(p["pnl_usd"] for p in done if p["pnl_usd"] > 0)
             lost = sum(p["pnl_usd"] for p in done if p["pnl_usd"] <= 0)   # ≤0, negative
             net = won + lost
-            line = (f"### 💰 Bottom line: net **${net:+,.0f}**\n"
-                    f"Won **+${won:,.0f}** · Lost **−${abs(lost):,.0f}** "
+            line = (f"### 💰 Bottom line: net **\\${net:+,.0f}**\n"
+                    f"Won **+\\${won:,.0f}** · Lost **−\\${abs(lost):,.0f}** "
                     f"over **{len(done)}** closed trades")
             if live:
-                line += f" · open unrealized **${unreal:+,.0f}**"
+                line += f" · open unrealized **\\${unreal:+,.0f}**{unpriced}"
             st.markdown(line)
+            st.caption("Realized = closed trades (cancelled orders excluded). Unrealized = "
+                       "open positions marked to the latest price: (now − entry) × shares. "
+                       "Armed breakout orders hold no shares yet, so they add nothing.")
             st.divider()
             if live:
                 st.markdown("**Live positions** _($1,000 virtual stake each)_")
@@ -1501,22 +1432,40 @@ def _portfolio_panel() -> None:
             closed_n = s["totals"]["n"]
             if closed_n:
                 st.markdown("**📊 Algorithm evidence** _(closed trades)_")
-                c = st.columns(max(2, min(4, len(s["traders"]) + 1)))
-                c[0].metric("All traders", wr,
-                            f"{closed_n} trades · ${tot['total_pnl_usd']:+,.0f}",
-                            delta_color="off")
-                for i, (name, a) in enumerate(s["traders"].items(), start=1):
-                    if i >= len(c):
-                        break
-                    twr = f"{a['win_rate']}%" if a["win_rate"] is not None else "—"
-                    c[i].metric(name, twr,
-                                f"{a['n']} trades · ${a['total_pnl_usd']:+,.0f}",
-                                delta_color="off")
+                st.metric("All traders", wr,
+                          f"{closed_n} trades · ${tot['total_pnl_usd']:+,.0f}",
+                          delta_color="off")
+                # Every trader, one row each — the old metric cards stopped at 3.
+                st.markdown("**🤖 Per-bot report card** _(every trader in the book)_")
+                bot_df = pd.DataFrame(report["rows"]).rename(columns={
+                    "win_rate": "win %", "avg_pnl_pct": "avg %",
+                    "realized_usd": "realized $", "unrealized_usd": "unrealized $",
+                    "total_usd": "total $", "last_close": "last close"})
+                bot_df = bot_df[["trader", "total $", "realized $", "unrealized $",
+                                 "closed", "win %", "avg %", "wins", "losses", "open",
+                                 "armed", "cancelled", "last close", "rule"]]
+                st.dataframe(
+                    _pnl_style(bot_df.sort_values("total $"),
+                               pct_cols=["avg %"],
+                               usd_cols=["realized $", "unrealized $", "total $"]),
+                    use_container_width=True, hide_index=True,
+                    height=min(420, 40 + 36 * len(bot_df)))
+                if report["months"]:
+                    st.caption("Realized \\$ by close month — which bot is losing *recently*?")
+                    month_df = (pd.DataFrame(report["months"]).T.fillna(0.0)
+                                .sort_index(axis=1))
+                    month_df.loc["ALL"] = month_df.sum()
+                    st.dataframe(
+                        _pnl_style(month_df.reset_index(names="trader"),
+                                   usd_cols=list(month_df.columns)),
+                        use_container_width=True, hide_index=True,
+                        height=min(460, 40 + 36 * len(month_df)))
                 band_rows = [{"score band": k, **v} for k, v in s["bands"].items()]
                 setup_rows = [{"setup": k, **v} for k, v in s["setups"].items()]
                 b1, b2 = st.columns(2)
                 with b1:
-                    st.caption("By score band — does a higher score win more?")
+                    st.caption("By score band — does a higher score win more? "
+                               "(**?** = no swing score: reversal & Gap-and-Go bots)")
                     st.dataframe(_pnl_style(pd.DataFrame(band_rows),
                                             pct_cols=["avg_pnl_pct"],
                                             usd_cols=["total_pnl_usd"]),
@@ -1563,8 +1512,10 @@ def _portfolio_panel() -> None:
                                          use_container_width=True)
                         st.caption("Same idea taken by several bots counts once "
                                    "here — so a duplicated call can't masquerade as "
-                                   "a winning streak. Compare with the per-trader "
-                                   "cards above to see which bot *rule* earns its place.")
+                                   "a winning streak. Managed-exit trades (bot-gap-mgd) "
+                                   "are left out so the exit policy doesn't count twice. "
+                                   "Compare with the per-bot report card above to see "
+                                   "which bot *rule* earns its place.")
                 except Exception:
                     pass
 
@@ -1592,7 +1543,14 @@ def _portfolio_panel() -> None:
                     pass
 
                 hist = [p for p in book if p["status"] == "closed"]
-                st.markdown(f"**Trade history ({len(hist)})**")
+                pick = st.multiselect(
+                    "Trade history — filter by trader",
+                    sorted({p["trader"] for p in hist}), key="vb_hist_traders")
+                if pick:
+                    hist = [p for p in hist if p["trader"] in pick]
+                n_cxl = sum(1 for p in hist if p.get("close_reason") == "cancelled")
+                st.markdown(f"**Trade history ({len(hist)})** "
+                            f"_— includes {n_cxl} cancelled (never filled, \\$0)_")
                 h_rows = [{
                     "closed": _fmt_ts(p.get("closed_ts") or p.get("closed")),
                     "ticker": p["ticker"],
@@ -1608,10 +1566,9 @@ def _portfolio_panel() -> None:
                                pct_cols=["P&L %"], usd_cols=["P&L $"],
                                price_cols=["stake $", "entry", "exit"]),
                     use_container_width=True, height=240)
-            st.caption("Manual buys = trader **me** · bots: **bot-GO** (strict GO only) · "
-                       "**bot-70** (score ≥70, ignores the GO gate) · **bot-BRK** (armed "
-                       "breakout orders) — compare win rates to see which rules earn their "
-                       "place in the algorithm. Virtual money only.")
+            st.caption("Traders: " + " · ".join(
+                f"**{t}** ({rule})" for t, rule in virtualbook.TRADER_RULES.items())
+                + " — compare them in the per-bot report card. Virtual money only.")
 
     _folio()
 
@@ -2254,58 +2211,6 @@ _LIVE_MID_S = 3
 _LIVE_SLOW_S = 15
 
 
-class _timed:
-    """Record how long a fragment body took, so the cadences above can be tuned
-    from evidence instead of guesswork.
-
-    Keeps the last 40 samples per section in session state; `_perf_panel` renders
-    p50/p95. A fragment whose p95 exceeds its own run_every is the thing to fix —
-    that is precisely the condition that makes redraws queue up and the UI stall.
-    """
-
-    def __init__(self, name: str, budget_s: float | None = None):
-        self.name, self.budget_s = name, budget_s
-
-    def __enter__(self):
-        self._t0 = time.perf_counter()
-        return self
-
-    def __exit__(self, *exc):
-        ms = (time.perf_counter() - self._t0) * 1000
-        ss = st.session_state
-        ss.setdefault("_perf", {})
-        rec = ss._perf.setdefault(self.name, {"ms": [], "budget_s": self.budget_s})
-        rec["ms"] = (rec["ms"] + [ms])[-40:]
-        return False
-
-
-def _perf_panel() -> None:
-    """Opt-in timing readout for live mode (sidebar toggle)."""
-    perf = st.session_state.get("_perf") or {}
-    if not perf:
-        st.caption("No timings yet — let live mode run for a few seconds.")
-        return
-    # Plain markdown, not st.dataframe: this is a four-row table, and the grid
-    # widget renders to a canvas that can't be read off the page (or copied out
-    # of a bug report).
-    lines = ["| fragment | n | p50 ms | p95 ms | budget ms | |",
-             "|---|--:|--:|--:|--:|---|"]
-    for name, rec in perf.items():
-        s = sorted(rec["ms"])
-        if not s:
-            continue
-        p50 = s[len(s) // 2]
-        p95 = s[min(len(s) - 1, int(len(s) * 0.95))]
-        budget_ms = (rec["budget_s"] or 0) * 1000
-        over = budget_ms and p95 > budget_ms
-        lines.append(f"| {name} | {len(s)} | {p50:.0f} | {p95:.0f} | "
-                     f"{budget_ms:.0f} | {'⚠️ over' if over else '✅ ok'} |")
-    st.markdown("\n".join(lines))
-    st.caption("A fragment whose **p95 exceeds its budget** cannot finish before "
-               "its next scheduled run — that backlog is what makes the UI feel "
-               "stuck. Lower its cadence or move work out of it.")
-
-
 def _live_dashboard(ticker, prefer, usecase, strategy, pace, buy_price, result) -> None:
     ss = st.session_state
     st.divider()
@@ -2537,9 +2442,27 @@ def _live_slow_frame(ctx: dict) -> None:
     _live_chart(ctx["ticker"], d1, plan, shared["key_level"], live_price, snap,
                 reports=shared["reports"])
     _live_signal_chips(d1)
+    _live_bot_brain(ctx, shared, live_price)
     st.caption(f"Price updates ~{_LIVE_FAST_S}s · pulse/bots ~{_LIVE_MID_S}s · "
                f"chart & plan ~{_LIVE_SLOW_S}s · signals re-run ~{_ENGINE_REFRESH_S}s · "
                "the multi-timeframe verdict is structural · **not financial advice.**")
+
+
+def _live_bot_brain(ctx, shared, live_price) -> None:
+    """Replay's per-bot gate panel, fed the live plan the bots just acted on."""
+    with st.expander("🤖 Why the bots are / aren't trading", expanded=False):
+        try:
+            quote = ctx["result"].quote
+            bar = replay.live_bar(
+                shared["reports"], live_price, session.now_et(),
+                _opening_range(ctx["ticker"], ctx["result"]),
+                quote.prev_close if quote else None, shared["plan"])
+        except Exception:
+            bar = None                     # a view option must never break live mode
+        if bar is None:
+            st.caption("Bot read unavailable on this refresh.")
+            return
+        replay_page._bot_panel(bar, live=True)
 
 
 def _live_header(ctx, snap, live_price, elapsed, engine_age, ended) -> None:
@@ -2682,17 +2605,6 @@ def _compute_focus(df, frac: float = 0.4, keep_prices=None):
             lo, hi = min(lo, p), max(hi, p)
     pad = (hi - lo) * 0.08
     return x0, x1, lo - pad, hi + pad
-
-
-def _apply_focus(fig, focus) -> None:
-    if focus is None:
-        return
-    x0, x1, y0, y1 = focus
-    # The price panel's x-axis is a *follower* (shared_xaxes matches it to the
-    # bottom anchor axis), so setting the range on row=1 alone gets overridden by
-    # the anchor's autorange. Set every x-axis so the anchor takes the range too.
-    fig.update_xaxes(range=[x0, x1])
-    fig.update_yaxes(range=[y0, y1], autorange=False, row=1, col=1)
 
 
 def _stable_focus(view_key: str, df, keep_prices=None):
