@@ -1361,13 +1361,16 @@ def _portfolio_panel() -> None:
         live = [p for p in book if p["status"] in ("open", "pending")]
         s = virtualbook.stats(book)
         tot = s["totals"]
-        unreal = sum((prices.get(p["ticker"], p["entry"]) - p["entry"]) * p["shares"]
-                     for p in live if p["status"] == "open")
+        report = virtualbook.bot_report(book, prices)
+        unreal = sum(r["unrealized_usd"] for r in report["rows"])
+        unpriced = (f" ({report['unpriced']} unpriced)" if report["unpriced"] else "")
         wr = f"{tot['win_rate']}%" if tot["win_rate"] is not None else "—"
         pnl_color = "🟢" if tot["total_pnl_usd"] + unreal >= 0 else "🔴"
+        # "\$": two bare dollar signs in one markdown line render as LaTeX math
+        # (that garbled "Won +8, 929 ∗∗·Lost∗∗" in the bottom line).
         head = (f"💼 Virtual portfolio — {len(live)} live · "
-                f"realized ${tot['total_pnl_usd']:+,.0f} · unrealized ${unreal:+,.0f} "
-                f"{pnl_color} · win rate {wr}")
+                f"realized \\${tot['total_pnl_usd']:+,.0f} · unrealized \\${unreal:+,.0f}"
+                f"{unpriced} {pnl_color} · win rate {wr}")
         with st.expander(head, expanded=False):
             # 💰 Bottom line — gross $ won, $ lost, and net, in plain dollars.
             done = [p for p in book if p["status"] == "closed"
@@ -1375,12 +1378,15 @@ def _portfolio_panel() -> None:
             won = sum(p["pnl_usd"] for p in done if p["pnl_usd"] > 0)
             lost = sum(p["pnl_usd"] for p in done if p["pnl_usd"] <= 0)   # ≤0, negative
             net = won + lost
-            line = (f"### 💰 Bottom line: net **${net:+,.0f}**\n"
-                    f"Won **+${won:,.0f}** · Lost **−${abs(lost):,.0f}** "
+            line = (f"### 💰 Bottom line: net **\\${net:+,.0f}**\n"
+                    f"Won **+\\${won:,.0f}** · Lost **−\\${abs(lost):,.0f}** "
                     f"over **{len(done)}** closed trades")
             if live:
-                line += f" · open unrealized **${unreal:+,.0f}**"
+                line += f" · open unrealized **\\${unreal:+,.0f}**{unpriced}"
             st.markdown(line)
+            st.caption("Realized = closed trades (cancelled orders excluded). Unrealized = "
+                       "open positions marked to the latest price: (now − entry) × shares. "
+                       "Armed breakout orders hold no shares yet, so they add nothing.")
             st.divider()
             if live:
                 st.markdown("**Live positions** _($1,000 virtual stake each)_")
@@ -1426,22 +1432,40 @@ def _portfolio_panel() -> None:
             closed_n = s["totals"]["n"]
             if closed_n:
                 st.markdown("**📊 Algorithm evidence** _(closed trades)_")
-                c = st.columns(max(2, min(4, len(s["traders"]) + 1)))
-                c[0].metric("All traders", wr,
-                            f"{closed_n} trades · ${tot['total_pnl_usd']:+,.0f}",
-                            delta_color="off")
-                for i, (name, a) in enumerate(s["traders"].items(), start=1):
-                    if i >= len(c):
-                        break
-                    twr = f"{a['win_rate']}%" if a["win_rate"] is not None else "—"
-                    c[i].metric(name, twr,
-                                f"{a['n']} trades · ${a['total_pnl_usd']:+,.0f}",
-                                delta_color="off")
+                st.metric("All traders", wr,
+                          f"{closed_n} trades · ${tot['total_pnl_usd']:+,.0f}",
+                          delta_color="off")
+                # Every trader, one row each — the old metric cards stopped at 3.
+                st.markdown("**🤖 Per-bot report card** _(every trader in the book)_")
+                bot_df = pd.DataFrame(report["rows"]).rename(columns={
+                    "win_rate": "win %", "avg_pnl_pct": "avg %",
+                    "realized_usd": "realized $", "unrealized_usd": "unrealized $",
+                    "total_usd": "total $", "last_close": "last close"})
+                bot_df = bot_df[["trader", "total $", "realized $", "unrealized $",
+                                 "closed", "win %", "avg %", "wins", "losses", "open",
+                                 "armed", "cancelled", "last close", "rule"]]
+                st.dataframe(
+                    _pnl_style(bot_df.sort_values("total $"),
+                               pct_cols=["avg %"],
+                               usd_cols=["realized $", "unrealized $", "total $"]),
+                    use_container_width=True, hide_index=True,
+                    height=min(420, 40 + 36 * len(bot_df)))
+                if report["months"]:
+                    st.caption("Realized \\$ by close month — which bot is losing *recently*?")
+                    month_df = (pd.DataFrame(report["months"]).T.fillna(0.0)
+                                .sort_index(axis=1))
+                    month_df.loc["ALL"] = month_df.sum()
+                    st.dataframe(
+                        _pnl_style(month_df.reset_index(names="trader"),
+                                   usd_cols=list(month_df.columns)),
+                        use_container_width=True, hide_index=True,
+                        height=min(460, 40 + 36 * len(month_df)))
                 band_rows = [{"score band": k, **v} for k, v in s["bands"].items()]
                 setup_rows = [{"setup": k, **v} for k, v in s["setups"].items()]
                 b1, b2 = st.columns(2)
                 with b1:
-                    st.caption("By score band — does a higher score win more?")
+                    st.caption("By score band — does a higher score win more? "
+                               "(**?** = no swing score: reversal & Gap-and-Go bots)")
                     st.dataframe(_pnl_style(pd.DataFrame(band_rows),
                                             pct_cols=["avg_pnl_pct"],
                                             usd_cols=["total_pnl_usd"]),
@@ -1488,8 +1512,10 @@ def _portfolio_panel() -> None:
                                          use_container_width=True)
                         st.caption("Same idea taken by several bots counts once "
                                    "here — so a duplicated call can't masquerade as "
-                                   "a winning streak. Compare with the per-trader "
-                                   "cards above to see which bot *rule* earns its place.")
+                                   "a winning streak. Managed-exit trades (bot-gap-mgd) "
+                                   "are left out so the exit policy doesn't count twice. "
+                                   "Compare with the per-bot report card above to see "
+                                   "which bot *rule* earns its place.")
                 except Exception:
                     pass
 
@@ -1517,7 +1543,14 @@ def _portfolio_panel() -> None:
                     pass
 
                 hist = [p for p in book if p["status"] == "closed"]
-                st.markdown(f"**Trade history ({len(hist)})**")
+                pick = st.multiselect(
+                    "Trade history — filter by trader",
+                    sorted({p["trader"] for p in hist}), key="vb_hist_traders")
+                if pick:
+                    hist = [p for p in hist if p["trader"] in pick]
+                n_cxl = sum(1 for p in hist if p.get("close_reason") == "cancelled")
+                st.markdown(f"**Trade history ({len(hist)})** "
+                            f"_— includes {n_cxl} cancelled (never filled, \\$0)_")
                 h_rows = [{
                     "closed": _fmt_ts(p.get("closed_ts") or p.get("closed")),
                     "ticker": p["ticker"],
@@ -1533,10 +1566,9 @@ def _portfolio_panel() -> None:
                                pct_cols=["P&L %"], usd_cols=["P&L $"],
                                price_cols=["stake $", "entry", "exit"]),
                     use_container_width=True, height=240)
-            st.caption("Manual buys = trader **me** · bots: **bot-GO** (strict GO only) · "
-                       "**bot-70** (score ≥70, ignores the GO gate) · **bot-BRK** (armed "
-                       "breakout orders) — compare win rates to see which rules earn their "
-                       "place in the algorithm. Virtual money only.")
+            st.caption("Traders: " + " · ".join(
+                f"**{t}** ({rule})" for t, rule in virtualbook.TRADER_RULES.items())
+                + " — compare them in the per-bot report card. Virtual money only.")
 
     _folio()
 

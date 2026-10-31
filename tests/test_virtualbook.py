@@ -129,6 +129,31 @@ def test_stats_by_trader_band_setup(owner):
     assert s["setups"]["Pullback to 20-EMA"]["win_rate"] == 100
 
 
+def test_bot_report_covers_every_trader_with_live_and_unrealized(owner):
+    traders = ["me", "bot-GO", "bot-70", "bot-BRK", "rev-strong-touch"]
+    for i, t in enumerate(traders):
+        pos = _open(owner, trader=t, ticker=f"T{i}")
+        vb.close_position(pos["id"], 14.7 if i % 2 else 13.5, now=1_000_100.0,
+                          user_id=owner)
+    _open(owner, trader="rev-trend-confirm", ticker="LIVE")         # open, priced
+    _open(owner, trader="rev-trend-confirm", ticker="NOPX")         # open, unpriced
+    _open(owner, trader="bot-BRK", ticker="ARM", kind="breakout_wait", trigger=14.2)
+    rep = vb.bot_report(vb.load(user_id=owner), {"LIVE": 15.0})
+    rows = {r["trader"]: r for r in rep["rows"]}
+    # Every trader appears — no truncation, even one with only live trades.
+    assert set(rows) == set(traders) | {"rev-trend-confirm"}
+    rc = rows["rev-trend-confirm"]
+    assert rc["closed"] == 0 and rc["open"] == 2
+    assert rc["unrealized_usd"] == round((15.0 - 14.0) * vb.STAKE_USD / 14.0, 2)
+    assert rep["unpriced"] == 1                                      # NOPX unknown, not $0
+    assert rows["bot-BRK"]["armed"] == 1 and rows["bot-BRK"]["closed"] == 1
+    assert rows["bot-GO"]["total_usd"] == rows["bot-GO"]["realized_usd"]
+    assert rows["rev-strong-touch"]["rule"] != "?"
+    month = vb._month(1_000_100.0)
+    assert abs(sum(m[month] for m in rep["months"].values())
+               - sum(r["realized_usd"] for r in rep["rows"])) < 0.01
+
+
 def test_cancelled_excluded_from_stats(owner):
     pos = _open(owner, kind="breakout_wait", trigger=14.2)
     vb.close_position(pos["id"], 0, user_id=owner)        # pending → cancelled
