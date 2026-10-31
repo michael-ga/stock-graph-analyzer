@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  tests:
+    name: pytest (SQLite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install "pytest>=8,<9" "ruff>=0.9,<1" "PyYAML>=6,<7"
+
+      # Correctness-only lint (undefined names, unused imports, syntax errors).
+      # The full `ruff check` style set in pyproject.toml still has legacy debt.
+      - name: Ruff (pyflakes + syntax)
+        run: ruff check --select E9,F .
+
+      - name: Pytest
+        run: python -m pytest -q
+
+  postgres:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        # Keep in step with the `db` image in compose.yaml.
+        image: postgres:16.9-bookworm
+        env:
+          POSTGRES_DB: stockanalyzer_test
+          POSTGRES_USER: stockapp_test
+          POSTGRES_PASSWORD: integration-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U stockapp_test -d stockanalyzer_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://stockapp_test:integration-test-only@localhost:5432/stockanalyzer_test
+      POSTGRES_TEST_URL: postgresql+psycopg://stockapp_test:integration-test-only@localhost:5432/stockanalyzer_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install "pytest>=8,<9" "PyYAML>=6,<7"
+
+      # The production container runs `alembic upgrade head` on start, so the
+      # migration chain must apply, reverse, and match the SQLAlchemy models.
+      - name: Alembic upgrade / downgrade / drift check
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+          alembic check
+
+      - name: Pytest (PostgreSQL)
+        run: python -m pytest -q -rs tests/test_postgres_integration.py
