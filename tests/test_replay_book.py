@@ -13,8 +13,9 @@ import pandas as pd
 import pytest
 
 from stockanalyzer import replay, virtualbook
+from stockanalyzer import replay, virtualbook
+from stockanalyzer.db import session as db_session
 from stockanalyzer.setups import orb, reversal
-from stockanalyzer.data import store
 
 _DAY = pd.Timestamp("2026-06-18")
 _T0 = pd.Timestamp("2026-06-18 09:45", tz="America/New_York")
@@ -86,21 +87,18 @@ def _db(tmp_path, attempt=1):
 # --------------------------------------------------------------------------- #
 # 🔴 Sandbox isolation.
 # --------------------------------------------------------------------------- #
-def test_replay_db_does_not_absorb_legacy_json(tmp_path):
-    """A brand-new book seeds itself from a ``.virtualbook.json`` sitting next to
-    it. The replay DB therefore lives one directory down — otherwise every
-    practice run would start pre-loaded with the real trade history.
-    """
+def test_replay_db_ignores_legacy_json_beside_it(tmp_path):
+    """The retired SQLite store seeded a brand-new book from a ``.virtualbook.json``
+    next to it. Sandbox books never import anything: a fresh one is always empty."""
     legacy = [{"id": "old1", "ticker": "NOK", "trader": "me", "status": "closed",
                "kind": "immediate", "entry": 14.0, "stop": 13.3, "target": 14.8,
                "opened_ts": 1.0, "opened": "2026-06-01 10:00", "pnl_pct": 5.0}]
     (tmp_path / ".virtualbook.json").write_text(json.dumps(legacy))
+    (tmp_path / ".replay").mkdir()
+    (tmp_path / ".replay" / ".virtualbook.json").write_text(json.dumps(legacy))
 
-    assert virtualbook.load(path=_db(tmp_path)) == []
-
-    # ...and the guard is load-bearing: a book placed beside the JSON does inherit
-    # it, which is exactly the accident replay_db_path exists to prevent.
-    assert len(virtualbook.load(path=tmp_path / "beside.db")) == 1
+    assert replay.load_book(_db(tmp_path)) == []
+    assert replay.load_book(tmp_path / "beside.db") == []
 
 
 def test_replay_db_path_is_namespaced_per_ticker_day_and_attempt(tmp_path):
@@ -113,8 +111,8 @@ def test_replay_db_path_is_namespaced_per_ticker_day_and_attempt(tmp_path):
 def test_a_restart_starts_from_an_empty_book(tmp_path):
     sess = _session([_bar(0, gap_fired=True)])
     replay.apply_bar(sess, 0, _ALL_BOTS, _db(tmp_path, 1))
-    assert virtualbook.load(path=_db(tmp_path, 1))
-    assert virtualbook.load(path=_db(tmp_path, 2)) == []
+    assert replay.load_book(_db(tmp_path, 1))
+    assert replay.load_book(_db(tmp_path, 2)) == []
 
 
 def test_next_attempt_skips_books_already_on_disk(tmp_path):
@@ -137,28 +135,36 @@ def test_next_attempt_ignores_unrelated_files(tmp_path):
 
 
 def test_the_real_book_is_never_touched(tmp_path):
-    """Whatever a replay does, ``store``'s default DB must stay untouched."""
-    real = tmp_path / "trades.db"
-    before = len(store.load_trades(real))
+    """Whatever a replay does, the application database must stay untouched."""
+    from stockanalyzer.auth import AuthService
+    from stockanalyzer.db.models import Base
+
+    engine = db_session.configure_engine(f"sqlite:///{tmp_path / 'real.db'}")
+    Base.metadata.create_all(engine)
+    real_owner = AuthService().create_user("real-owner", "correct horse battery staple").id
     sess = _session([_bar(0, gap_fired=True), _bar(1), _bar(2, low=95.0)])
     for i in range(3):
         replay.apply_bar(sess, i, _ALL_BOTS, _db(tmp_path))
-    assert len(store.load_trades(real)) == before == 0
-    assert virtualbook.load(path=_db(tmp_path))
+    replay.force_flat(sess, _db(tmp_path))
+    assert virtualbook.load(user_id=real_owner) == []
+    assert replay.load_book(_db(tmp_path))
+    engine.dispose()
 
 
 def test_a_replay_never_reaches_postgres_even_when_it_is_configured(tmp_path,
                                                                     monkeypatch):
-    """On the NUC ``DATABASE_URL`` routes the default book to PostgreSQL. A replay
-    passes its own ``path`` on every call, so it must stay in its SQLite file —
-    practice trades in the production book would corrupt the real sample."""
+    """On the NUC ``DATABASE_URL`` routes the application book to PostgreSQL. A
+    replay binds the repositories to its own sandbox file, so it must never even
+    create the application engine — practice trades in the production book would
+    corrupt the real sample."""
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://unused@nowhere/db")
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_factory", None)
 
-    class _Forbidden:
-        def __getattr__(self, name):
-            raise AssertionError(f"replay reached the PostgreSQL repository ({name})")
+    def _forbidden(*_a, **_k):
+        raise AssertionError("replay reached the application database")
 
-    monkeypatch.setattr(virtualbook, "_REPOSITORY", _Forbidden())
+    monkeypatch.setattr(db_session, "configure_engine", _forbidden)
     db = _db(tmp_path)
     sess = _session([_bar(0, gap_fired=True), _bar(1), _bar(2, close=106.0)])
     for i in range(3):
@@ -166,18 +172,19 @@ def test_a_replay_never_reaches_postgres_even_when_it_is_configured(tmp_path,
     replay.force_flat(sess, db)
     card = replay.scorecard(sess, db)
     assert card["book"] and all(r["status"] == "closed" for r in card["book"])
+    assert db_session._engine is None
 
 
 # --------------------------------------------------------------------------- #
 # Per-bar lifecycle.
 # --------------------------------------------------------------------------- #
 def test_positions_are_stamped_with_the_bar_clock_not_the_wall_clock(tmp_path):
-    """A replayed trade opened at 09:45 on 2026-06-18 must say so — the store's
+    """A replayed trade opened at 09:45 on 2026-06-18 must say so — the book's
     expiry and Friday-flat logic both read these timestamps."""
     db = _db(tmp_path)
     sess = _session([_bar(0, gap_fired=True)])
     replay.apply_bar(sess, 0, _ALL_BOTS, db)
-    rows = virtualbook.load(path=db)
+    rows = replay.load_book(db)
     assert rows
     for row in rows:
         assert row["opened_ts"] == sess.bars[0].epoch
@@ -190,7 +197,7 @@ def test_a_bar_that_spans_both_levels_is_resolved_as_the_stop(tmp_path):
                      _bar(1, low=101.0, high=109.0, close=105.0)])
     replay.apply_bar(sess, 0, _ALL_BOTS, db)
     replay.apply_bar(sess, 1, _ALL_BOTS, db)
-    for row in virtualbook.load(path=db):
+    for row in replay.load_book(db):
         assert row["status"] == "closed"
         assert row["close_reason"] == "stop_hit"
         assert row["closed_ts"] == sess.bars[1].epoch
@@ -202,7 +209,7 @@ def test_a_position_is_not_judged_against_the_bar_it_opened_on(tmp_path):
     db = _db(tmp_path)
     sess = _session([_bar(0, gap_fired=True, low=101.0, high=109.0)])
     replay.apply_bar(sess, 0, _ALL_BOTS, db)
-    rows = virtualbook.load(path=db)
+    rows = replay.load_book(db)
     assert rows and all(r["status"] == "open" for r in rows)
 
 
@@ -221,7 +228,7 @@ def test_stepping_one_bar_at_a_time_equals_a_fast_forward(tmp_path):
                        r["exit_price"], r["opened_ts"], r["closed_ts"])
                       for r in rows)
 
-    assert _cmp(virtualbook.load(path=slow)) == _cmp(virtualbook.load(path=fast))
+    assert _cmp(replay.load_book(slow)) == _cmp(replay.load_book(fast))
 
 
 def test_only_one_position_per_trader_per_ticker(tmp_path):
@@ -229,7 +236,7 @@ def test_only_one_position_per_trader_per_ticker(tmp_path):
     sess = _session([_bar(0, gap_fired=True), _bar(1, gap_fired=True)])
     replay.apply_bar(sess, 0, _ALL_BOTS, db)
     replay.apply_bar(sess, 1, _ALL_BOTS, db)
-    traders = [r["trader"] for r in virtualbook.load(path=db)]
+    traders = [r["trader"] for r in replay.load_book(db)]
     assert sorted(traders) == sorted(set(traders))
 
 
@@ -240,7 +247,7 @@ def test_toggles_off_means_signal_only(tmp_path):
     db = _db(tmp_path)
     sess = _session([_bar(0, gap_fired=True, rev_fired=True, go=True)])
     replay.apply_bar(sess, 0, _NO_BOTS, db)
-    assert virtualbook.load(path=db) == []
+    assert replay.load_book(db) == []
     assert sess.bars[0].bots.any_fired is True      # the signal still exists
 
 
@@ -253,7 +260,7 @@ def test_each_toggle_places_only_its_own_bots(tmp_path, key, expected):
     db = _db(tmp_path)
     sess = _session([_bar(0, gap_fired=True, rev_fired=True, go=True)])
     replay.apply_bar(sess, 0, {**_NO_BOTS, key: True}, db)
-    assert {r["trader"] for r in virtualbook.load(path=db)} == expected
+    assert {r["trader"] for r in replay.load_book(db)} == expected
 
 
 def test_the_replay_runs_the_same_swing_roster_as_the_live_radar():
@@ -268,19 +275,19 @@ def test_bot_70_takes_a_strong_plan_that_falls_short_of_go(tmp_path):
     db = _db(tmp_path)
     replay.apply_bar(_session([_bar(0, go=False, score=74)]), 0,
                      {**_NO_BOTS, "swing": True}, db)
-    assert {r["trader"] for r in virtualbook.load(path=db)} == {"bot-70"}
+    assert {r["trader"] for r in replay.load_book(db)} == {"bot-70"}
 
 
 def test_bot_70_stands_aside_on_an_extended_plan(tmp_path):
     db = _db(tmp_path)
     replay.apply_bar(_session([_bar(0, go=False, score=74, extended=True)]), 0,
                      {**_NO_BOTS, "swing": True}, db)
-    assert virtualbook.load(path=db) == []
+    assert replay.load_book(db) == []
 
 
 def test_bot_brk_arms_a_pending_order_and_fills_on_the_break(tmp_path):
     """The breakout bot is the only one that doesn't enter at market: it arms a
-    trigger, and the store's two-phase fill decides whether the break confirms."""
+    trigger, and the book's two-phase fill decides whether the break confirms."""
     db = _db(tmp_path)
     bars = [_bar(0, kind="breakout_wait", trigger=104.0, score=60,
                  high=103.0, low=102.5, close=102.8),
@@ -289,12 +296,12 @@ def test_bot_brk_arms_a_pending_order_and_fills_on_the_break(tmp_path):
     sess = _session(bars)
 
     replay.apply_bar(sess, 0, {**_NO_BOTS, "swing": True}, db)
-    row = virtualbook.load(path=db)[0]
+    row = replay.load_book(db)[0]
     assert row["trader"] == "bot-BRK" and row["status"] == "pending"
 
     replay.apply_bar(sess, 1, {**_NO_BOTS, "swing": True}, db)
     replay.apply_bar(sess, 2, {**_NO_BOTS, "swing": True}, db)
-    row = virtualbook.load(path=db)[0]
+    row = replay.load_book(db)[0]
     assert row["status"] in ("open", "closed"), "the armed breakout never filled"
     assert row["activated_ts"] in (sess.bars[1].epoch, sess.bars[2].epoch)
 
@@ -311,7 +318,7 @@ def test_the_gap_pair_is_an_ab_test_on_identical_geometry(tmp_path):
     db = _db(tmp_path)
     replay.apply_bar(_session([_bar(0, gap_fired=True)]), 0,
                      {**_NO_BOTS, "orb": True}, db)
-    rows = {r["trader"]: r for r in virtualbook.load(path=db)}
+    rows = {r["trader"]: r for r in replay.load_book(db)}
     fixed, managed = rows["bot-gap-fixed"], rows["bot-gap-mgd"]
     assert (fixed["entry"], fixed["stop"], fixed["target"]) == \
            (managed["entry"], managed["stop"], managed["target"])
@@ -324,7 +331,7 @@ def test_a_swing_bot_stands_aside_on_a_non_actionable_plan(tmp_path):
     bar = _bar(0, go=True)
     sess = _session([replay.ReplayBar(**{**bar.__dict__, "actionable": False})])
     replay.apply_bar(sess, 0, {**_NO_BOTS, "swing": True}, db)
-    assert virtualbook.load(path=db) == []
+    assert replay.load_book(db) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +344,7 @@ def test_force_flat_closes_everything_at_the_last_bar(tmp_path):
         replay.apply_bar(sess, i, _ALL_BOTS, db)
     closed = replay.force_flat(sess, db)
     assert closed
-    rows = virtualbook.load(path=db)
+    rows = replay.load_book(db)
     assert all(r["status"] == "closed" for r in rows)
     assert all(r["close_reason"] == "eod" for r in closed)
     assert all(r["exit_price"] == sess.bars[-1].close for r in closed)
@@ -373,19 +380,21 @@ def test_missed_signals_price_what_standing_aside_cost(tmp_path):
 def test_a_signal_you_took_is_not_reported_as_missed(tmp_path):
     db = _db(tmp_path)
     sess = _session([_bar(0, gap_fired=True), _bar(1, high=109.0)])
-    virtualbook.open_position(ticker="TEST", trader="me", entry=104.0, stop=102.0,
-                              target=108.0, now=sess.bars[0].epoch, path=db)
+    with replay.book(db) as owner:
+        virtualbook.open_position(ticker="TEST", trader="me", entry=104.0, stop=102.0,
+                                  target=108.0, now=sess.bars[0].epoch, user_id=owner)
     assert replay.missed_signals(sess, db) == []
 
 
 def test_excursions_are_computed_for_manual_trades(tmp_path):
-    """The store only tracks MFE/MAE on managed rows, so a manual trade would read
+    """The book only tracks MFE/MAE on managed rows, so a manual trade would read
     0/0 — these come from the session bars instead."""
     db = _db(tmp_path)
     sess = _session([_bar(0), _bar(1, high=110.0, low=99.0), _bar(2)])
-    row = virtualbook.open_position(ticker="TEST", trader="me", entry=100.0,
-                                    stop=98.0, target=106.0,
-                                    now=sess.bars[0].epoch, path=db)
+    with replay.book(db) as owner:
+        row = virtualbook.open_position(ticker="TEST", trader="me", entry=100.0,
+                                        stop=98.0, target=106.0,
+                                        now=sess.bars[0].epoch, user_id=owner)
     mfe, mae = replay.excursions(sess, row, upto=2)
     assert mfe == pytest.approx(10.0)
     assert mae == pytest.approx(-1.0)

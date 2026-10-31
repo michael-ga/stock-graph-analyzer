@@ -2,13 +2,13 @@
 
 Every position in the book carries *why* it was opened: the plan's checks and
 reasons, the per-timeframe signals and indicator values, the verdict, the
-recommendation. That's what makes post-hoc analysis (`store.algorithm_correctness`,
+recommendation. That's what makes post-hoc analysis (`virtualbook.algorithm_correctness`,
 `losing_trade_patterns`) possible at all — without it a closed trade is just a
 number with no testable hypothesis attached.
 
 These builders are pure dicts with no UI dependency, so the live radar, the
 bots, and the replay simulator all produce identically-shaped snapshots. That
-shape matters: `store.trade_stats` groups by ``snapshot["setup"]`` and
+shape matters: `virtualbook.stats` groups by ``snapshot["setup"]`` and
 ``["score"]``, so a divergent builder silently degrades those groupings to "?".
 """
 from __future__ import annotations

@@ -497,3 +497,42 @@ bot for either setup is its own `[ALGO]` PR with the user's approval.
 **Next session, start here:** after ~20 new sessions (late Nov 2026) run
 `python -m stockanalyzer.setups.harness SNXX SNDQ NBIZ NBIS --days 20` on only the
 sessions after 2026-10-23. That is the first true out-of-sample read for H8/H9.
+
+---
+
+### 2026-10-31 — persistence: SQLite `store.py` retired (no decision change; algo-gate BLOCKED statically, 0 behavioral flips)
+
+**What changed:** `stockanalyzer/data/store.py` (SQLite `trades.db`) is gone.
+`virtualbook`, `papertrade`, `manage`, the replay simulator and
+`algolab/analyze.py` now go only through the SQLAlchemy repositories
+(`db/repositories/trades.py`, `paper_trades.py`) — the same PostgreSQL path the
+live bots already used. Older entries above that cite `store.<fn>` map 1:1 onto
+`TradeRepository.<fn>` (`trade_stats` → `stats`, `manage_trades` → `manage`,
+`mark_trades` → `mark`, `query_closed_trades` → `closed_trades`); the
+fill/stop/expiry/cohort logic is the same code the live book runs.
+
+**Replay books** are now *sandbox* books (`db/sandbox.py`): one SQLite file per
+practice attempt under `.replay/`, with the full app schema, bound to the
+repositories only inside `with replay.book(path)`. A replay can no longer create
+the application engine at all (pinned by `test_replay_book.py`).
+
+**Gate:** `scripts/algo_gate.py --base origin/feat/main-safe-merge` → **BLOCKED**
+on the static layer only (execution functions `mark`/`manage`/`open_position`/
+`apply_bar` were edited). Behavioral layer: swing plans 200/200, `_BOTS` table
+24/24, replay intraday bars 68/68, walk-forward backtest 200/200 — **0 changed,
+0 decision flips**, backtest headline identical (32 traded, 75.0% WR).
+
+**Known differences** (all were already true of the live PostgreSQL book, so the
+replay now matches live instead of the retired SQLite path):
+1. a managed `weekend_flat` close stores the spread-adjusted exit price (P&L was
+   already spread-adjusted) — in the replay this nudges `trade_r` for that one
+   exit reason on Friday sessions;
+2. a sandbox/user book ignores any `.virtualbook.json` (no more JSON seeding).
+
+**What it means for the loop:** the book is **per user**, so run
+`python algolab/analyze.py --user <name>` (with `DATABASE_URL` set; on the NUC via
+`docker compose exec app …`). A legacy `trades.db` can still be imported with
+`scripts/migrate_legacy_data.py`, which now also carries over each trade's
+signals / indicators / verdict / swing-checks, so view 3 (losing-trade patterns)
+covers imported history too. No baseline reset — no score, setup or exit rule
+was touched.

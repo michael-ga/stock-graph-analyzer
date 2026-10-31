@@ -2,8 +2,11 @@
 
 Personal technical-analysis app (Python / Streamlit). Entry point `app.py`;
 engine in `stockanalyzer/` (`analysis/`, `explain/swing.py`, `verdict/`); virtual
-paper-trading book + all persistence in `stockanalyzer/data/store.py` (SQLite
-`trades.db`). Indicators are hand-rolled in `stockanalyzer/analysis/indicators.py`.
+paper-trading book in `stockanalyzer/virtualbook.py` / `papertrade.py`. All
+persistence is SQLAlchemy (`stockanalyzer/db/`: `models.py`, `session.py`,
+`repositories/`) on PostgreSQL in production (`DATABASE_URL`); every book/journal
+call is scoped by a keyword-only `user_id`. Indicators are hand-rolled in
+`stockanalyzer/analysis/indicators.py`.
 Intraday setups live one per file in `stockanalyzer/setups/`; to add one from an
 idea, use the `setup-lab` skill (`.claude/skills/setup-lab/SKILL.md`).
 
@@ -12,7 +15,8 @@ idea, use the `setup-lab` skill (`.claude/skills/setup-lab/SKILL.md`).
 `algolab/` is the algorithm-development learning loop. Its job is to stop us
 re-deriving the same wrong conclusions each session.
 
-1. Run `python algolab/analyze.py` for the current post-mortem.
+1. Run `python algolab/analyze.py --user <name>` (needs `DATABASE_URL`) for the
+   current post-mortem.
 2. Read `algolab/LEARNINGS.md` — check **Ruled out / do not repeat** and **Open
    hypotheses** before forming a theory.
 3. Make small, reversible changes; run `pytest`.
@@ -22,8 +26,8 @@ re-deriving the same wrong conclusions each session.
 
 **Statistical discipline (the recurring trap):** the book copies one plan across
 several bots, so raw row counts overstate the sample. Judge the *algorithm* on the
-deduped **idea-level** view (`store.algorithm_correctness`, grouped by
-`cohort_id`), and the *bots* on `store.trade_stats`. Do not re-weight the score or
+deduped **idea-level** view (`virtualbook.algorithm_correctness`, grouped by
+`cohort_id`), and the *bots* on `virtualbook.stats`. Do not re-weight the score or
 kill a setup on a single session's data — see the guardrails in `LEARNINGS.md`.
 
 ## Pull requests that change the algorithm — mark them `[ALGO]` (mandatory)
@@ -63,7 +67,7 @@ APP_ENV=development DATABASE_URL=sqlite:///.local/dev.db .venv/Scripts/python.ex
 APP_ENV=development DATABASE_URL=sqlite:///.local/dev.db RADAR_WORKER_HEARTBEAT=.local/radar-worker-heartbeat .venv/Scripts/python.exe -m stockanalyzer.radar_worker
 ```
 
-Use `.local/dev.db`, never the real `trades.db`. Migrate first with
+Use `.local/dev.db`, never a production database. Migrate first with
 `python -m alembic upgrade head` under the same `DATABASE_URL`.
 
 **Skip the password locally:** add `DEV_AUTO_LOGIN=<username>` to the app's
@@ -75,14 +79,19 @@ shows the normal sign-in form for the rest of that browser session. Never set
 
 ## Tests
 
-`pytest` (uses `STOCKANALYZER_DB` env for DB isolation — never writes the real
-`trades.db`). Run the full suite before declaring a change done.
+`pytest` — persistence tests run the real repositories against a throwaway SQLite
+file per test (`tests/conftest.py`: `book_db` / `owner` fixtures); nothing touches
+a real database. PostgreSQL-specific tests run when `POSTGRES_TEST_URL` is set
+(CI does this, see `.github/workflows/ci.yml`). Run the full suite before
+declaring a change done.
 
 ## Conventions
 
-- Persistence is functional, module-level functions with a default `db_path`
-  (see `store.py`); match that style.
-- Schema changes go through a versioned migration in `store._ensure_schema`
-  (bump `SCHEMA_VERSION`, add an `if current < N:` block with guarded `ALTER`s).
-  The `_DDL` runs on every connect *before* migrations, so it must not reference a
-  column that only a later migration adds.
+- Domain modules (`virtualbook`, `papertrade`, `watchlist`, …) stay functional
+  module-level APIs; they delegate to a repository class in `db/repositories/`
+  that opens a `session_scope()` per operation. Match that split.
+- Schema changes: edit `db/models.py` **and** add an Alembic revision in
+  `alembic/versions/` (the container runs `alembic upgrade head` on start). CI
+  runs upgrade → downgrade → upgrade → `alembic check` on PostgreSQL, so models
+  and migrations must not drift.
+- Never add a SQLite-only code path; SQLite is for tests only.

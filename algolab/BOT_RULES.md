@@ -9,10 +9,10 @@
 Code map:
 - Entry signals / GO gate: `stockanalyzer/explain/swing.py` (`build_swing_plan`, `_build_side`)
 - Bot entry wiring: `app.py` `_BOTS`, `_run_bots`, `_run_gap_bots`
-- Fixed exits: `stockanalyzer/data/store.py` `mark_trades`
-- Managed exits: `stockanalyzer/manage.py` `assess_position` + `store.manage_trades`
+- Fixed exits: `stockanalyzer/db/repositories/trades.py` `TradeRepository.mark`
+- Managed exits: `stockanalyzer/manage.py` `assess_position` + `TradeRepository.manage`
 - Session clock: `stockanalyzer/session.py`
-- Measurement: `store.algorithm_correctness`, `store.trade_stats`, `store.managed_vs_fixed`
+- Measurement: `TradeRepository.algorithm_correctness`, `.stats`, `.managed_vs_fixed` (via `virtualbook`)
 
 ---
 
@@ -104,7 +104,7 @@ under the opening-range low), `target = entry + 2R` (`_ORB_TARGET_R`). Both gap 
   then (2) fill only on the **throwback to entry**. Runs-away-without-retest → expires
   unfilled; collapses through stop before fill → cancelled (not a loss). No spread haircut.
 
-### 5b. Managed exit (`manage.assess_position`, `store.manage_trades`) — `bot-gap-mgd` only
+### 5b. Managed exit (`manage.assess_position`, `TradeRepository.manage`) — `bot-gap-mgd` only
 `R = entry − init_stop` (pinned at open so trailing never shrinks R). Priority order:
 
 | Rule | Trigger | Action | Canonical basis |

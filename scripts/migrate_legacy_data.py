@@ -7,7 +7,6 @@ from datetime import date
 from pathlib import Path
 from sqlalchemy import select
 from stockanalyzer.config import Settings
-from stockanalyzer.data.store import load_paper_trades, load_trades
 from stockanalyzer.db.models import User
 from stockanalyzer.db.repositories.paper_trades import PaperTradeRepository
 from stockanalyzer.db.repositories.rate_limits import RateLimitRepository
@@ -15,13 +14,9 @@ from stockanalyzer.db.repositories.swingwatch import SwingWatchRepository
 from stockanalyzer.db.repositories.trades import TradeRepository
 from stockanalyzer.db.repositories.watchlist import WatchlistRepository
 from stockanalyzer.db.session import configure_engine, session_scope, transaction_scope
-
-
-def _symbols(path: Path) -> list[str]:
-    if not path.exists(): return []
-    value = json.loads(path.read_text())
-    if isinstance(value, dict): value = value.get("tickers", value.get("symbols", []))
-    return sorted({str(item).strip().upper() for item in value if str(item).strip()})
+from stockanalyzer.migrations.legacy import (
+    read_legacy_paper_trades, read_legacy_trades, read_symbol_file,
+)
 
 
 def _rate_counts(path: Path) -> tuple[date | None, dict[str, int]]:
@@ -53,9 +48,9 @@ def main() -> None:
         user = session.scalar(select(User).where(User.username == args.username.strip().lower()))
         if user is None: raise SystemExit("Target user does not exist")
         user_id = user.id
-    trades = load_trades(args.sqlite) if args.sqlite.exists() else []
-    papers = load_paper_trades(args.sqlite) if args.sqlite.exists() else []
-    watch = _symbols(args.watchlist); swing = _symbols(args.swingwatch)
+    trades = read_legacy_trades(args.sqlite) if args.sqlite.exists() else []
+    papers = read_legacy_paper_trades(args.sqlite) if args.sqlite.exists() else []
+    watch = read_symbol_file(args.watchlist); swing = read_symbol_file(args.swingwatch)
     rate_day, rate_counts = _rate_counts(args.ratelimit)
     print({"trades": len(trades), "paper_trades": len(papers),
            "watchlist": len(watch), "swingwatch": len(swing),
