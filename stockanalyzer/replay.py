@@ -20,14 +20,15 @@ No Streamlit import lives here on purpose — everything below is unit-testable.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pandas as pd
 
 from stockanalyzer import virtualbook
 from stockanalyzer.analysis import asof
-from stockanalyzer.setups import orb, reversal
+from stockanalyzer.setups import SETUPS, orb, reversal
+from stockanalyzer.setups.base import SetupContext, SetupDecision
 from stockanalyzer.analysis.daycard import DayCard, build_day_card
 from stockanalyzer.data.schema import Timeframe, validate_ohlcv
 from stockanalyzer.db.sandbox import sandbox_book
@@ -68,8 +69,9 @@ SWING_BOTS = (
 )
 SWING_BOT = SWING_BOTS[0][0]        # kept for callers that only mean bot-GO
 
-# The auto-place toggle keys the UI owns.
-BOT_KEYS = ("orb", "rev", "swing")
+# The auto-place toggle keys the UI owns. "setups" are the setups/ registry's
+# variants: replayable here, never traded by a live bot.
+BOT_KEYS = ("orb", "rev", "swing", "setups")
 
 
 # --------------------------------------------------------------------------- #
@@ -87,14 +89,20 @@ class BotVerdicts:
     swing_go: bool
     swing_block: str                    # "" when the swing plan says GO
     contradiction: str | None           # momentum setup vetoed by a mean-reversion gate
+    setups: tuple[SetupDecision, ...] = ()   # one per setups/ variant; replay only
 
     @property
     def fired_reversals(self) -> tuple[reversal.ReversalDecision, ...]:
         return tuple(d for d in self.reversals if d.fired)
 
     @property
+    def fired_setups(self) -> tuple[SetupDecision, ...]:
+        return tuple(d for d in self.setups if d.fired)
+
+    @property
     def any_fired(self) -> bool:
-        return self.orb.fired or bool(self.fired_reversals) or self.swing_go
+        return (self.orb.fired or bool(self.fired_reversals) or self.swing_go
+                or bool(self.fired_setups))
 
 
 @dataclass(frozen=True)
@@ -376,6 +384,30 @@ def live_bar(reports, price, now, orange: dict | None, prev_close, plan) -> Repl
     return _eval_bar(0, pd.Timestamp(now), row, reports, rng, prev_close, plan=plan)
 
 
+def _setup_reads(i5, daily_y1, day, prev_close, sess_full, bars: list) -> list:
+    """Every setups/ variant's read at each replay bar, built from the same as-of
+    context the setups harness uses (session so far, the previous session, today's
+    pre-market, daily bars before today), so a replayed setup trade matches the
+    harness's. Live mode never calls this: no live bot trades a setup."""
+    from stockanalyzer.setups.harness import MIN_SESSION_BARS   # harness imports replay
+    if not SETUPS or not bars or len(sess_full) < MIN_SESSION_BARS:
+        return bars
+    variants = [(m, cfg) for m in SETUPS.values() for cfg in m.VARIANTS]
+    allday = asof.day_bars(i5, day)
+    pre = allday.between_time("04:00", asof.REG_START, inclusive="left")
+    prior = [d for d in asof.trading_days(i5) if d < day]
+    prev = (asof.day_bars(i5, prior[-1]).between_time(
+        asof.REG_START, asof.REG_END, inclusive="left") if prior else None)
+    dly = (daily_y1[asof.naive_dates(daily_y1.index) < day]
+           if daily_y1 is not None else None)
+    out = []
+    for b in bars:
+        ctx = SetupContext(sess_full[sess_full.index <= b.t], prev, pre, prev_close, dly)
+        reads = tuple(m.signal(ctx, cfg) for m, cfg in variants)
+        out.append(replace(b, bots=replace(b.bots, setups=reads)))
+    return out
+
+
 def precompute_day(i5, i30, daily, day, prev_close, ticker: str = "",
                    progress=None) -> ReplaySession:
     """Walk 09:45 → 15:55 and freeze every bar's decision.
@@ -410,6 +442,7 @@ def precompute_day(i5, i30, daily, day, prev_close, ticker: str = "",
         if progress is not None:
             progress(n + 1, total)
 
+    bars = _setup_reads(i5, daily.get(Timeframe.Y1), day, prev_close, sess_full, bars)
     fired = tuple(b.i for b in bars if b.bots.any_fired)
     return ReplaySession(ticker=ticker, day=day, prev_close=prev_close,
                          orange=orange, bars=tuple(bars), session_full=sess_full,
@@ -538,6 +571,33 @@ def apply_bar(sess: ReplaySession, i: int, bots: dict, db: Path) -> list[dict]:
             if row:
                 events.append({"bar": i, "t": bar.clock, "kind": "open", "row": row})
 
+    return events
+
+
+def apply_setups(sess: ReplaySession, i: int, bots: dict, db: Path) -> list[dict]:
+    """Open the setups that fired on bar ``i``; call it right after ``apply_bar``.
+
+    Kept apart so ``apply_bar``, the replay's copy of live bot execution, is
+    untouched by setups no live bot trades. A setup's resting order that filled
+    inside this bar and whose stop the bar also reached is closed at the stop now:
+    stop-first, the way the setups harness judges the fill bar. Only that position
+    is touched, never another bot's.
+    """
+    bar, events = sess.bars[i], []
+    if not bots.get("setups"):
+        return events
+    for dec in bar.bots.fired_setups:
+        row = _open(dec.variant, sess.ticker, bar, db, entry=dec.entry, stop=dec.stop,
+                    target=dec.target, snap={"setup": dec.setup, "reason": dec.reason})
+        if not row:
+            continue
+        events.append({"bar": i, "t": bar.clock, "kind": "open", "row": row})
+        if dec.filled_intrabar and bar.low <= dec.stop:
+            with book(db) as owner:
+                closed = virtualbook.close_position(row["id"], dec.stop, "stop_hit",
+                                                    now=bar.epoch, user_id=owner)
+            if closed:
+                events.append({"bar": i, "t": bar.clock, "kind": "mark", "row": closed})
     return events
 
 

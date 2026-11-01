@@ -316,3 +316,21 @@ def test_live_bar_is_none_without_daily_data():
                            None, 99.0, plan=None) is None
     assert replay.live_bar(None, 100.0, pd.Timestamp("2026-06-18 10:00", tz=asof.ET),
                            None, 99.0, plan=None) is None
+
+
+def test_every_bar_reads_every_setup_variant_on_a_full_session(sess, hist):
+    from stockanalyzer.setups import SETUPS
+    from stockanalyzer.setups.harness import MIN_SESSION_BARS
+    names = {cfg.name for m in SETUPS.values() for cfg in m.VARIANTS}
+    # The fixture's short day is skipped, exactly as the harness skips it ...
+    assert len(sess.session_full) < MIN_SESSION_BARS
+    assert all(b.bots.setups == () for b in sess.bars)
+    # ... and a full session reads every variant on every bar.
+    full = replay._setup_reads(hist["i5"], hist["daily"].get(replay.Timeframe.Y1), _DAY,
+                               100.0, pd.DataFrame(100.0, columns=sess.session_full.columns,
+                                                   index=pd.date_range(sess.session_full.index[0],
+                                                                       periods=78, freq="5min")),
+                               list(sess.bars))
+    for bar in full:
+        assert {d.variant for d in bar.bots.setups} == names
+        assert all(d.reason for d in bar.bots.setups)      # a fire or a stand-aside reason

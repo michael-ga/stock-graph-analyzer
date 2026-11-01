@@ -50,6 +50,29 @@ It does three things:
 
    Any differing output is an algorithm change, direct or indirect.
 3. **Confirmed mode only:** the full `pytest` suite on both trees, plus the no-regression checks below.
+4. **Real-history A/B** (`--history fast|full`; confirmed mode runs `fast` by default).
+   `scripts/algo_replay_ab.py` replays real yfinance days on base and change and compares,
+   per bot and per setup: trades, days, **win %**, avg R, **net R**, plus a whole-book row.
+   - Bots: Gap-and-Go and the `rev-*` reversals through the replay simulator. Swing is
+     out of scope here; the walk-forward backtest above covers it.
+   - Setups: every `SETUPS` variant through the setups harness (fast). On trees whose
+     replay runs setups, the report also checks the replay book against the harness
+     ("Setups parity").
+   - **The script picks the days**, so the AI doesn't have to: per ticker, every day with
+     a ≥1% gap (Gap-and-Go candidates, by either open), then the widest-range days, up to
+     20 (`fast`) or 12 (`full`) per ticker. Setups run on every day. Override with
+     `--from/--to`, `--max-days`, `--all-days` or explicit tickers.
+   - `fast` = SNXX SNDQ NBIZ NBIS (NBIC is too illiquid; NBIS stands in). `full` adds
+     INTC AMD NVDA TSLA PLTR SMCI MU SNDK. **Ask the user which; default `fast`.**
+   - **Regression (owner's rule: net R + win %):** FAIL when the whole-book net R falls, or
+     a bot/setup on both sides whose trades changed loses net R or more than 5 points of
+     win %. In detection mode, any changed real-history trade of an existing bot/setup is
+     BLOCKED.
+   - Cost: ~12 s per replayed ticker-day per tree, jobs in parallel; results are cached in
+     `.local/replay-ab/cache` by a hash of each tree's code, so an unchanged base replays
+     once. Run it in the background.
+   - Standalone, e.g. to judge a PR branch against its base:
+     `.venv/Scripts/python.exe scripts/algo_replay_ab.py --base <merge-base> --change <ref> --mode fast --report .local/replay-ab.md`
 
 ## Verdicts and what to do
 

@@ -161,3 +161,16 @@ def test_rule_table_covers_every_state_and_shows_each_threshold():
     # The watch-only chokepoint: nothing fires on a non-actionable or extended plan.
     assert table["immediate|go=True|actionable=False|extended=False"]["by_score"] == ["0-100:-"]
     assert table["immediate|go=True|actionable=True|extended=True"]["by_score"] == ["0-100:-"]
+
+
+def test_history_layer_blocks_on_existing_bots_and_renders_its_table():
+    hist = {"bots": [{"bot-gap-fixed": {}}, {"bot-gap-fixed": {}, "sb-am-bias": {}}],
+            "changed_bots": ["bot-gap-fixed", "sb-am-bias"], "regressions": [],
+            "report": "# Replay A/B: **TRADES DIFFER, no regression**\n\n## Per bot\n| x |\n"}
+    assert gate.history_moves(hist) == ["bot-gap-fixed"]      # a new setup is not a "move"
+    ctx = {"verdict": "BLOCKED", "base": "b", "merge_base": "0" * 8, "branch": "x",
+           "confirmed": False, "reasons": [], "static": [], "setups": [], "history": hist,
+           "compare": {"sections": {}, "errors": {}, "summary": {}}}
+    report = gate.render(ctx)
+    assert "## 4. Real-history A/B: non-swing bots and setups" in report
+    assert "Verdict: **TRADES DIFFER, no regression**" in report and "#### Per bot" in report

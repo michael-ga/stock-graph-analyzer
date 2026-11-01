@@ -397,3 +397,47 @@ def test_excursions_are_computed_for_manual_trades(tmp_path):
     mfe, mae = replay.excursions(sess, row, upto=2)
     assert mfe == pytest.approx(10.0)
     assert mae == pytest.approx(-1.0)
+
+
+# --------------------------------------------------------------------------- #
+# 🎯 Setups in the replay (never in live mode).
+# --------------------------------------------------------------------------- #
+def _with_setup(bar, *, entry=104.0, stop=102.5, target=106.0, intrabar=False):
+    from dataclasses import replace
+
+    from stockanalyzer.setups.base import SetupDecision
+    dec = SetupDecision(True, "test fire", "double_bottom", "xfade-dbl-bottom",
+                        entry=entry, stop=stop, target=target, rr=1.0,
+                        filled_intrabar=intrabar)
+    return replace(bar, bots=replace(bar.bots, setups=(dec,)))
+
+
+def test_a_fired_setup_trades_only_when_its_toggle_is_on(tmp_path):
+    db = _db(tmp_path)
+    sess = _session([_with_setup(_bar(0))])
+    assert sess.bars[0].bots.any_fired is True
+    replay.apply_bar(sess, 0, {**_ALL_BOTS, "setups": False}, db)
+    replay.apply_setups(sess, 0, _NO_BOTS, db)
+    assert [r["trader"] for r in replay.load_book(db)] == []             # bar fires no bot
+    replay.apply_bar(sess, 0, {**_NO_BOTS, "setups": True}, db)          # apply_bar ignores it
+    assert replay.load_book(db) == []
+    replay.apply_setups(sess, 0, {**_NO_BOTS, "setups": True}, db)
+    [row] = replay.load_book(db)
+    assert row["trader"] == "xfade-dbl-bottom" and row["status"] == "open"
+
+
+def test_a_resting_setup_order_stopped_inside_its_fill_bar_is_a_full_loss(tmp_path):
+    db = _db(tmp_path)
+    sess = _session([_with_setup(_bar(0, low=102.0), stop=102.5, intrabar=True),
+                     _with_setup(_bar(1), stop=102.5, intrabar=True)])
+    replay.apply_setups(sess, 0, {**_NO_BOTS, "setups": True}, db)
+    [row] = replay.load_book(db)
+    assert row["close_reason"] == "stop_hit" and row["exit_price"] == 102.5
+    assert replay.trade_r(row) == -1.0
+
+
+def test_the_setups_family_is_a_replay_toggle_and_a_scan_family():
+    assert "setups" in replay.BOT_KEYS
+    from stockanalyzer import replay_scan
+    bar = _with_setup(_bar(0))
+    assert ("setups", "xfade-dbl-bottom", 104.0) in replay_scan.bar_signals(bar)
