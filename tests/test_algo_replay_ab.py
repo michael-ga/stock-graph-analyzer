@@ -138,3 +138,33 @@ def test_tree_fingerprint_moves_with_any_package_file(tmp_path):
     before = ab.tree_fingerprint(tmp_path)
     (pkg / "feed.py").write_text("X = 2\n", encoding="utf-8")   # an *input*, not decision code
     assert ab.tree_fingerprint(tmp_path) != before
+
+
+def test_pick_days_takes_gap_days_first_then_the_widest_ranges():
+    import pandas as pd
+
+    def day(d, pre_open, open_, lo, hi):
+        pre = pd.date_range(f"{d} 08:00", periods=2, freq="5min", tz="America/New_York")
+        reg = pd.date_range(f"{d} 09:30", periods=78, freq="5min", tz="America/New_York")
+        rows = [(pre_open, pre_open, pre_open, pre_open)] * 2 + [(open_, hi, lo, open_)] * 78
+        return pd.DataFrame(rows, columns=["open", "high", "low", "close"], index=pre.append(reg))
+
+    i5 = pd.concat([day("2026-10-19", 100, 100, 99, 101),       # quiet: 2% range
+                    day("2026-10-20", 100, 100, 95, 105),       # wide: 10% range
+                    day("2026-10-21", 103, 100, 99.5, 100.5),   # pre-market gap 3%
+                    day("2026-10-22", 100, 100, 98, 102)])      # 4% range
+    days = [pd.Timestamp(d) for d in ("2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22")]
+    hist = {"i5": i5, "days": days, "prev_close": {d: 100.0 for d in days}}
+    picks = ab.pick_days(hist, 2)
+    assert [(p["day"], p["why"]) for p in picks] == [("2026-10-20", "range"), ("2026-10-21", "gap")]
+    assert len(ab.pick_days(hist, 10)) == 4                         # cap above the window
+    assert [p["day"] for p in ab.pick_days(hist, 1, start="2026-10-22")] == ["2026-10-22"]
+
+
+def test_parity_flags_any_setup_trade_the_two_judges_disagree_on():
+    rep = [{"trader": "xfade-dbl-bottom", "in": "11:30", "entry": 98.2, "r": 1.0}]
+    har = [{"trader": "xfade-dbl-bottom", "in": "11:30", "entry": 98.2, "gross_r": 1.0, "r": 0.98}]
+    assert ab.parity(rep, har) == []
+    assert ab.parity(rep, [{**har[0], "gross_r": -1.0}]) == [
+        "R differs ('xfade-dbl-bottom', '11:30', 98.2): replay 1.0 vs harness -1.0"]
+    assert ab.parity([], har) == ["harness only ('xfade-dbl-bottom', '11:30', 98.2)"]

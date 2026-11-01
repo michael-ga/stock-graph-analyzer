@@ -136,6 +136,7 @@ def bar_signals(bar: replay.ReplayBar) -> list[tuple[str, str, float | None]]:
         out += [("orb", name, bar.bots.orb.entry) for name, _ in replay.GAP_BOTS]
     out += [("rev", d.variant, d.entry) for d in bar.bots.fired_reversals]
     out += [("swing", name, bar.entry) for name in replay.armed_swing_bots(bar)]
+    out += [("setups", d.variant, d.entry) for d in bar.bots.fired_setups]
     return out
 
 
@@ -147,6 +148,7 @@ def summarize(sess: replay.ReplaySession, db: Path) -> DayResult:
                          prev_close=sess.prev_close, error="no session bars")
     for i in range(len(sess.bars)):
         replay.apply_bar(sess, i, ALL_BOTS, db)
+        replay.apply_setups(sess, i, ALL_BOTS, db)
     replay.force_flat(sess, db)
 
     signals, families, signal_bars = [], [], 0

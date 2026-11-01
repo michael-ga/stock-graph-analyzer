@@ -49,7 +49,8 @@ Every such PR, whoever opens it:
    - a before → after table of each changed rule, threshold or input;
    - each commit and the files and functions it changes;
    - the evidence: `algo-gate` verdict and, for paths the frozen probes cannot reach,
-     a real-history replay A/B (trades per bot, before → after, the days that changed);
+     a real-history replay A/B (`algo_gate.py --history fast|full`: trades, win % and
+     net R per bot and setup, before → after, the days that changed);
    - what is not covered and why;
    - the dated `algolab/LEARNINGS.md` entry it adds.
 3. **Algorithm changes ship in their own PR**, never mixed into a non-algorithm PR.

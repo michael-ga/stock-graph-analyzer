@@ -58,8 +58,42 @@ MODES = {
     "full": ("INTC", "AMD", "NVDA", "TSLA", "PLTR", "SMCI", "MU", "SNDK",
              "SNXX", "SNDQ", "NBIZ", "NBIS"),
 }
+MAX_DAYS = {"fast": 20, "full": 12}     # replayed ticker-days per ticker (bots)
+GAP_PICK = 0.01             # a gap this size either way may become a Gap-and-Go day
 WIN_PCT_DROP = 5.0          # points of win % an existing bot/setup may not lose
 _EPS = 1e-9
+
+
+def pick_days(hist: dict, max_days: int, start=None, end=None) -> list[dict]:
+    """The ticker-days worth replaying for the bots: every day with a ≥1% gap (from
+    the 09:30 open or the pre-market open, so a change to how the gap is measured
+    still lands on a replayed day), then the widest-range days, where reversals
+    and managed exits get exercised. Setups don't need this: they replay every day.
+    Pure and cheap (5-minute bars only), so both trees replay the same days."""
+    import pandas as pd
+    i5, pcs = hist["i5"], hist["prev_close"]
+    idx = i5.index.tz_localize(None) if i5.index.tz is not None else i5.index
+    rows = []
+    for d in hist["days"]:
+        if (start is not None and d < pd.Timestamp(start)) or (end is not None and d > pd.Timestamp(end)):
+            continue
+        bars = i5[idx.normalize() == d]
+        reg = bars.between_time("09:30", "15:55")
+        pc = pcs.get(d)
+        if reg.empty or not pc:
+            continue
+        o = float(reg["open"].iloc[0])
+        gap = max(abs(o / pc - 1), abs(float(bars["open"].iloc[0]) / pc - 1))
+        rng = (float(reg["high"].max()) - float(reg["low"].min())) / o
+        rows.append({"day": f"{d:%Y-%m-%d}", "gap": round(gap * 100, 2),
+                     "range": round(rng * 100, 2)})
+    gaps = sorted((r for r in rows if r["gap"] >= GAP_PICK * 100), key=lambda r: -r["gap"])
+    picked = {r["day"]: {**r, "why": "gap"} for r in gaps[:max_days]}
+    for r in sorted(rows, key=lambda r: -r["range"]):
+        if len(picked) >= max_days:
+            break
+        picked.setdefault(r["day"], {**r, "why": "range"})
+    return sorted(picked.values(), key=lambda r: r["day"])
 
 
 # --------------------------------------------------------------------------- #
@@ -79,15 +113,32 @@ def _bots_rows(replay, replay_scan, hist, ticker, day) -> dict:
     """One replay day boiled down to the non-swing bots."""
     keep = {name for name, _ in replay.GAP_BOTS}
     keep |= {cfg.name for cfg in replay.reversal.REVERSAL_VARIANTS}
+    setup_names = {cfg.name for m in getattr(replay, "SETUPS", {}).values() for cfg in m.VARIANTS}
     row = asdict(replay_scan.scan_day(hist, ticker, day))
-    trades = []
+    trades, replayed_setups = [], []
     for t in row.get("trades") or []:
         if t["trader"] in keep:
             fam = "orb" if t["trader"].startswith("bot-gap") else "rev"
             trades.append({**t, "family": fam})
+        elif t["trader"] in setup_names:
+            replayed_setups.append(t)             # setups the tree's replay also ran
     return {"ticker": ticker, "day": row["day"], "error": row.get("error", ""),
-            "trades": trades,
+            "trades": trades, "replayed_setups": replayed_setups,
             "signals": [s for s in row.get("signals") or [] if s["bot"] in keep]}
+
+
+def parity(replayed: list[dict], harness: list[dict]) -> list[str]:
+    """Replay-book setup trades vs the harness's for one day: same variants, entry
+    clock, entry price and gross R (to 0.01), or a line saying what differs."""
+    def key(t):
+        return (t["trader"], t["in"], round(float(t["entry"]), 2))
+    a = {key(t): t["r"] for t in replayed}
+    b = {key(t): t["gross_r"] for t in harness}
+    out = [f"replay only {k}" for k in a.keys() - b.keys()]
+    out += [f"harness only {k}" for k in b.keys() - a.keys()]
+    out += [f"R differs {k}: replay {a[k]} vs harness {b[k]}" for k in a.keys() & b.keys()
+            if a[k] is not None and abs(a[k] - b[k]) > 0.011]
+    return out
 
 
 def _setup_trades(tree_setups, hist, i, ticker, timeframe) -> list[dict]:
@@ -107,7 +158,8 @@ def _setup_trades(tree_setups, hist, i, ticker, timeframe) -> list[dict]:
 
 
 def worker(tree: Path, hist_dir: Path, out: Path, start: str | None, end: str | None,
-           ticker: str, load_only: bool, cache_dir: Path | None = None) -> None:
+           ticker: str, load_only: bool, cache_dir: Path | None = None,
+           max_days: int | None = None) -> None:
     sys.path.insert(0, str(tree.resolve()))
     import pandas as pd
     from stockanalyzer import replay, replay_scan
@@ -128,8 +180,14 @@ def worker(tree: Path, hist_dir: Path, out: Path, start: str | None, end: str | 
         hist = replay.load_history(ticker)
         raw = pickle.dumps(hist)
         pk.write_bytes(raw)
+    picks_file = hist_dir / f"{ticker}.picks-{max_days}-{start}-{end}.json"
     if load_only:
+        if max_days:                              # chosen once, read by both trees
+            picks_file.write_text(json.dumps(pick_days(hist, max_days, start, end)),
+                                  encoding="utf-8")
         return
+    picked = ({p["day"] for p in json.loads(picks_file.read_text(encoding="utf-8"))}
+              if max_days else None)
 
     cache_file, cached = None, {}
     if cache_dir is not None:
@@ -148,13 +206,24 @@ def worker(tree: Path, hist_dir: Path, out: Path, start: str | None, end: str | 
         if (lo is not None and d < lo) or (hi is not None and d > hi) or d not in replayable:
             continue
         k = f"{d:%Y-%m-%d}"
-        if k in cached:
-            rows.append(cached[k])
+        replay_it = picked is None or k in picked
+        if k in cached and (cached[k].get("replayed") or not replay_it):
+            row = cached[k]
+            if not replay_it:                     # keep only what this run covers
+                row = {**row, "trades": [t for t in row["trades"] if t["family"] == "setups"],
+                       "signals": [], "replayed": False}
+            rows.append(row)
             hits += 1
             continue
         try:
-            row = _bots_rows(replay, replay_scan, hist, ticker, d)
-            row["trades"] += _setup_trades(tree_setups, hist, i, ticker, Timeframe)
+            row = (_bots_rows(replay, replay_scan, hist, ticker, d) if replay_it else
+                   {"ticker": ticker, "day": k, "error": "", "trades": [], "signals": []})
+            row["replayed"] = replay_it
+            setups_today = _setup_trades(tree_setups, hist, i, ticker, Timeframe)
+            if replay_it and "setups" in replay.BOT_KEYS:
+                row["parity"] = parity(row.pop("replayed_setups", []), setups_today)
+            row.pop("replayed_setups", None)
+            row["trades"] += setups_today
         except Exception as exc:                  # one bad day must not sink the run
             row = {"ticker": ticker, "day": k, "trades": [], "signals": [],
                    "error": f"{type(exc).__name__}: {exc}"}
@@ -265,7 +334,10 @@ def render(cmp: dict, ctx: dict) -> str:
            f"Base `{ctx['base']}` vs `{ctx['change']}`. Mode `{ctx['mode']}`: "
            f"{', '.join(ctx['tickers'])}. Days {ctx['start']} → {ctx['end']} "
            f"({cmp['days']} ticker-days). Wall time {ctx['wall']}s"
-           + (f", cache hits {ctx['cache_hits']}" if ctx.get("cache_hits") else "") + ".", ""]
+           + (f", cache hits {ctx['cache_hits']}" if ctx.get("cache_hits") else "") + ".",
+           *([f"Coverage: {ctx['coverage']}."] if ctx.get("coverage") else []),
+           *([f"Setups parity (replay book vs harness, change side): {ctx['parity']}."]
+             if ctx.get("parity") else []), ""]
     if regs:
         out += ["## Regressions (net R + win % rule)", ""] + [f"- {r}" for r in regs] + [""]
     out += ["## Per bot and setup (base → change)", "",
@@ -338,6 +410,9 @@ def main(argv=None) -> int:
     ap.add_argument("--json", dest="json_out", help="also write the comparison as JSON")
     ap.add_argument("--refresh", action="store_true", help="refetch history even if cached today")
     ap.add_argument("--no-cache", action="store_true", help="replay every day again")
+    ap.add_argument("--max-days", type=int, help="ticker-days per ticker the bots replay "
+                    "(default: fast 20, full 12; gap days first, then the most active)")
+    ap.add_argument("--all-days", action="store_true", help="replay the bots on every day")
     ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--load-only", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--tree", help=argparse.SUPPRESS)
@@ -348,7 +423,8 @@ def main(argv=None) -> int:
 
     if a.worker:
         worker(Path(a.tree), Path(a.hist), Path(a.out or os.devnull), a.start, a.end,
-               a.tickers[0], a.load_only, Path(a.cache) if a.cache else None)
+               a.tickers[0], a.load_only, Path(a.cache) if a.cache else None,
+               a.max_days)
         return 0
     if not a.base:
         ap.error("--base is required")
@@ -364,6 +440,7 @@ def main(argv=None) -> int:
         shutil.rmtree(hist)
     hist.mkdir(parents=True, exist_ok=True)
     cache = None if a.no_cache else local / "cache"
+    max_days = None if a.all_days else (a.max_days or MAX_DAYS[a.mode])
 
     scratch = Path(tempfile.mkdtemp(prefix="replay-ab-"))
     base_tree = scratch / "base"
@@ -380,6 +457,7 @@ def main(argv=None) -> int:
                    "--hist", str(hist), tk, "--to", end]
             cmd += ["--from", start] if start else []
             cmd += ["--cache", str(cache)] if cache is not None else []
+            cmd += ["--max-days", str(max_days)] if max_days else []
             cmd += ["--load-only"] if load_only else ["--out", str(out)]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode:
@@ -394,16 +472,20 @@ def main(argv=None) -> int:
         with ThreadPoolExecutor(max_workers=a.jobs) as pool:
             list(pool.map(lambda j: run(j[1], j[2], scratch / f"{j[0]}-{j[2]}.json"), jobs))
 
-        hits = 0
+        hits, replayed, parity_checked, parity_bad = 0, 0, 0, []
 
         def collect(side: str) -> dict:
-            nonlocal hits
+            nonlocal hits, replayed, parity_checked, parity_bad
             rows = {}
             for tk in tickers:
                 data = json.loads((scratch / f"{side}-{tk}.json").read_text(encoding="utf-8"))
                 hits += data.get("cache_hits", 0)
                 for r in data["rows"]:
                     rows[(r["ticker"], r["day"])] = r
+                    replayed += bool(r.get("replayed", True)) and side == "change"
+                    if side == "change" and "parity" in r:
+                        parity_checked += 1
+                        parity_bad += [f"{r['ticker']} {r['day']}: {x}" for x in r["parity"]]
             return rows
 
         cmp_ = compare(collect("base"), collect("change"))
@@ -412,7 +494,14 @@ def main(argv=None) -> int:
                "change": a.change or (_git("branch", "--show-current", cwd=root) or "working tree"),
                "mode": a.mode if not a.tickers else "custom", "tickers": tickers,
                "start": start or (days[0] if days else "?"), "end": days[-1] if days else end,
-               "wall": round(time.time() - t0), "cache_hits": hits}
+               "wall": round(time.time() - t0), "cache_hits": hits,
+               "parity": (f"{parity_checked} replayed ticker-days, "
+                          + (f"{len(parity_bad)} mismatches: " + "; ".join(parity_bad[:10])
+                             if parity_bad else "replay book and harness agree")
+                          if parity_checked else None),
+               "coverage": (f"bots replayed on {replayed} of {cmp_['days']} ticker-days "
+                            f"({'every day' if not max_days else f'≤{max_days}/ticker: gap ≥1% days, then the widest ranges'}); "
+                            f"setups on all {cmp_['days']}")}
         report = render(cmp_, ctx)
         sys.stdout.buffer.write(report.encode("utf-8"))
         if a.report:

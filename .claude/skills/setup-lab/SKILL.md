@@ -87,6 +87,11 @@ the rule — don't add variants after seeing results.
 
 ## 5. Backtest
 
+To compare a change against its base on real history (every bot and setup, win % and
+net R before → after), use the `algo-gate` skill's `--history` layer
+(`scripts/algo_replay_ab.py`). To watch a setup trade, open the Replay page and turn on
+🎯 Setups.
+
 ```bash
 .venv/Scripts/python.exe -m stockanalyzer.setups.harness SNXX SNDQ NBIZ NBIS --setup <name> --days 40 --null 200
 .venv/Scripts/python.exe -m stockanalyzer.setups.harness SNXX SNDQ NBIZ NBIS --setup <name> --days 20 --offset 40
