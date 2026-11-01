@@ -36,7 +36,7 @@ from stockanalyzer.user_management import UserManagementService
 from stockanalyzer.config import ConfigurationError, Settings
 from stockanalyzer.db.repositories.analysis_history import AnalysisHistoryRepository
 from stockanalyzer.db.session import configure_engine
-from stockanalyzer.analysis import reversal
+from stockanalyzer.setups import reversal
 from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
 from stockanalyzer.analysis.engine import CATEGORY_WEIGHTS, analyze_timeframe
 from stockanalyzer.explain.swing import (_MIN_RR, build_swing_plan,
@@ -719,11 +719,11 @@ _is_extended = swing_is_extended
 
 # --------------------------------------------------------------------------- #
 # Gap-and-Go (opening-range breakout) — Carter-style intraday rules.
-# The decision logic lives in stockanalyzer.analysis.orb (pure + testable); this
+# The decision logic lives in stockanalyzer.setups.orb (pure + testable); this
 # module keeps the Streamlit/session wiring and delegates the rules to it, so the
 # live radar and daytrade_backtest.py share one code path.
 # --------------------------------------------------------------------------- #
-from stockanalyzer.analysis import orb as _orb  # noqa: E402
+from stockanalyzer.setups import orb as _orb  # noqa: E402
 
 _GAP_MIN_PCT       = _orb.GAP_MIN_PCT
 _OPENING_RANGE_MIN = _orb.OPENING_RANGE_MIN

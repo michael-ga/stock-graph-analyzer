@@ -17,6 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_paths_are_classified_by_their_role_in_a_decision():
     assert gate._area("stockanalyzer/explain/swing.py") == "core"
     assert gate._area("stockanalyzer/analysis/orb.py") == "core"
+    assert gate._area("stockanalyzer/setups/orb.py") == "core"          # every setup,
+    assert gate._area("stockanalyzer/setups/double_bottom.py") == "core"  # traded or not
+    assert gate._area("stockanalyzer/setups/base.py") == "core"
+    assert gate._area("stockanalyzer/setups/harness.py") == "simulator"
     assert gate._area("stockanalyzer/pipeline.py") == "inputs"
     assert gate._area("stockanalyzer/data/providers.py") == "inputs"
     assert gate._area("app.py") == "execution"
@@ -24,6 +28,83 @@ def test_paths_are_classified_by_their_role_in_a_decision():
     assert gate._area("stockanalyzer/replay.py") == "simulator"
     assert gate._area("docs/local-setup.md") is None
     assert gate._area("stockanalyzer/ui/history.py") is None
+
+
+def _repo(tmp_path: Path) -> tuple[Path, str]:
+    """A throwaway git repo with one core file committed; returns (root, base sha)."""
+    def run(*args):
+        return gate.git("-c", "user.name=t", "-c", "user.email=t@t", *args, cwd=tmp_path)
+    run("init", "-q")
+    src = tmp_path / "stockanalyzer" / "analysis" / "orb.py"
+    src.parent.mkdir(parents=True)
+    helpers = "".join(f"\n\ndef helper_{i}(p):\n    return p * {i} + {i}\n" for i in range(12))
+    src.write_text("from .daycard import x\n\nGAP = 0.02\n\ndef signal(p):\n    return p > GAP\n"
+                   + helpers, encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-q", "-m", "base")
+    return tmp_path, run("rev-parse", "HEAD")
+
+
+def test_a_moved_decision_file_is_compared_with_its_old_path(tmp_path):
+    root, base = _repo(tmp_path)
+    new = root / "stockanalyzer" / "setups" / "orb.py"
+    new.parent.mkdir(parents=True)
+    old = root / "stockanalyzer" / "analysis" / "orb.py"
+    new.write_text(old.read_text(encoding="utf-8").replace(
+        "from .daycard", "from ..analysis.daycard"), encoding="utf-8")
+    old.unlink()
+    gate.git("add", "-A", cwd=root)
+    [item] = gate.static_scan(root, base)
+    assert item["path"] == "stockanalyzer/setups/orb.py"
+    assert item["moved_from"] == "stockanalyzer/analysis/orb.py"
+    assert item["area"] == "core" and item["functions"] == []   # imports only: no change
+
+    new.write_text(new.read_text(encoding="utf-8").replace("0.02", "0.03"), encoding="utf-8")
+    [item] = gate.static_scan(root, base)
+    assert item["functions"] == ["GAP (changed)"]                 # a move can't hide an edit
+
+    new.write_text("def signal(p):\n    return True\n", encoding="utf-8")   # a rewrite:
+    items = {i["path"]: i for i in gate.static_scan(root, base)}          # delete + add
+    assert "signal (removed)" in items["stockanalyzer/analysis/orb.py"]["functions"]
+    assert "signal (added)" in items["stockanalyzer/setups/orb.py"]["functions"]
+
+
+_REVERSAL = ('REVERSAL_VARIANTS: list[C] = [\n    C("rev-trend-touch", "with_trend", "touch"),\n'
+             '    C("rev-strong-touch", "strong_support", "touch"),\n]\n')
+
+
+def test_variants_are_read_from_every_variants_list():
+    assert gate._variants(_REVERSAL) == ["rev-strong-touch", "rev-trend-touch"]
+    assert gate._variants('VARIANTS = [Cfg("sb-am-bias")]\n') == ["sb-am-bias"]
+    assert gate._variants("GAP_MIN_PCT = 0.02\n") == []                 # orb: no variants
+
+
+def test_adding_or_removing_a_setup_or_variant_is_reported_but_a_move_is_not():
+    base = gate.setup_inventory({"stockanalyzer/analysis/orb.py": "X = 1\n",
+                                 "stockanalyzer/analysis/reversal.py": _REVERSAL})
+    moved = gate.setup_inventory({"stockanalyzer/setups/orb.py": "X = 1\n",
+                                  "stockanalyzer/setups/reversal.py": _REVERSAL,
+                                  "stockanalyzer/setups/base.py": "MIN_RR = 1.0\n",
+                                  "stockanalyzer/setups/harness.py": "",
+                                  "stockanalyzer/setups/__init__.py": ""})
+    assert gate.inventory_diff(base, moved) == []                      # support files aren't setups
+
+    grown = {**moved, "silver_bullet": ["sb-am-bias"], "reversal": ["rev-trend-touch"]}
+    assert gate.inventory_diff(base, grown) == [
+        "setup added: `silver_bullet` (variants: sb-am-bias)",
+        "`reversal` variants removed: rev-strong-touch"]
+    assert gate.inventory_diff(base, {"reversal": base["reversal"]}) == ["setup removed: `orb`"]
+
+
+def test_setup_changes_compares_the_merge_base_with_the_working_tree(tmp_path):
+    root, base = _repo(tmp_path)
+    (root / "stockanalyzer" / "setups").mkdir(parents=True)
+    gate.git("mv", "stockanalyzer/analysis/orb.py", "stockanalyzer/setups/orb.py", cwd=root)
+    assert gate.setup_changes(root, base) == []                        # a move adds nothing
+    (root / "stockanalyzer" / "setups" / "double_bottom.py").write_text(
+        'VARIANTS = [Cfg("xfade-dbl-bottom")]\n', encoding="utf-8")     # untracked new file
+    assert gate.setup_changes(root, base) == [
+        "setup added: `double_bottom` (variants: xfade-dbl-bottom)"]
 
 
 def test_defs_see_function_and_constant_changes_but_not_formatting():
@@ -80,3 +161,16 @@ def test_rule_table_covers_every_state_and_shows_each_threshold():
     # The watch-only chokepoint: nothing fires on a non-actionable or extended plan.
     assert table["immediate|go=True|actionable=False|extended=False"]["by_score"] == ["0-100:-"]
     assert table["immediate|go=True|actionable=True|extended=True"]["by_score"] == ["0-100:-"]
+
+
+def test_history_layer_blocks_on_existing_bots_and_renders_its_table():
+    hist = {"bots": [{"bot-gap-fixed": {}}, {"bot-gap-fixed": {}, "sb-am-bias": {}}],
+            "changed_bots": ["bot-gap-fixed", "sb-am-bias"], "regressions": [],
+            "report": "# Replay A/B: **TRADES DIFFER, no regression**\n\n## Per bot\n| x |\n"}
+    assert gate.history_moves(hist) == ["bot-gap-fixed"]      # a new setup is not a "move"
+    ctx = {"verdict": "BLOCKED", "base": "b", "merge_base": "0" * 8, "branch": "x",
+           "confirmed": False, "reasons": [], "static": [], "setups": [], "history": hist,
+           "compare": {"sections": {}, "errors": {}, "summary": {}}}
+    report = gate.render(ctx)
+    assert "## 4. Real-history A/B: non-swing bots and setups" in report
+    assert "Verdict: **TRADES DIFFER, no regression**" in report and "#### Per bot" in report
