@@ -99,6 +99,15 @@ class TradeRepository:
                 Trade.trader == trader, Trade.status.in_(("open", "pending")),
             ).limit(1)) is not None
 
+    def entered_since(self, user_id: str, ticker: str, trader: str, since: float) -> bool:
+        """True if ``trader`` had a position on ``ticker`` filled at or after ``since``
+        (a pending order that never filled doesn't count)."""
+        with session_scope() as session:
+            return session.scalar(select(Trade.id).where(
+                Trade.user_id == user_id, Trade.ticker == ticker.upper(),
+                Trade.trader == trader, Trade.activated_ts >= since,
+            ).limit(1)) is not None
+
     def has_any_open(self, user_id: str, ticker: str) -> bool:
         with session_scope() as session:
             return session.scalar(select(Trade.id).where(
