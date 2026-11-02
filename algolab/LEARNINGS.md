@@ -70,6 +70,13 @@ again without materially more data:**
   book. Any "perf fix" that changes which timeframes reach `build_verdict` must be
   treated as a scoring change and measured as one. (The long frames are cached on
   disk for 6–24h anyway, so they are rarely the actual cost — measure first.)
+- ❌ **A wider reversal stop (0.5% / 1.0% under support instead of 0.2%)** —
+  2026-11-02, rev-strong-touch + knife guard, latest 40 sessions x 12 tickers: wins
+  more often (21–25% vs 18%) but loses more per trade (net −0.28 / −0.31 R vs +0.07).
+  The reversal losses are real knives, not noise stop-outs.
+- ❌ **Retired reversal variants `rev-trend-touch` and `rev-strong-confirm`** (2026-11-02):
+  0% win Sep–Oct for trend-touch (−11.8 R over both windows), sign flips by regime for
+  strong-confirm. Don't bring them back without a new spec.
 - ❌ **Failed-breakdown, second-chance retest and resistance→support longs on
   2x single-stock ETFs (5-min, as specced 2026-10-25).** Negative in the 40-session
   screen *and* the 20-session holdout, across opposite regimes: failed breakdown
@@ -540,3 +547,62 @@ replay now matches live instead of the retired SQLite path):
 signals / indicators / verdict / swing-checks, so view 3 (losing-trade patterns)
 covers imported history too. No baseline reset — no score, setup or exit rule
 was touched.
+
+---
+
+### 2026-11-02 — reversal iteration: once-per-day entries, 2 variants kept, knife guard for strong support (ALGORITHM CHANGE)
+
+**What changed (code):**
+1. **One entry per ticker per day, every bot** (owner's rule). `virtualbook.has_open`,
+   which every bot entry path checks (live radar, radar worker, replay), is also true
+   when the bot already had a position on the ticker filled today (ET);
+   `TradeRepository.entered_since` on `activated_ts`. The human trader `me` is not
+   limited; an order that never filled doesn't count. The replay passes its bar clock.
+2. **Reversal family pruned to the two survivors**: `rev-trend-confirm`,
+   `rev-strong-touch`. `rev-trend-touch` and `rev-strong-confirm` retired (Ruled out).
+3. **Knife guard for strong support**: `strong_support` stands aside on a gap-down
+   ≤ −2% too (`with_trend` already did).
+
+**How it was chosen (pre-registered in `algolab/screens/reversal_2026_11_02/screen.py`):**
+per-bar reversal inputs for 12 tickers x 59 sessions were cached once
+(`contexts.py`, `.local/rev-ctx`, 22 min), then 4 variants x 5 filters (none / knife /
+green day / after 10:30 / all three), all with the once-per-day rule, were judged like
+the replay book (open at the bar close, stop-first, flat at the close, $0.02/share).
+Picked on the latest 40 sessions (Sep 4 – Oct 30), checked on the 19 before (Aug 10 –
+Sep 3).
+- Nothing passed the strict pick rule (≥ 15 trades, > 0 in both halves and without the
+  best date). The two changes that improved **both** windows were kept:
+  once-per-day (rev-strong-touch −148 → −16 R on the screen window, better or flat on
+  the holdout) and the strong-support knife guard (rev-strong-touch −15.6 → +2.0 R
+  screen, +2.5 → +5.9 R holdout).
+- Iteration 2 (wider stop) was rejected; see Ruled out.
+- Regime matters: in the rising Aug window dip-buying worked (rev-trend-confirm 60% win,
+  5 trades); in Sep–Oct it failed, worst on the leveraged ETFs.
+
+**Real-history replay A/B** (`scripts/algo_replay_ab.py --mode full --all-days`, base =
+`feat/main-safe-merge`, 12 tickers, 2026-08-10 → 2026-10-30, every day, 708 ticker-days):
+**TRADES DIFFER, no regression.**
+
+| Bot / setup | Family | Trades | Days | Win % | Avg R | Net R | Δ net R |
+|---|---|---|---|---|---|---|---|
+| `bot-gap-fixed` | orb | 29 → 29 | 19 → 19 | 52% → 52% | +0.05 → +0.05 | +1.34 → +1.34 | +0.00 |
+| `bot-gap-mgd` | orb | 29 → 29 | 19 → 19 | 55% → 55% | +0.05 → +0.05 | +1.49 → +1.49 | +0.00 |
+| `rev-strong-confirm` **(removed)** | rev | 36 → 0 | 15 → 0 | 8% → – | -0.45 → – | -16.02 → +0.00 | +16.02 |
+| `rev-strong-touch` | rev | 163 → 37 | 38 → 27 | 10% → 19% | -0.33 → +0.43 | -53.06 → +16.07 | +69.13 |
+| `rev-trend-confirm` | rev | 24 → 12 | 11 → 11 | 21% → 25% | +0.22 → +0.97 | +5.32 → +11.63 | +6.31 |
+| `rev-trend-touch` **(removed)** | rev | 88 → 0 | 16 → 0 | 7% → – | -0.50 → – | -43.65 → +0.00 | +43.65 |
+| `sb-am-bias` | setups | 47 → 47 | 36 → 36 | 43% → 43% | +0.49 → +0.49 | +22.97 → +22.97 | +0.00 |
+| `xfade-dbl-bottom` | setups | 242 → 242 | 59 → 59 | 54% → 54% | +0.05 → +0.05 | +13.07 → +13.07 | +0.00 |
+| **Whole book** | | 658 → 396 | | 33% → 49% | | **-68.54 → +66.57** | **+135.11** |
+
+Swing bots are not in this A/B; the once-per-day rule can only stop a swing bot from
+re-buying a ticker the same day it closed one.
+
+**Open hypothesis (H11):** reversal-at-support works on regular stocks but not on daily
+2x ETFs (both windows: ETFs negative, stocks positive, but stocks n ≤ 11 per window).
+Test on new sessions before any ticker filter.
+
+**How we'll know:** run `algo_gate.py --history full` on sessions after 2026-10-30
+(refetch with `--refresh`); keep the two variants if their net R stays > 0 over ≥ 30
+distinct dates each; drop a variant if it is ≤ 0 there.
+

@@ -30,6 +30,17 @@ Code map:
 day ⇒ same `cohort_id`); they differ **only** in exit policy, so the pair is a clean
 A/B for "does active management beat a fixed exit?" (`managed_vs_fixed`).
 
+| `rev-trend-confirm` | Reversal at support (intraday) | daily uptrend, confirmed bullish reclaim of support; no gap-down ≤ −2% | fixed ~3% aim, stop 0.2% under support | 1d | no |
+| `rev-strong-touch` | Reversal at strong support (intraday) | first touch of support with ≥ 2 confirmations, any trend; no gap-down ≤ −2% (since 2026-11-02) | fixed ~3% aim, stop 0.2% under support | 1d | no |
+
+`rev-trend-touch` and `rev-strong-confirm` were retired on 2026-11-02 (LEARNINGS).
+
+**One entry per ticker per day, every bot (2026-11-02).** A bot that already entered a
+ticker today (ET) does not enter it again that day, even after its trade closed;
+`virtualbook.has_open` enforces it on every entry path (live radar, radar worker,
+replay). Different bots still enter independently, so paired bots compare on the same
+idea. The human trader (`me`) is not limited.
+
 A trade is a 3-state machine: `pending` (armed breakout) → `open` → `closed`.
 
 ---
