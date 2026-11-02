@@ -21,7 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from stockanalyzer import session as market_session, swingwatch, virtualbook
-from stockanalyzer.analysis import orb, reversal
+from stockanalyzer.setups import orb, reversal
 from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
 from stockanalyzer.data.schema import Timeframe
 from stockanalyzer.explain import UseCase

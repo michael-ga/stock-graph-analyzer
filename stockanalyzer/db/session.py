@@ -13,6 +13,9 @@ from sqlalchemy.orm import Session, sessionmaker
 _engine: Engine | None = None
 _factory: sessionmaker[Session] | None = None
 _ambient_session: ContextVar[Session | None] = ContextVar("ambient_db_session", default=None)
+# A context-local override of the session factory (see ``bound_engine``).
+_bound_factory: ContextVar[sessionmaker[Session] | None] = ContextVar(
+    "bound_db_session_factory", default=None)
 
 
 def configure_engine(database_url: str | None = None) -> Engine:
@@ -40,10 +43,32 @@ def get_engine() -> Engine:
 
 def get_session_factory() -> sessionmaker[Session]:
     global _factory
+    bound = _bound_factory.get()
+    if bound is not None:
+        return bound
     if _factory is None:
         configure_engine()
     assert _factory is not None
     return _factory
+
+
+@contextmanager
+def bound_engine(engine: Engine) -> Iterator[None]:
+    """Route every repository call in this context to ``engine`` instead of the
+    configured application database.
+
+    Used for isolated sandboxes (the replay simulator's practice books): inside
+    the block nothing can reach ``DATABASE_URL``, and the application engine is
+    never created or reconfigured. Context-local, so other threads (the live
+    app, the radar worker) keep using the real database. Any ambient
+    ``transaction_scope`` session is hidden for the duration."""
+    factory_token = _bound_factory.set(sessionmaker(bind=engine, expire_on_commit=False))
+    ambient_token = _ambient_session.set(None)
+    try:
+        yield
+    finally:
+        _ambient_session.reset(ambient_token)
+        _bound_factory.reset(factory_token)
 
 
 @contextmanager

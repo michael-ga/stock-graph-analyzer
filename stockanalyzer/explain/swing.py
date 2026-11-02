@@ -112,6 +112,17 @@ class SwingPlan:
     #                                        set, score/score_label come from it
 
 
+def is_extended(plan) -> bool:
+    """The plan's own 'too stretched / not real demand' verdict (emerging path).
+
+    Lives beside the plan rather than in the UI because it is the chokepoint every
+    auto-trader gates on — the live radar and the replay simulator must agree on
+    what "extended" means or their books stop being comparable.
+    """
+    es = getattr(plan, "emerging", None)
+    return bool(es and (es.extended or "distribution_risk" in es.flags))
+
+
 def _last(df, col: str, default: float | None = None) -> float | None:
     if col not in df:
         return default
