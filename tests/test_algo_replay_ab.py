@@ -100,10 +100,12 @@ def test_win_pct_may_drop_up_to_five_points_but_not_more():
         "`bot-gap-fixed` win % fell 95% → 80% (more than 5 points)"]
 
 
-def test_a_bot_that_stops_trading_is_named():
-    cmp_ = _cmp([_trade(r=1.0), _trade(trader="rev-a", family="rev", r=-1.0)],
-                [_trade(r=1.0)])
-    assert "`rev-a` no longer trades (was 1 trades, -1.00 R)" in cmp_["regressions"]
+def test_dropping_a_loser_is_progress_and_dropping_a_winner_fails_on_the_book():
+    loser = _cmp([_trade(r=1.0), _trade(trader="rev-a", family="rev", r=-1.0)], [_trade(r=1.0)])
+    assert loser["regressions"] == [] and ab.exit_code(loser) == 1
+    assert "`rev-a` **(removed)**" in ab.render(loser, _CTX)
+    winner = _cmp([_trade(r=1.0), _trade(trader="rev-a", family="rev", r=2.0)], [_trade(r=1.0)])
+    assert winner["regressions"] == ["whole-book net R fell +3.00 → +1.00"]
 
 
 def test_report_leads_with_regressions_and_lists_errors():

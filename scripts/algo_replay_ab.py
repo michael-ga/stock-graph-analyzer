@@ -311,9 +311,8 @@ def regressions(base: dict, change: dict, changed_bots: set[str], book: tuple) -
         if wa is not None and wb is not None and wb < wa - WIN_PCT_DROP:
             out.append(f"`{bot}` win % fell {wa:.0f}% → {wb:.0f}% (more than "
                        f"{WIN_PCT_DROP:g} points)")
-    for bot in sorted(set(base) & set(changed_bots) - set(change)):
-        out.append(f"`{bot}` no longer trades (was {base[bot]['n']} trades, "
-                   f"{base[bot]['r']:+.2f} R)")
+    # A bot or setup that no longer trades is judged by the whole-book line above:
+    # dropping a winner lowers the book (FAIL), dropping a loser raises it (progress).
     return out
 
 
