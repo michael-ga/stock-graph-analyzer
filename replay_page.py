@@ -430,7 +430,7 @@ def _bot_panel(bar, live: bool = False) -> None:
         if not live:
             ss.rp_bots["rev"] = tog.toggle("auto", value=ss.rp_bots["rev"],
                                            key="rp_bot_rev", label_visibility="collapsed")
-        with head.expander("all four variants"):
+        with head.expander("every variant"):
             for d in bar.bots.reversals:
                 st.markdown(f"`{d.variant}` {'🟢' if d.fired else '⚪'} {d.reason}")
                 st.caption(" · ".join([

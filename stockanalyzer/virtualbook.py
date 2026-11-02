@@ -39,8 +39,30 @@ def load(*, user_id: str) -> list[dict]:
     return _REPOSITORY.list(_owner(user_id))
 
 
-def has_open(ticker: str, trader: str, *, user_id: str) -> bool:
-    return _REPOSITORY.has_open(_owner(user_id), ticker, trader)
+# Traders that are people, not bots: the once-a-day rule below doesn't apply to them.
+HUMAN_TRADERS = frozenset({"me"})
+
+
+def _et_day_start(now: float | None) -> float:
+    """Epoch seconds of 00:00 US/Eastern on the day of ``now``."""
+    import pandas as pd
+    ts = pd.Timestamp(now if now is not None else time.time(), unit="s", tz="UTC")
+    return ts.tz_convert("America/New_York").normalize().timestamp()
+
+
+def has_open(ticker: str, trader: str, *, user_id: str, now: float | None = None) -> bool:
+    """True when ``trader`` may not open ``ticker`` now: it holds an open or pending
+    position there, or, for a bot, it already entered ``ticker`` today (ET).
+
+    A bot trades a ticker at most once per session: after a stop-out it does not
+    buy the same ticker again until the next day (owner's rule, 2026-11-02). Every
+    bot entry path (live radar, radar worker, replay) checks this before opening.
+    ``now`` is the decision time (the replay passes its bar clock)."""
+    owner = _owner(user_id)
+    if _REPOSITORY.has_open(owner, ticker, trader):
+        return True
+    return (trader not in HUMAN_TRADERS
+            and _REPOSITORY.entered_since(owner, ticker, trader, _et_day_start(now)))
 
 
 def open_position(*, ticker: str, trader: str, entry: float, stop: float,
@@ -129,10 +151,10 @@ TRADER_RULES = {
     "bot-BRK": "swing plan, armed breakout_wait orders",
     "bot-gap-fixed": "Gap-and-Go ORB, fixed stop/target",
     "bot-gap-mgd": "Gap-and-Go ORB, managed exit",
-    "rev-trend-touch": "reversal @ support, daily uptrend, first touch",
+    "rev-trend-touch": "reversal @ support, daily uptrend, first touch (retired 2026-11-02)",
     "rev-trend-confirm": "reversal @ support, daily uptrend, confirmed reclaim",
     "rev-strong-touch": "reversal @ strong support, any trend, first touch",
-    "rev-strong-confirm": "reversal @ strong support, any trend, confirmed reclaim",
+    "rev-strong-confirm": "reversal @ strong support, any trend, confirmed reclaim (retired 2026-11-02)",
 }
 
 

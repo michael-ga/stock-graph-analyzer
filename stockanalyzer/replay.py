@@ -504,7 +504,7 @@ def _open(trader: str, ticker: str, bar: ReplayBar, db: Path, *, entry: float,
     """Open one position in the replay book, at the *bar's* clock. Returns the row
     (or None when this trader already holds the ticker)."""
     with book(db) as owner:
-        if virtualbook.has_open(ticker, trader, user_id=owner):
+        if virtualbook.has_open(ticker, trader, user_id=owner, now=bar.epoch):
             return None
         kw = dict(ticker=ticker, trader=trader, entry=entry, stop=stop, target=target,
                   kind=kind, trigger=trigger, horizon_days=horizon_days,

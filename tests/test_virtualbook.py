@@ -159,3 +159,44 @@ def test_cancelled_excluded_from_stats(owner):
     vb.close_position(pos["id"], 0, user_id=owner)        # pending → cancelled
     s = vb.stats(vb.load(user_id=owner))
     assert s["totals"]["n"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# A bot enters a ticker at most once per ET session (owner's rule, 2026-11-02).
+# --------------------------------------------------------------------------- #
+def _et(ts: str) -> float:
+    import pandas as pd
+    return pd.Timestamp(ts, tz="America/New_York").timestamp()
+
+
+def test_a_bot_does_not_re_enter_a_ticker_it_traded_today(owner):
+    from stockanalyzer import virtualbook as vb
+    t0 = _et("2026-10-20 10:00")
+    row = vb.open_position(ticker="NBIZ", trader="rev-trend-touch", entry=30.0, stop=29.0,
+                           target=31.0, horizon_days=1, now=t0, user_id=owner)
+    assert vb.has_open("NBIZ", "rev-trend-touch", user_id=owner, now=t0) is True
+    vb.mark("NBIZ", 28.9, now=t0 + 600, user_id=owner)              # stopped out
+    assert vb.load(user_id=owner)[0]["id"] == row["id"]
+    later = _et("2026-10-20 14:00")
+    assert vb.has_open("NBIZ", "rev-trend-touch", user_id=owner, now=later) is True   # same day
+    assert vb.has_open("NBIZ", "rev-strong-touch", user_id=owner, now=later) is False  # other bot
+    assert vb.has_open("SNXX", "rev-trend-touch", user_id=owner, now=later) is False  # other ticker
+    next_day = _et("2026-10-21 09:50")
+    assert vb.has_open("NBIZ", "rev-trend-touch", user_id=owner, now=next_day) is False
+
+
+def test_the_human_trader_may_re_enter_and_unfilled_orders_do_not_count(owner):
+    from stockanalyzer import virtualbook as vb
+    t0 = _et("2026-10-20 10:00")
+    vb.open_position(ticker="AMD", trader="me", entry=100.0, stop=98.0, target=104.0,
+                     now=t0, user_id=owner)
+    vb.mark("AMD", 97.0, now=t0 + 60, user_id=owner)
+    assert vb.has_open("AMD", "me", user_id=owner, now=t0 + 3600) is False
+    vb.open_position(ticker="AMD", trader="bot-BRK", entry=105.0, stop=101.0, target=113.0,
+                     kind="breakout_wait", trigger=105.0, horizon_days=1, now=t0, user_id=owner)
+    assert vb.has_open("AMD", "bot-BRK", user_id=owner, now=t0) is True     # pending blocks
+    vb.mark("AMD", 100.0, now=t0 + 2 * 86400, user_id=owner)               # stale: cancelled
+    [brk] = [r for r in vb.load(user_id=owner) if r["trader"] == "bot-BRK"]
+    assert brk["close_reason"] == "cancelled" and brk["activated_ts"] is None
+    # An order that never filled is not an entry: same day, the bot may try again.
+    assert vb.has_open("AMD", "bot-BRK", user_id=owner, now=t0 + 3600) is False

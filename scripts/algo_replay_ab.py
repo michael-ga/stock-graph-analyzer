@@ -21,8 +21,8 @@ forward:
   every session yfinance keeps (~60) unless ``--from``/``--to`` narrow it.
 - The change is this working tree (uncommitted edits included) unless ``--change``
   names a ref; the base is a temporary checkout of ``--base``.
-- History is fetched once per ticker per day, pickled under
-  ``.local/replay-ab/hist/<date>``, and shared, so both trees replay byte-identical
+- History is fetched once and pickled under ``.local/replay-ab/hist/<date>``; later
+  runs reuse the newest fetch until ``--refresh``, and both trees replay byte-identical
   bars. Results are cached under ``.local/replay-ab/cache`` by (hash of the tree's
   ``stockanalyzer`` code, ticker, history hash): an unchanged base replays once.
 - Cost: the replay is ~12 s per ticker-day per tree (measured on INTC 2026-10-22);
@@ -311,9 +311,8 @@ def regressions(base: dict, change: dict, changed_bots: set[str], book: tuple) -
         if wa is not None and wb is not None and wb < wa - WIN_PCT_DROP:
             out.append(f"`{bot}` win % fell {wa:.0f}% → {wb:.0f}% (more than "
                        f"{WIN_PCT_DROP:g} points)")
-    for bot in sorted(set(base) & set(changed_bots) - set(change)):
-        out.append(f"`{bot}` no longer trades (was {base[bot]['n']} trades, "
-                   f"{base[bot]['r']:+.2f} R)")
+    # A bot or setup that no longer trades is judged by the whole-book line above:
+    # dropping a winner lowers the book (FAIL), dropping a loser raises it (progress).
     return out
 
 
@@ -333,7 +332,8 @@ def render(cmp: dict, ctx: dict) -> str:
     out = [f"# Replay A/B: **{verdict}**", "",
            f"Base `{ctx['base']}` vs `{ctx['change']}`. Mode `{ctx['mode']}`: "
            f"{', '.join(ctx['tickers'])}. Days {ctx['start']} → {ctx['end']} "
-           f"({cmp['days']} ticker-days). Wall time {ctx['wall']}s"
+           f"({cmp['days']} ticker-days, bars fetched {ctx.get('fetched', '?')}). "
+           f"Wall time {ctx['wall']}s"
            + (f", cache hits {ctx['cache_hits']}" if ctx.get("cache_hits") else "") + ".",
            *([f"Coverage: {ctx['coverage']}."] if ctx.get("coverage") else []),
            *([f"Setups parity (replay book vs harness, change side): {ctx['parity']}."]
@@ -408,7 +408,8 @@ def main(argv=None) -> int:
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--report", help="also write the markdown report here")
     ap.add_argument("--json", dest="json_out", help="also write the comparison as JSON")
-    ap.add_argument("--refresh", action="store_true", help="refetch history even if cached today")
+    ap.add_argument("--refresh", action="store_true",
+                    help="fetch today's bars (default: reuse the newest cached fetch)")
     ap.add_argument("--no-cache", action="store_true", help="replay every day again")
     ap.add_argument("--max-days", type=int, help="ticker-days per ticker the bots replay "
                     "(default: fast 20, full 12; gap days first, then the most active)")
@@ -435,9 +436,11 @@ def main(argv=None) -> int:
     end = a.end or (pd.Timestamp(date.today()) - pd.Timedelta(days=1)).date().isoformat()
     start = a.start
     local = root / ".local" / "replay-ab"
-    hist = local / "hist" / date.today().isoformat()
-    if a.refresh and hist.exists():
-        shutil.rmtree(hist)
+    # Reuse the newest cached fetch: the same bars mean cached results stay valid.
+    # --refresh fetches today's bars (a new window, so everything replays again).
+    fetched = sorted(p for p in (local / "hist").glob("*") if p.is_dir())
+    hist = (fetched[-1] if fetched and not a.refresh
+            else local / "hist" / date.today().isoformat())
     hist.mkdir(parents=True, exist_ok=True)
     cache = None if a.no_cache else local / "cache"
     max_days = None if a.all_days else (a.max_days or MAX_DAYS[a.mode])
@@ -493,6 +496,7 @@ def main(argv=None) -> int:
         ctx = {"base": a.base,
                "change": a.change or (_git("branch", "--show-current", cwd=root) or "working tree"),
                "mode": a.mode if not a.tickers else "custom", "tickers": tickers,
+               "fetched": hist.name,
                "start": start or (days[0] if days else "?"), "end": days[-1] if days else end,
                "wall": round(time.time() - t0), "cache_hits": hits,
                "parity": (f"{parity_checked} replayed ticker-days, "
