@@ -66,13 +66,14 @@ class ReversalDecision:
     rr: float | None = None
 
 
-# The starter "bunch" — 2 risk axes = 4 variants. Extend by adding a row; both the
-# live bots and the backtest sweep pick it up automatically (the ORB no-drift rule).
+# The live variants. Extend by adding a row; both the live bots and the backtest
+# sweep pick it up automatically (the ORB no-drift rule). Started as 2 risk axes x 2
+# = 4 variants; on 2026-11-02 rev-trend-touch (−11.8 R, 0% win in Sep–Oct) and
+# rev-strong-confirm (sign flips by regime) were retired on 59 sessions x 12 tickers
+# (algolab/screens/reversal_2026_11_02, LEARNINGS 2026-11-02).
 REVERSAL_VARIANTS: list[ReversalConfig] = [
-    ReversalConfig("rev-trend-touch",    "with_trend",     "touch"),
     ReversalConfig("rev-trend-confirm",  "with_trend",     "confirmed"),
     ReversalConfig("rev-strong-touch",   "strong_support", "touch"),
-    ReversalConfig("rev-strong-confirm", "strong_support", "confirmed"),
 ]
 
 
@@ -165,8 +166,12 @@ def reversal_signal(card: DayCard | None, intraday_df: pd.DataFrame | None,
         else:
             trend_why = ""
     else:  # strong_support: any trend, but the level must be proven
-        trend_ok = conf >= STRONG_CONF_MIN
-        trend_why = f"support only {conf} confirmation(s) (need ≥{STRONG_CONF_MIN})"
+        # The knife guard applies here too (2026-11-02): a proven level does not make
+        # a gap-down ≤ −2% safe to dip-buy (screen + holdout in algolab/LEARNINGS.md).
+        gap_down = gap_pct is not None and gap_pct <= GAP_DOWN_PCT
+        trend_ok = conf >= STRONG_CONF_MIN and not gap_down
+        trend_why = (f"gap-down {gap_pct*100:.1f}% — standing aside" if gap_down
+                     else f"support only {conf} confirmation(s) (need ≥{STRONG_CONF_MIN})")
     if not trend_ok:
         return _no(trend_why, at_support=True, support=support, support_conf=conf,
                    gap_pct=gap_pct)

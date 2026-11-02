@@ -141,3 +141,19 @@ def test_every_variant_produces_sane_geometry_when_it_fires():
             assert dec.rr > 0
             assert dec.target / dec.entry - 1 >= REV_MIN_AIM - 1e-9
     assert fired_any            # at least the touch/trend variants fire on this card
+
+
+def test_gap_down_blocks_strong_support_too():
+    # 2026-11-02: a proven level doesn't make a gap-down knife safe. Same strong
+    # support as above, but prev_close=105 puts the open ~3.8% below it.
+    card = _card(battle=[BattleZone(99.7, 40.0)], session_low=99.7)
+    dec = reversal_signal(card, None, 100.0, Direction.BEAR, 105.0, _REG, _STRONG_TOUCH)
+    assert dec.fired is False and dec.support_conf >= 2
+    assert "gap-down" in dec.reason
+
+
+def test_the_live_family_is_the_two_survivors():
+    from stockanalyzer.setups.reversal import REVERSAL_VARIANTS
+    assert [(c.name, c.trend_mode, c.entry_mode) for c in REVERSAL_VARIANTS] == [
+        ("rev-trend-confirm", "with_trend", "confirmed"),
+        ("rev-strong-touch", "strong_support", "touch")]

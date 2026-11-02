@@ -151,10 +151,10 @@ TRADER_RULES = {
     "bot-BRK": "swing plan, armed breakout_wait orders",
     "bot-gap-fixed": "Gap-and-Go ORB, fixed stop/target",
     "bot-gap-mgd": "Gap-and-Go ORB, managed exit",
-    "rev-trend-touch": "reversal @ support, daily uptrend, first touch",
+    "rev-trend-touch": "reversal @ support, daily uptrend, first touch (retired 2026-11-02)",
     "rev-trend-confirm": "reversal @ support, daily uptrend, confirmed reclaim",
     "rev-strong-touch": "reversal @ strong support, any trend, first touch",
-    "rev-strong-confirm": "reversal @ strong support, any trend, confirmed reclaim",
+    "rev-strong-confirm": "reversal @ strong support, any trend, confirmed reclaim (retired 2026-11-02)",
 }
 
 
