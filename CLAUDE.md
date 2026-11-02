@@ -7,6 +7,8 @@ persistence is SQLAlchemy (`stockanalyzer/db/`: `models.py`, `session.py`,
 `repositories/`) on PostgreSQL in production (`DATABASE_URL`); every book/journal
 call is scoped by a keyword-only `user_id`. Indicators are hand-rolled in
 `stockanalyzer/analysis/indicators.py`.
+Intraday setups live one per file in `stockanalyzer/setups/`; to add one from an
+idea, use the `setup-lab` skill (`.claude/skills/setup-lab/SKILL.md`).
 
 ## Before changing the trading algorithm — READ `algolab/LEARNINGS.md`
 
@@ -33,8 +35,11 @@ kill a setup on a single session's data — see the guardrails in `LEARNINGS.md`
 A change affects the algorithm if it can change any bot decision, **directly or
 indirectly**: the swing plan or score, any bot's gates or thresholds, Gap-and-Go,
 reversal or swing-bot rules, when or how bots execute, or any *input* those read
-(prices, quotes, `prev_close`, sessions, the data feed, `pipeline.py`). When in
-doubt, run the `algo-gate` skill; a `BLOCKED` verdict means it affects the algorithm.
+(prices, quotes, `prev_close`, sessions, the data feed, `pipeline.py`). **Adding,
+removing or renaming a setup** in `stockanalyzer/setups/` (or one of its variants)
+is an algorithm change too, even before a bot trades it: the net result depends on
+which setups exist. When in doubt, run the `algo-gate` skill; a `BLOCKED` verdict
+means it affects the algorithm.
 
 Every such PR, whoever opens it:
 
@@ -44,7 +49,8 @@ Every such PR, whoever opens it:
    - a before → after table of each changed rule, threshold or input;
    - each commit and the files and functions it changes;
    - the evidence: `algo-gate` verdict and, for paths the frozen probes cannot reach,
-     a real-history replay A/B (trades per bot, before → after, the days that changed);
+     a real-history replay A/B (`algo_gate.py --history fast|full`: trades, win % and
+     net R per bot and setup, before → after, the days that changed);
    - what is not covered and why;
    - the dated `algolab/LEARNINGS.md` entry it adds.
 3. **Algorithm changes ship in their own PR**, never mixed into a non-algorithm PR.

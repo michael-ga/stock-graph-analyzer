@@ -3,7 +3,7 @@
 A *family* of "fast reversal" setups: price pulls back into a support level inside
 the day's range and turns up; take a quick ~3% aim (capped just under the nearest
 resistance) with a hard stop just below support. Written the same way as
-``analysis/orb.py`` — a pure as-of function the live radar and
+``setups/orb.py`` — a pure as-of function the live radar and
 ``daytrade_backtest.py`` share verbatim (no drift), plus a plain config list
 (``REVERSAL_VARIANTS``) that BOTH the live bots and the backtest ``--variants``
 sweep iterate. Everything is a pure function of the day card + data + an explicit
@@ -24,8 +24,8 @@ from dataclasses import dataclass
 import pandas as pd
 
 from ..session import market_phase
-from .daycard import DayCard
-from .signals import Direction
+from ..analysis.daycard import DayCard
+from ..analysis.signals import Direction
 
 # Thresholds — single source of truth (app + backtest import these).
 REV_TARGET_PCT   = 0.03     # profit aim: ~3% above entry

@@ -49,7 +49,7 @@ _VISIBLE_BARS = 90        # width of the scrolling window
 _LEAD_BARS = 12           # breathing room to the right of "now"
 
 _BOT_LABELS = {"orb": "🚀 Gap-and-Go", "rev": "🔄 Reversal @ support",
-               "swing": "📈 Swing plan"}
+               "swing": "📈 Swing plan", "setups": "🎯 Setups"}
 
 
 # --------------------------------------------------------------------------- #
@@ -252,6 +252,7 @@ def _fire_tip(bar) -> str:
     parts += [d.variant for d in bar.bots.fired_reversals]
     if bar.go:
         parts.append("Swing GO")
+    parts += [d.variant for d in bar.bots.fired_setups]
     return f"{bar.clock} — {', '.join(parts)}"
 
 
@@ -323,8 +324,8 @@ def _apply_through(sess, upto: int) -> None:
     ss = st.session_state
     db = ss.rp_db
     for j in range(ss.rp_applied + 1, upto + 1):
-        ss.rp_events = (ss.get("rp_events", []) +
-                        replay.apply_bar(sess, j, ss.rp_bots, db))[-40:]
+        ss.rp_events = (ss.get("rp_events", []) + replay.apply_bar(sess, j, ss.rp_bots, db)
+                        + replay.apply_setups(sess, j, ss.rp_bots, db))[-40:]
         ss.rp_applied = j
 
 
@@ -465,6 +466,19 @@ def _bot_panel(bar, live: bool = False) -> None:
                 for name, w in bar.lost[:6]:
                     st.markdown(f"−{w} &nbsp; {name}", unsafe_allow_html=True)
 
+    if bar.bots.setups and not live:     # replay only: no live bot trades a setup
+        fired_set = bar.bots.fired_setups
+        with st.container(border=True):
+            head, tog = st.columns([4, 1])
+            head.markdown(f"**{_BOT_LABELS['setups']}** — " + (
+                "🟢 **FIRED**: " + ", ".join(d.variant for d in fired_set)
+                if fired_set else "⚪ none ready"))
+            ss.rp_bots["setups"] = tog.toggle("auto", value=ss.rp_bots.get("setups", False),
+                                              key="rp_bot_setups",
+                                              label_visibility="collapsed")
+            for d in bar.bots.setups:
+                head.caption(f"{'🟢' if d.fired else '⚪'} `{d.variant}` ({d.setup}): {d.reason}")
+
     if bar.bots.contradiction:
         st.warning(f"⚠️ {bar.bots.contradiction}", icon="⚠️")
 
@@ -480,6 +494,8 @@ def _sources(bar) -> dict:
         out["Gap-and-Go"] = (g.entry, g.stop, g.target)
     for d in bar.bots.fired_reversals:
         out[f"Reversal ({d.variant})"] = (d.entry, d.stop, d.target)
+    for d in bar.bots.fired_setups:
+        out[f"Setup ({d.variant})"] = (d.entry, d.stop, d.target)
     out["Freehand"] = (bar.close, round(bar.close * 0.99, 2),
                        round(bar.close * 1.02, 2))
     return out
@@ -726,7 +742,7 @@ def render() -> None:
     ss = st.session_state
     ss.setdefault("rp_speed", _DEFAULT_SPEED)
     ss.setdefault("rp_ivl", 5)
-    ss.setdefault("rp_bots", {"orb": False, "rev": False, "swing": False})
+    ss.setdefault("rp_bots", {"orb": False, "rev": False, "swing": False, "setups": False})
     ss.setdefault("rp_attempt", 0)
     ss.setdefault("rp_revealed", False)
     ss.setdefault("rp_next_at", 0.0)

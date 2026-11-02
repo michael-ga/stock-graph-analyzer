@@ -22,6 +22,8 @@ legacy/
 .last-deploy
 # Replay simulator practice books — one SQLite file per attempt, never the real book
 .replay/
+# Local dev database, worker heartbeat and research data (see CLAUDE.md "Local run")
+.local/
 # Editor/agent config and the copyrighted source PDF (rules are encoded in code)
 .claude/*
 !.claude/skills/

@@ -6,7 +6,10 @@ description: Gate a change or PR against trading-algorithm regressions. Runs eve
 # algo-gate — algorithm-regression gate
 
 The trading algorithm is the swing plan and score, the Gap-and-Go, reversal and
-swing bots, and how and when they execute. A regression can come from a file
+swing bots, how and when they execute, and **the set of setups**. The book's net
+result depends on which setups exist, so adding, removing or renaming a setup in
+`stockanalyzer/setups/` (or one of its variants) is an algorithm change, even
+before any bot trades it. A regression can come from a file
 that never looks like "algorithm" code, as with the `74d23d0` incident in
 `docs/bot-execution-rollback.md`. This gate therefore compares **behavior**, not
 just paths.
@@ -28,10 +31,18 @@ From the repo root (or a worktree), with the project venv:
 
 It does three things:
 1. **Static scan.** Changed files and top-level functions are classified as one of:
-   - `core`: `analysis/`, `explain/`, `verdict/`, `sentiment/`, `strategy.py`.
+   - `core`: `analysis/`, `explain/`, `verdict/`, `sentiment/`, `strategy.py`, and all of `setups/` (every setup, whether a bot trades it or not, plus `base.py` and the `SETUPS` registry).
    - `inputs`: `data/`, `pipeline.py`, `session.py`.
    - `execution`: `app.py`, `radar_worker.py`, `virtualbook.py` and others. Changes to bot entry points, trade-placing calls or cadence constants are flagged **sensitive**.
-   - `simulator`: `replay.py`, `backtest.py`, `daytrade_backtest.py`.
+   - `simulator`: `replay.py`, `backtest.py`, `daytrade_backtest.py`, `setups/harness.py`.
+
+   A moved file is compared with its old path, so a pure move shows no change and an edit inside a move still shows.
+
+   **Setup inventory.** The gate lists every setup (module in `setups/`, or the old
+   `analysis/orb.py` / `analysis/reversal.py`) and its variants (`*VARIANTS` rows)
+   on both sides. Any setup or variant added, removed or renamed is reported by name
+   under "Setups added or removed" and **blocks** on its own. Moving a setup is not a
+   change.
 2. **Behavioral probe** (`scripts/algo_probe.py`). This runs on a temporary checkout of the base and on the change, using frozen in-repo data:
    - Swing plans and swing-bot rules: 20 tickers × 5 points × 2 paces.
    - Every replay bar, covering Gap-and-Go, the reversal variants and the swing bots.
@@ -39,6 +50,29 @@ It does three things:
 
    Any differing output is an algorithm change, direct or indirect.
 3. **Confirmed mode only:** the full `pytest` suite on both trees, plus the no-regression checks below.
+4. **Real-history A/B** (`--history fast|full`; confirmed mode runs `fast` by default).
+   `scripts/algo_replay_ab.py` replays real yfinance days on base and change and compares,
+   per bot and per setup: trades, days, **win %**, avg R, **net R**, plus a whole-book row.
+   - Bots: Gap-and-Go and the `rev-*` reversals through the replay simulator. Swing is
+     out of scope here; the walk-forward backtest above covers it.
+   - Setups: every `SETUPS` variant through the setups harness (fast). On trees whose
+     replay runs setups, the report also checks the replay book against the harness
+     ("Setups parity").
+   - **The script picks the days**, so the AI doesn't have to: per ticker, every day with
+     a ≥1% gap (Gap-and-Go candidates, by either open), then the widest-range days, up to
+     20 (`fast`) or 12 (`full`) per ticker. Setups run on every day. Override with
+     `--from/--to`, `--max-days`, `--all-days` or explicit tickers.
+   - `fast` = SNXX SNDQ NBIZ NBIS (NBIC is too illiquid; NBIS stands in). `full` adds
+     INTC AMD NVDA TSLA PLTR SMCI MU SNDK. **Ask the user which; default `fast`.**
+   - **Regression (owner's rule: net R + win %):** FAIL when the whole-book net R falls, or
+     a bot/setup on both sides whose trades changed loses net R or more than 5 points of
+     win %. In detection mode, any changed real-history trade of an existing bot/setup is
+     BLOCKED.
+   - Cost: ~12 s per replayed ticker-day per tree, jobs in parallel; results are cached in
+     `.local/replay-ab/cache` by a hash of each tree's code, so an unchanged base replays
+     once. Run it in the background.
+   - Standalone, e.g. to judge a PR branch against its base:
+     `.venv/Scripts/python.exe scripts/algo_replay_ab.py --base <merge-base> --change <ref> --mode fast --report .local/replay-ab.md`
 
 ## Verdicts and what to do
 

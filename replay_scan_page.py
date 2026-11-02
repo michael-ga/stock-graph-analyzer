@@ -39,7 +39,7 @@ _STATUS = {   # status → (icon, cell background, label)
 }
 _SHOW = {"🟢 Traded": ("traded",), "🟡 Any signal": ("traded", "signal"),
          "All days": ("traded", "signal", "quiet", "error")}
-_FAMILY = {"orb": "🚀", "rev": "🔄", "swing": "📈"}
+_FAMILY = {"orb": "🚀", "rev": "🔄", "swing": "📈", "setups": "🎯"}
 
 
 # --------------------------------------------------------------------------- #
