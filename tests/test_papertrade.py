@@ -72,18 +72,17 @@ def test_breakout_wick_through_trigger_does_not_fill():
 
 
 # --- record / dedup ----------------------------------------------------------
-def test_record_and_dedup(tmp_path):
-    p = tmp_path / "journal.json"
+def test_record_and_dedup(owner):
     now = time.time()
     rec = dict(ts=now, ticker="NOK", level=60, entry=13.8, stop=13.2, target=14.5,
                status="open", result_pct=0.0)
-    assert record(rec, p) is True
-    assert record(dict(rec), p) is False                   # same level within 24h
+    assert record(rec, user_id=owner) is True
+    assert record(dict(rec), user_id=owner) is False                   # same level within 24h
     rec70 = dict(rec, level=70)
-    assert record(rec70, p) is True                        # higher rung records
-    assert len(load(p)) == 2
-    assert recent_duplicate(load(p), "NOK", 60, now) is True
-    assert recent_duplicate(load(p), "NOK", 60, now + 25 * 3600) is False
+    assert record(rec70, user_id=owner) is True                        # higher rung records
+    assert len(load(user_id=owner)) == 2
+    assert recent_duplicate(load(user_id=owner), "NOK", 60, now) is True
+    assert recent_duplicate(load(user_id=owner), "NOK", 60, now + 25 * 3600) is False
 
 
 # --- report card ---------------------------------------------------------------

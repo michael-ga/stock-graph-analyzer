@@ -15,7 +15,7 @@ asked for, made disciplined:
 Plus a weekend safeguard: day-trades are flattened into the Friday close unless
 explicitly flagged to hold.
 
-This module owns no DB or Streamlit state — ``data.store.manage_trades`` applies
+This module owns no DB or Streamlit state — ``TradeRepository.manage`` applies
 what it returns.
 """
 from __future__ import annotations
@@ -52,7 +52,7 @@ def breakeven_stop(entry: float) -> float:
     return round(entry + _SPREAD_PER_SHARE, 4)
 
 
-# ── intraday readouts (shared with store.manage_trades) ─────────────────────── #
+# ── intraday readouts (shared with TradeRepository.manage) ──────────────────── #
 
 def intraday_readout(reports) -> tuple[float | None, float | None]:
     """(ema8, last_close) from the shortest intraday frame, or (None, None)."""

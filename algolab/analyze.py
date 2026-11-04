@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """Algorithm post-mortem — run this at the start of every algo-dev session.
 
-Prints three views of the closed virtual book (trades.db):
+Prints the views below over ONE owner's closed virtual book (read through the
+SQLAlchemy repositories, i.e. the same PostgreSQL database the app uses):
 
   1. PER-BOT      — which trading *rule* (bot-GO / bot-70 / bot-BRK / me) earned
                     its keep. This is the original report card.
@@ -11,14 +12,18 @@ Prints three views of the closed virtual book (trades.db):
                     sample for deciding whether a setup/score actually works.
   3. LOSERS       — common failed checks / signals among losing trades.
 
-Usage (from anywhere):  python algolab/analyze.py
-Point at another DB:    STOCKANALYZER_DB=/path/to/x.db python algolab/analyze.py
+Usage (from anywhere):  DATABASE_URL=postgresql+psycopg://... python algolab/analyze.py
+On the NUC:             docker compose exec app python algolab/analyze.py --user admin
+Pick the book owner:    --user USERNAME (optional when exactly one active user exists)
+Point at another DB:    --database-url URL (default: $DATABASE_URL)
 
 Read algolab/LEARNINGS.md BEFORE acting on anything here — most single-session
 patterns are sample noise, and that file records what's already been ruled out.
 """
 from __future__ import annotations
 
+import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -29,7 +34,12 @@ try:
 except Exception:
     pass
 
-from stockanalyzer.data import store  # noqa: E402
+from sqlalchemy import select  # noqa: E402
+
+from stockanalyzer import virtualbook  # noqa: E402
+from stockanalyzer.config import redact_database_url  # noqa: E402
+from stockanalyzer.db.models import User  # noqa: E402
+from stockanalyzer.db.session import configure_engine, session_scope  # noqa: E402
 
 
 def _bar(title: str) -> None:
@@ -47,9 +57,9 @@ def _fmt_agg(a: dict) -> str:
             f"avg%={('--' if avg is None else f'{avg:+.2f}')}")
 
 
-def per_bot() -> None:
+def per_bot(user_id: str) -> None:
     _bar("1. PER-BOT REPORT CARD  (which rule makes money)")
-    s = store.trade_stats()
+    s = virtualbook.stats(user_id=user_id)
     t = s["totals"]
     if not t["n"]:
         print("No closed trades yet.")
@@ -66,9 +76,9 @@ def per_bot() -> None:
         print(f"  {k:7s} {_fmt_agg(v)}  ${v['total_pnl_usd']:+.0f}")
 
 
-def algorithm() -> None:
+def algorithm(user_id: str) -> None:
     _bar("2. ALGORITHM CORRECTNESS  (deduped: 1 vote per idea, across all bots)")
-    a = store.algorithm_correctness()
+    a = virtualbook.algorithm_correctness(user_id=user_id)
     t = a["totals"]
     if not t["n_ideas"]:
         print("No closed ideas yet.")
@@ -93,9 +103,9 @@ def algorithm() -> None:
               f"x{i['n_trades']} [{traders}]")
 
 
-def losers() -> None:
+def losers(user_id: str) -> None:
     _bar("3. LOSING-TRADE PATTERNS  (hypotheses to TEST, not conclusions)")
-    p = store.losing_trade_patterns()
+    p = virtualbook.losing_trade_patterns(user_id=user_id)
     if not p["n"]:
         print("No losing trades yet.")
         return
@@ -110,9 +120,9 @@ def losers() -> None:
             print(f"  {k}: {('--' if v is None else round(v, 4))}")
 
 
-def managed_ab() -> None:
+def managed_ab(user_id: str) -> None:
     _bar("4. MANAGED vs FIXED  (Gap-and-Go: does the smart exit beat fixed?)")
-    a = store.managed_vs_fixed()
+    a = virtualbook.managed_vs_fixed(user_id=user_id)
     if not a["n_pairs"]:
         print("No matched Gap-and-Go pairs yet (need bot-gap-mgd + bot-gap-fixed "
               "on the same idea, both closed).")
@@ -129,9 +139,9 @@ def managed_ab() -> None:
               f"fixed={p['fixed_pnl_pct']:+.2f}% ({p['fixed_reason']})")
 
 
-def bottom_line() -> None:
+def bottom_line(user_id: str) -> None:
     _bar("BOTTOM LINE  (paper dollars across all bots)")
-    rows = store.query_closed_trades()
+    rows = virtualbook.closed_trades(user_id=user_id)
     if not rows:
         print("No closed trades yet.")
         return
@@ -143,13 +153,40 @@ def bottom_line() -> None:
           f"($1,000 paper stake each)")
 
 
-def main() -> None:
-    print(f"DB: {store.DB_PATH}")
-    per_bot()
-    algorithm()
-    losers()
-    managed_ab()
-    bottom_line()
+def resolve_user(username: str | None) -> User:
+    """The book owner: ``username`` if given, else the only active user."""
+    with session_scope() as session:
+        if username:
+            user = session.scalar(
+                select(User).where(User.username == username.strip().lower()))
+            if user is None:
+                raise SystemExit(f"No user named {username!r}")
+            return user
+        users = session.scalars(
+            select(User).where(User.is_active.is_(True)).order_by(User.username)).all()
+    if len(users) == 1:
+        return users[0]
+    names = ", ".join(u.username for u in users) or "none"
+    raise SystemExit(f"Pass --user USERNAME (active users: {names})")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--user", help="username whose book to analyze")
+    parser.add_argument("--database-url", default=os.getenv("DATABASE_URL", ""),
+                        help="SQLAlchemy URL (default: $DATABASE_URL)")
+    args = parser.parse_args(argv)
+    if not args.database_url:
+        raise SystemExit("Set DATABASE_URL or pass --database-url")
+    configure_engine(args.database_url)
+    user = resolve_user(args.user)
+    print(f"DB: {redact_database_url(args.database_url)}"
+          f"  |  book owner: {user.username}")
+    per_bot(user.id)
+    algorithm(user.id)
+    losers(user.id)
+    managed_ab(user.id)
+    bottom_line(user.id)
     print("\nReminder: at small n most sub-group splits are noise. See "
           "algolab/LEARNINGS.md for what has already been ruled out, and add a "
           "dated entry there for anything you change.")

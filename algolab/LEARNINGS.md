@@ -70,6 +70,19 @@ again without materially more data:**
   book. Any "perf fix" that changes which timeframes reach `build_verdict` must be
   treated as a scoring change and measured as one. (The long frames are cached on
   disk for 6–24h anyway, so they are rarely the actual cost — measure first.)
+- ❌ **A wider reversal stop (0.5% / 1.0% under support instead of 0.2%)** —
+  2026-11-02, rev-strong-touch + knife guard, latest 40 sessions x 12 tickers: wins
+  more often (21–25% vs 18%) but loses more per trade (net −0.28 / −0.31 R vs +0.07).
+  The reversal losses are real knives, not noise stop-outs.
+- ❌ **Retired reversal variants `rev-trend-touch` and `rev-strong-confirm`** (2026-11-02):
+  0% win Sep–Oct for trend-touch (−11.8 R over both windows), sign flips by regime for
+  strong-confirm. Don't bring them back without a new spec.
+- ❌ **Failed-breakdown, second-chance retest and resistance→support longs on
+  2x single-stock ETFs (5-min, as specced 2026-10-25).** Negative in the 40-session
+  screen *and* the 20-session holdout, across opposite regimes: failed breakdown
+  −0.40R net over 155 trades / 105 underlying-days, second chance −0.30R / 92,
+  resistance→support −0.29R / 38. Re-test only with a materially different spec
+  (e.g. 1-min bars), not by nudging thresholds on the same data.
 
 ---
 
@@ -82,6 +95,10 @@ again without materially more data:**
 | H3 | **"Support test (uptrend)" is the real edge; with-trend > counter-trend.** | Support-test 6/6; Breakout(volume) 6/8; counter-trend Pullback/Momentum poor. | Watch only (n too small). | Track idea-level win-rate per setup over time. |
 | H4 | **The throwback/breakout model doesn't beat immediate entries.** | breakout_wait 9/15 (60%) vs immediate 8/13 (62%), but immediate captured ~2× profit/trade. | Watch only. | Compare idea-level avg_pnl breakout_wait vs immediate at larger n. |
 | H5 | **Active exit management beats a fixed stop/target** on identical Gap-and-Go entries. | None yet — instrumentation shipped 2026-06-21. | **Collecting.** Do NOT conclude until pairs accumulate. | `store.managed_vs_fixed()`: pair `bot-gap-mgd` vs `bot-gap-fixed` by `cohort_id`; positive mean Δ at n≥~30 pairs = management earns its place. |
+| H8 | **Extension-fade double bottom (`xfade-dbl-bottom`) has a small edge on 2x single-stock ETFs** — and it pays on whichever leg of the pair is trending up. | 2026-10-25: 60 sessions, 82 trades / 48 dates, +0.19R net, positive in both windows and both halves, beats a random-entry null (p=0.005). Cluster t vs zero 1.7: not significant. Leg split is post-hoc. | **Collecting** (backtest only, not a bot). | Re-run the harness on *new* sessions only. Keep if avg net R > 0 at ≥ 100 distinct dates and still > 0 without the best date; kill if ≤ 0 there. A daily-bias filter is a new variant, pre-registered before it's run. |
+| H9 | **ICT Silver Bullet, long mirror (`sb-am-bias`)** has an edge. | 2026-10-25: 12 trades in 60 sessions, +0.78R net, null p=0.045. n is an anecdote. | **Collecting** (backtest only). | Same keep/kill rule as H8 at ≥ 50 distinct dates. To accrue faster, add tickers, chosen before running. |
+
+(H7 is reserved for the `rev-gapfill` proposal in `docs/plans/2026-10-21-sndk-snapshot-review.md`.)
 
 ---
 
@@ -291,6 +308,306 @@ and Gap-and-Go measurements are unaffected.
 
 ---
 
+### 2026-07-26 — interactive replay simulator (observation surface, no algorithm change)
+
+**Why:** we could analyse *now* and backtest *offline*, but there was no way to sit
+inside a past session and watch it develop. `daytrade_backtest.py` already replayed
+a day bar-by-bar with strict no-lookahead — it just printed a table at the end. You
+couldn't see the chart move, pause on a bar, or take the trade yourself. That makes
+two things hard: judging a setup without hindsight bias, and *learning* the tape.
+
+**This entry changes NO algorithm behaviour.** `orb.py`, `reversal.py`, `swing.py`,
+`engine.py`, `daycard.py` and `store.py` are untouched, `SCHEMA_VERSION` stays at 5,
+and no live gate, weight or threshold moved. It is a new way to *observe* the engine.
+
+**What changed (code):**
+1. **`stockanalyzer/analysis/asof.py`** — the as-of reconstruction (`asof_intraday`,
+   `asof_daily`, `asof_reports`, `decision_rep`, `higher_trend`, …) **moved** out of
+   `daytrade_backtest.py`. The CLI now imports it under its old private names, so its
+   body is unchanged (verified: the `--variants` run reproduces the prior output).
+   This extends the H5/H6 "one pure as-of function, no drift" rule to a third
+   consumer. `tests/test_asof.py` pins it with an **import-identity test** — a future
+   edit cannot silently re-copy the logic and let the two versions drift.
+2. **`stockanalyzer/replay.py`** — headless engine. `precompute_day` walks 09:45 →
+   15:55 and freezes each bar's complete decision (swing plan scalars + all four
+   reversal variants + the ORB verdict + the blocking gate) into an immutable
+   `ReplayBar`. `apply_bar` runs the book forward one bar: `manage` → `mark`
+   (low → high → close, so an ambiguous bar resolves stop-first using the store's
+   own fill logic) → auto-place *after* marking, so a position is never judged
+   against the bar that opened it.
+3. **`replay_page.py` + `ui_common.py`** — the Streamlit page and the shared
+   presentation helpers extracted so `app.py` can import the page without a cycle.
+   `explain/snapshot.py` likewise now holds the three snapshot builders, so the
+   radar, the bots and the replay all store identically-shaped context (a divergent
+   builder would silently degrade `trade_stats`' `by_setup` grouping to "?").
+
+**Measured (AMD, 2026-07-22, this machine):** `analyze_timeframe` 29–39 ms ·
+`asof_reports` (5 calls) **121 ms/bar** · full-day precompute (75 bars) **9.6 s** ·
+`candlestick_figure` at 384 bars **200 ms build + 60 ms serialize**. The *chart* is
+4× the per-bar *decision*, which is why the day is precomputed once and why faster
+playback advances more bars per tick rather than ticking faster (the same lesson
+live mode learned at `_LIVE_FAST_S`).
+
+**Isolation.** Practice trades go to `.replay/<TICKER>-<YYYYMMDD>-<n>.db`, never
+`trades.db`, so `trade_stats` / `algorithm_correctness` over the real book are
+unaffected. The **subdirectory is load-bearing**: `store._ensure_schema` seeds a
+brand-new DB from `<db_path>.parent/.virtualbook.json`, so a replay book at the repo
+root would silently inherit ~100 real trades. Pinned by
+`test_replay_db_does_not_absorb_legacy_json`, which also asserts the failure mode
+still exists (a book placed beside the JSON *does* inherit it) so the test can't go
+vacuous. Bots keep their **live trader names** — isolation is by file, and identical
+names make a replay scorecard comparable row-for-row with the live one.
+
+**The no-lookahead invariant** is the flagship test
+(`test_bar_state_is_identical_whether_stepped_or_truncated`): the state at bar *i*
+must be identical whether the engine walked there or whether every later bar was
+physically deleted from the input. If anything in the stack peeked forward, deleting
+those bars would change the answer.
+
+**New open observation (do NOT "fix" without a deliberate decision):**
+`orb.opening_range` measures the gap from `_session_bars(df)["open"].iloc[0]`, which
+with `prepost=True` intraday data is the **pre-market open, not the 09:30 open**.
+On AMD 2026-07-22 that is 533.24 vs a regular open of 526.875 — a ~1.2 pp difference
+in the measured gap, i.e. it can flip the 2% `GAP_MIN_PCT` gate near the boundary.
+The live radar and the backtest share this behaviour, so the replay reproduces it
+faithfully rather than diverging. Whether the gap *should* be measured from the
+regular open is a real question — but it is an algorithm change, needs its own
+entry, and must be judged on ideas, not on one session.
+
+**How we'll know it worked:** the replay is a measurement instrument, so the test is
+usage — load a day, run the bots, and check that the fired/blocked verdicts match
+what `daytrade_backtest.py <ticker> --verbose` prints for the same day. Any
+disagreement means the shared as-of path has drifted, which is exactly what the
+import-identity test exists to prevent.
+
+---
+
+### 2026-10-21 — replay multi-day scan + replay daily-window fidelity (no algorithm change)
+
+**Why:** the replay simulator answers "what happened on this day", but most days
+nothing happens — stepping through them one ten-second rebuild at a time wastes the
+session. `stockanalyzer/replay_scan.py` runs the same headless replay over a ticker
+list × a set of days (every bot on, a throwaway book per day) and summarizes each
+ticker-day — signals, the bots' trades and R, the idea count, the modal blocking gate
+— so the 🔎 Multi-day scan view on the Replay page can point at the days worth
+replaying. Rows are cached in `.replay/scan-cache.db`, keyed by a hash of the
+decision code (`analysis/`, `explain/`, `verdict/`, `replay.py`, `strategy.py`,
+`virtualbook.py`, `data/store.py`), so any algorithm change re-scans instead of
+serving the old algorithm's answer.
+
+**No gate, weight, threshold or `SCHEMA_VERSION` moved.** Two *harness* changes do
+shift replay numbers, and are recorded here so they aren't mistaken for an
+algorithm effect:
+1. The replay/backtest intraday window is now yfinance's 60-day maximum
+   (`replay.INTRADAY_PERIOD`), up from 1 month — more days, same per-day logic.
+2. `replay.daily_for_day` rebuilds the 1-month daily frame as the trailing month
+   **before the replayed day** (from the 6-month frame). Previously it was the
+   month fetched *today*, so a session three weeks back saw only ~1 week of prior
+   daily bars — often below `MIN_BARS`, silently dropping the M1 report the live
+   radar had on that morning. `daytrade_backtest.py` uses the same window, so the
+   replay ↔ backtest agreement check below still holds. `prev_close` now comes from
+   the 6-month frame (identical values for recent days; defined for older ones).
+
+**Statistical discipline still applies.** A scan's 🟢 days are a *finding aid*, not
+evidence: they are one ticker list over ≤60 days, and the per-day "ideas" column is
+the number to read, not the trade count (several bots copy one plan). Don't tune a
+gate from a scan grid — use it to pick days, then judge with `algorithm_correctness`.
+
+**How we'll know it worked:** a 🟢 cell's trades must match what the single-day
+replay shows for that day with all three bot toggles on and the day revealed —
+`tests/test_replay_scan.py` pins that the summary is built from the same
+`apply_bar → force_flat → scorecard` path.
+
+---
+
+### 2026-10-25 — `setups/` package, setup-lab skill, 12-idea screen on SNXX/SNDQ/NBIZ/NBIC (algorithm change: two setups added)
+
+**Algorithm change: two setups added** (`silver_bullet`, `double_bottom`). Since
+2026-10-31 adding or removing a setup counts as an algorithm change even before a
+bot trades it, because the net result depends on which setups exist (`CLAUDE.md`,
+the `algo-gate` setup inventory). **No bot trades them yet**, and every existing
+bot decides as before: the gate's behavioral probe shows 0 changes. `orb.py` and
+`reversal.py` moved verbatim from `analysis/` to `stockanalyzer/setups/` (only
+their relative imports changed); callers import from the new path.
+
+**What changed (code):**
+1. `stockanalyzer/setups/`: one file per setup. `orb.py`, `reversal.py` (moved);
+   `silver_bullet.py`, `double_bottom.py` (new); `base.py`, the contract new setups
+   follow (`signal(SetupContext, cfg) -> SetupDecision`; `fire()` refuses stop ≥
+   entry and targets < 1R); `harness.py`, the bar-by-bar backtest
+   (`python -m stockanalyzer.setups.harness TICKERS --days 40 [--offset N] [--null 200]`).
+   Judging reuses `replay.judge_intraday` (stop-first, flat at the 15:55 close),
+   minus $0.02/share round trip.
+2. `replay_scan._ENGINE_SOURCES` now includes `setups`. Without it, an edit to
+   `orb.py`/`reversal.py` after the move would have served stale scan rows.
+3. `.claude/skills/setup-lab/`: the idea → spec card → module → tests →
+   backtest → record loop, with a jargon → code glossary (FVG, CE, sweep, MSS…).
+
+**The screen (rules and pass rule written before the first run).** 12 pasted
+ideas (ICT Silver Bullet, prev-PM Judas swing, London raid, ORG PM reversion,
+lunch raid, prev-AM draw, range break, second chance, extension double bottom,
+failed breakout, ABC + EMA9, resistance → support) coded to common rules: 5-min
+bars, long only (the inverse ETF is the short side), entry at the trigger bar's
+close or a resting order's level, 0.1% stop buffer, skip < 1R, stop-first, flat
+at 15:55, one trade per idea per ticker-day, $0.02/share. Tickers: SNXX (2x long
+SNDK), SNDQ (2x short SNDK), NBIZ (2x short NBIS), NBIS standing in for **NBIC**
+(Corgi 2x long NBIS: median 9 of 78 five-minute bars trade, ~8k shares/day,
+untradeable intraday). Pick on the latest 40 sessions (2026-08-28..10-23),
+confirm on the 20 before (07-31..08-27). Pass rule: ≥ 8 trades; avg net R > 0 in
+both halves, with the best day removed, and on both underlyings.
+The ideas the source states as shorts were coded as their long mirror. Not
+modelled: SMT vs NQ/ES/YM, news pauses, the London session (stocks don't trade
+it; the pre-market range stood in), 1-min triggers.
+
+| Idea | 40d n | avg net R | holdout n | avg net R |
+|---|--:|--:|--:|--:|
+| I1 Silver Bullet (long mirror) | 9 | +0.50 | 3 | +1.44 |
+| I2 Judas swing, prev PM range | 10 | +0.54 *(2nd half −0.25)* | 1 | −1.15 |
+| I3 pre-market raid (London adapted) | 6 | −0.38 | 2 | −1.03 |
+| I4 opening-range gap, PM reversion | 14 | −0.15 | 7 | −0.78 |
+| I5 NY lunch raid | 45 | −0.13 | 22 | +0.31 |
+| I6 prev AM draw (mirror) | 15 | −0.37 | 3 | −0.61 |
+| I7 consolidation range break | 118 | +0.02 | 63 | −0.05 |
+| I8 second chance (break & retest) | 57 | −0.23 | 35 | −0.42 |
+| I9 extension fade, double bottom | 57 | +0.18 | 25 | +0.11 |
+| I10 failed breakdown | 99 | −0.52 | 56 | −0.19 |
+| I11 ABC + EMA9 trail | 7 | +0.00 | 9 | −0.38 |
+| I12 resistance → support | 22 | −0.35 | 16 | −0.22 |
+
+Passed: **I1** and **I9**, now `silver_bullet.py` and `double_bottom.py`. The
+production harness reproduces the screen trade for trade (same 57 + 9 entries).
+Harness numbers, NBIS costed at its own price:
+
+| Setup | 40d (dates) | win % | avg net R | halves | best day removed | holdout 20d | 60d | null p |
+|---|--:|--:|--:|---|--:|--:|--:|--:|
+| `xfade-dbl-bottom` | 57 (34) | 63 | +0.21 | +0.22 / +0.20 | +0.18 | +0.13 (25) | +0.19 (82 / 48) | 0.005 |
+| `sb-am-bias` | 9 (9) | 44 | +0.55 | +1.26 / +0.34 | +0.17 | +1.49 (3) | +0.78 (12) | 0.045 |
+
+Null = every trade re-entered at a random bar of the same ticker-day with the
+same risk % and R target (200 reps); its mean was −0.10R and −0.16R.
+
+**Read this honestly:**
+- The two windows had **opposite regimes**: Aug SNDK +16% / NBIS +16%;
+  Sep–Oct SNDK −17% / NBIS −27% (SNXX −37%, NBIZ +48%). The double bottom was
+  positive in both, each time mostly on the leg trending up (Aug: SNXX +0.20,
+  NBIS +0.17; Sep–Oct: NBIZ +0.50, SNDQ +0.51; the down-trending legs ≈ 0). So it
+  behaves like a with-trend dip buy. That split was found after the fact, so it is
+  H8's next pre-registered variant, not a rule.
+- The edge is small: +0.2R on a 1R target at ~61% wins; cluster t ≈ 1.7. One
+  bad week erases a month.
+- Silver Bullet, the best known of the 12, has the best average per trade, but
+  12 trades in 60 sessions is an anecdote (H9).
+- Judas swing (I2) looked good on its average and failed the rule: the second
+  half and the best-day-removed checks were negative. The rule did its job.
+- The source ideas assume 1-min triggers for several setups; all of this is
+  5-min.
+
+**Not done (on purpose):** no live wiring, no replay bot, no threshold sweep. A
+bot for either setup is its own `[ALGO]` PR with the user's approval.
+
+**Next session, start here:** after ~20 new sessions (late Nov 2026) run
+`python -m stockanalyzer.setups.harness SNXX SNDQ NBIZ NBIS --days 20` on only the
+sessions after 2026-10-23. That is the first true out-of-sample read for H8/H9.
+
+---
+
+### 2026-10-31 — persistence: SQLite `store.py` retired (no decision change; algo-gate BLOCKED statically, 0 behavioral flips)
+
+**What changed:** `stockanalyzer/data/store.py` (SQLite `trades.db`) is gone.
+`virtualbook`, `papertrade`, `manage`, the replay simulator and
+`algolab/analyze.py` now go only through the SQLAlchemy repositories
+(`db/repositories/trades.py`, `paper_trades.py`) — the same PostgreSQL path the
+live bots already used. Older entries above that cite `store.<fn>` map 1:1 onto
+`TradeRepository.<fn>` (`trade_stats` → `stats`, `manage_trades` → `manage`,
+`mark_trades` → `mark`, `query_closed_trades` → `closed_trades`); the
+fill/stop/expiry/cohort logic is the same code the live book runs.
+
+**Replay books** are now *sandbox* books (`db/sandbox.py`): one SQLite file per
+practice attempt under `.replay/`, with the full app schema, bound to the
+repositories only inside `with replay.book(path)`. A replay can no longer create
+the application engine at all (pinned by `test_replay_book.py`).
+
+**Gate:** `scripts/algo_gate.py --base origin/feat/main-safe-merge` → **BLOCKED**
+on the static layer only (execution functions `mark`/`manage`/`open_position`/
+`apply_bar` were edited). Behavioral layer: swing plans 200/200, `_BOTS` table
+24/24, replay intraday bars 68/68, walk-forward backtest 200/200 — **0 changed,
+0 decision flips**, backtest headline identical (32 traded, 75.0% WR).
+
+**Known differences** (all were already true of the live PostgreSQL book, so the
+replay now matches live instead of the retired SQLite path):
+1. a managed `weekend_flat` close stores the spread-adjusted exit price (P&L was
+   already spread-adjusted) — in the replay this nudges `trade_r` for that one
+   exit reason on Friday sessions;
+2. a sandbox/user book ignores any `.virtualbook.json` (no more JSON seeding).
+
+**What it means for the loop:** the book is **per user**, so run
+`python algolab/analyze.py --user <name>` (with `DATABASE_URL` set; on the NUC via
+`docker compose exec app …`). A legacy `trades.db` can still be imported with
+`scripts/migrate_legacy_data.py`, which now also carries over each trade's
+signals / indicators / verdict / swing-checks, so view 3 (losing-trade patterns)
+covers imported history too. No baseline reset — no score, setup or exit rule
+was touched.
+
+---
+
+### 2026-11-02 — reversal iteration: once-per-day entries, 2 variants kept, knife guard for strong support (ALGORITHM CHANGE)
+
+**What changed (code):**
+1. **One entry per ticker per day, every bot** (owner's rule). `virtualbook.has_open`,
+   which every bot entry path checks (live radar, radar worker, replay), is also true
+   when the bot already had a position on the ticker filled today (ET);
+   `TradeRepository.entered_since` on `activated_ts`. The human trader `me` is not
+   limited; an order that never filled doesn't count. The replay passes its bar clock.
+2. **Reversal family pruned to the two survivors**: `rev-trend-confirm`,
+   `rev-strong-touch`. `rev-trend-touch` and `rev-strong-confirm` retired (Ruled out).
+3. **Knife guard for strong support**: `strong_support` stands aside on a gap-down
+   ≤ −2% too (`with_trend` already did).
+
+**How it was chosen (pre-registered in `algolab/screens/reversal_2026_11_02/screen.py`):**
+per-bar reversal inputs for 12 tickers x 59 sessions were cached once
+(`contexts.py`, `.local/rev-ctx`, 22 min), then 4 variants x 5 filters (none / knife /
+green day / after 10:30 / all three), all with the once-per-day rule, were judged like
+the replay book (open at the bar close, stop-first, flat at the close, $0.02/share).
+Picked on the latest 40 sessions (Sep 4 – Oct 30), checked on the 19 before (Aug 10 –
+Sep 3).
+- Nothing passed the strict pick rule (≥ 15 trades, > 0 in both halves and without the
+  best date). The two changes that improved **both** windows were kept:
+  once-per-day (rev-strong-touch −148 → −16 R on the screen window, better or flat on
+  the holdout) and the strong-support knife guard (rev-strong-touch −15.6 → +2.0 R
+  screen, +2.5 → +5.9 R holdout).
+- Iteration 2 (wider stop) was rejected; see Ruled out.
+- Regime matters: in the rising Aug window dip-buying worked (rev-trend-confirm 60% win,
+  5 trades); in Sep–Oct it failed, worst on the leveraged ETFs.
+
+**Real-history replay A/B** (`scripts/algo_replay_ab.py --mode full --all-days`, base =
+`feat/main-safe-merge`, 12 tickers, 2026-08-10 → 2026-10-30, every day, 708 ticker-days):
+**TRADES DIFFER, no regression.**
+
+| Bot / setup | Family | Trades | Days | Win % | Avg R | Net R | Δ net R |
+|---|---|---|---|---|---|---|---|
+| `bot-gap-fixed` | orb | 29 → 29 | 19 → 19 | 52% → 52% | +0.05 → +0.05 | +1.34 → +1.34 | +0.00 |
+| `bot-gap-mgd` | orb | 29 → 29 | 19 → 19 | 55% → 55% | +0.05 → +0.05 | +1.49 → +1.49 | +0.00 |
+| `rev-strong-confirm` **(removed)** | rev | 36 → 0 | 15 → 0 | 8% → – | -0.45 → – | -16.02 → +0.00 | +16.02 |
+| `rev-strong-touch` | rev | 163 → 37 | 38 → 27 | 10% → 19% | -0.33 → +0.43 | -53.06 → +16.07 | +69.13 |
+| `rev-trend-confirm` | rev | 24 → 12 | 11 → 11 | 21% → 25% | +0.22 → +0.97 | +5.32 → +11.63 | +6.31 |
+| `rev-trend-touch` **(removed)** | rev | 88 → 0 | 16 → 0 | 7% → – | -0.50 → – | -43.65 → +0.00 | +43.65 |
+| `sb-am-bias` | setups | 47 → 47 | 36 → 36 | 43% → 43% | +0.49 → +0.49 | +22.97 → +22.97 | +0.00 |
+| `xfade-dbl-bottom` | setups | 242 → 242 | 59 → 59 | 54% → 54% | +0.05 → +0.05 | +13.07 → +13.07 | +0.00 |
+| **Whole book** | | 658 → 396 | | 33% → 49% | | **-68.54 → +66.57** | **+135.11** |
+
+Swing bots are not in this A/B; the once-per-day rule can only stop a swing bot from
+re-buying a ticker the same day it closed one.
+
+**Open hypothesis (H11):** reversal-at-support works on regular stocks but not on daily
+2x ETFs (both windows: ETFs negative, stocks positive, but stocks n ≤ 11 per window).
+Test on new sessions before any ticker filter.
+
+**How we'll know:** run `algo_gate.py --history full` on sessions after 2026-10-30
+(refetch with `--refresh`); keep the two variants if their net R stays > 0 over ≥ 30
+distinct dates each; drop a variant if it is ≤ 0 there.
+
+---
+
 ### 2026-07-27 — quote day-change fix when the daily feed skips a session (no algorithm change)
 
 **Why:** INTC's price header printed a "day change" roughly double the real
@@ -401,3 +718,4 @@ not compare ORB/reversal stats across 2026-10-21.
 **How we'll know it worked:** the unit tests in the two entries above; the gap shown
 on the replay page matches the 09:30 open; and a re-run of the replay A/B on a later
 month shows Gap-and-Go firing only on days whose 09:30 gap is ≥ +2%.
+
