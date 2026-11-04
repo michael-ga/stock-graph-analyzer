@@ -41,14 +41,44 @@ def _fallback_quote(reports: dict[Timeframe, TimeframeReport]) -> Quote | None:
     the 1D frame supplies the extended-hours ``price``; the regular close it is
     measured against still comes from the daily series.
     """
-    from .data.market_session import classify, is_intraday, last_regular_close
+    from .data.market_session import (classify, is_intraday, last_regular_close,
+                                      session_closes)
 
     daily = reports.get(Timeframe.M1) or reports.get(Timeframe.M6)
     reg_close = prev_close = None
+    daily_last_day = None
     if daily is not None and len(daily.df) >= 2:
         closes = daily.df["close"]
         reg_close = float(closes.iloc[-1])   # today's regular close (prior session's, pre-open)
         prev_close = float(closes.iloc[-2])
+        daily_last_day = daily.df.index[-1].date()
+
+    # The daily-bar feed occasionally lags a session behind — a real yfinance
+    # quirk where a day's row goes missing entirely (not just "not posted yet":
+    # a LATER day can already be present while a day in between is skipped).
+    # `iloc[-2]` above is *assumed* to be "yesterday"; when a session is missing
+    # that assumption silently spans two trading days and reports a 1-day change
+    # roughly double the real one (see algolab/LEARNINGS.md, 2026-07-27). The
+    # intraday frame gets every session's bars as they trade, so cross-check
+    # against it whenever it knows about a session the daily frame doesn't.
+    intraday_daily = reports.get(Timeframe.D5) or reports.get(Timeframe.D1)
+    if intraday_daily is not None and is_intraday(intraday_daily.df):
+        sessions = session_closes(intraday_daily.df, n=3)  # most-recent-first
+        if sessions:
+            latest_day = sessions[0][0]
+            if daily_last_day is None or latest_day > daily_last_day:
+                # The daily frame doesn't have the latest session at all yet.
+                if len(sessions) >= 2:
+                    reg_close, prev_close = sessions[0][1], sessions[1][1]
+                else:
+                    reg_close = sessions[0][1]
+            elif latest_day == daily_last_day and len(sessions) >= 2 and daily is not None:
+                # The daily frame's last row is current — but is the row BEFORE
+                # it really the immediately preceding session, or did the feed
+                # skip one? Compare against the intraday frame's own record.
+                daily_prev_day = daily.df.index[-2].date()
+                if sessions[1][0] != daily_prev_day:
+                    prev_close = sessions[1][1]
 
     # Extended-hours path: the latest 1D bar is pre/after-hours.
     intraday = reports.get(Timeframe.D1)
