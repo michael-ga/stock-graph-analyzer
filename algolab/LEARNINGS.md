@@ -374,6 +374,9 @@ faithfully rather than diverging. Whether the gap *should* be measured from the
 regular open is a real question — but it is an algorithm change, needs its own
 entry, and must be judged on ideas, not on one session.
 
+*Status (2026-11-04): this observation is addressed by the 2026-10-21 entry below, and
+the 2026-11-04 entry adds a live-session example where the pre-market open flipped the gate.*
+
 **How we'll know it worked:** the replay is a measurement instrument, so the test is
 usage — load a day, run the bots, and check that the fired/blocked verdicts match
 what `daytrade_backtest.py <ticker> --verbose` prints for the same day. Any
@@ -719,3 +722,60 @@ not compare ORB/reversal stats across 2026-10-21.
 on the replay page matches the 09:30 open; and a re-run of the replay A/B on a later
 month shows Gap-and-Go firing only on days whose 09:30 gap is ≥ +2%.
 
+---
+
+### 2026-11-04 — pre-market gap read flipped the ORB gate on 3 of 4 tickers in one session (evidence for the 2026-10-21 fix)
+
+**Why this entry:** a read-only replay of 2026-11-04 for SNXX, SNDQ, AMDL and NBIZ
+(`replay.precompute_day` + `replay_scan.summarize`, every bot on, throwaway sandbox
+books, code without this fix) showed the Gap-and-Go gate reading the wrong gap on
+three of the four names. PR #18 is being updated onto `feat/main-safe-merge`, so this
+records today's example next to the 2026-10-22 measurement.
+
+| Ticker | Gap read from the 04:00 print | Real gap (09:30 open) | Gate on the old code | With the 09:30 open |
+|---|---|---|---|---|
+| SNXX | +1.47% | −8.77% | blocked | blocked (no change) |
+| SNDQ | −1.13% | +8.44% | **blocked** | fires 10:45, entry 24.77, stop 21.70, target 30.90 |
+| AMDL | +11.33% | +0.35% | **fired 09:45**, entry 51.38 | blocked |
+| NBIZ | +1.82% | +7.36% | **blocked** | fires 10:40, entry 42.59, stop 37.21, target 53.34 |
+
+- **AMDL, false fire:** the 04:00 print was 51.76 against a 46.49 prev close. ORB
+  entered at 51.38, near the top of a 44.95 → 52.24 opening spike, and the stock faded
+  all day. `bot-gap-fixed` closed at the EOD price of 47.32 (−7.89%, about −0.63R), and
+  `bot-gap-mgd` was stopped at 48.23 at 10:20 (−6.13%, about −0.49R). Together that is −1.12R.
+- **SNDQ and NBIZ, missed entries:** with a fixed bracket, each counterfactual entry
+  closes at the EOD price for about 0R (SNDQ −0.56%, −0.05R; NBIZ +0.52%, +0.04R). The
+  stops sat 12–13% away, below the opening-range lows, so neither the stop nor the 2R
+  target came close. `bot-gap-mgd`'s managed exits were not simulated for these two.
+
+**Statistical discipline:** this is one session and three ideas. It shows that the gate
+reads the wrong number, and that the error runs in both directions (+11 points
+on AMDL, −9.6 points on SNDQ). It does **not** show that the fix has an edge. The
+net change on the day is about −1.1R → 0R, which is within noise. Judge Gap-and-Go on
+idea-level results after the fix ships, as the 2026-10-22 entry says.
+
+**Re-measured on top of `feat/main-safe-merge`** (`algo_gate.py --history fast`: SNXX,
+SNDQ, NBIZ, NBIS, 2026-08-13 → 2026-11-03, bots replayed on 76 of 232 ticker-days,
+base = `76e4ec36`). The gate verdict is BLOCKED (intended), with 0 flips on the frozen probes.
+
+| Bot / setup | Trades | Win % | Net R |
+|---|---|---|---|
+| `bot-gap-fixed` | 9 → 13 | 67% → 54% | +1.71 → +3.14 |
+| `bot-gap-mgd` | 9 → 13 | 56% → 46% | +0.45 → +0.25 |
+| `rev-strong-touch` | 10 → 5 | 10% → 20% | −0.70 → +4.30 |
+| `rev-trend-confirm` | 4 → 2 | 0% → 0% | −4.00 → −2.00 |
+| setups (`sb-am-bias`, `xfade-dbl-bottom`) | unchanged | unchanged | unchanged |
+| **Whole book** | 125 → 126 | 52% → 53% | **+15.45 → +23.68** |
+
+- **Gap bots:** these are 4 new gap days (NBIS 09-08, NBIZ 08-19, 10-14, 10-16). The
+  real-history rule flags both gap bots, because win % fell more than 5 points and
+  `bot-gap-mgd`'s net R fell by 0.20. That is 4 ideas. It is the "more Gap-and-Go days, unproven
+  bot" effect that the 2026-10-22 entry already describes, not evidence that the fix
+  reads the gap wrongly.
+- **Reversals:** since 2026-11-02, the knife guard also covers `strong_support`, and it
+  now reads the real gap-down. It removed 7 reversal entries on gap-down days, and all
+  7 had lost −1R on the base.
+
+**How we'll know it worked:** after merge, the replay of 2026-11-04 shows no AMDL ORB
+trade, and shows ORB entries on SNDQ (10:45) and NBIZ (10:40). Going forward, ORB
+fires only on days whose 09:30 gap is ≥ +2%.
