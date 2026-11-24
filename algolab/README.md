@@ -21,6 +21,10 @@ re-blaming a setup whose losses were really one bad market day.
 - **`LEARNINGS.md`** — the running journal: standing guardrails, a *ruled-out /
   do-not-repeat* list, an *open-hypotheses* table with status, and a dated
   session log. This is the file to read and to append to.
+- **`live/`**: what live manual sessions teach. One note per session, plus
+  `murphy_ledger.csv` (textbook rules validated or challenged on the tape) and
+  `behavior_ledger.csv` (execution mistakes and good habits, with their cost).
+  `python algolab/live/summarize.py` tallies them. See [`live/README.md`](live/README.md).
 - **`analyze.py`** — the post-mortem. Run it to see the current state:
   ```
   DATABASE_URL=postgresql+psycopg://... python algolab/analyze.py [--user USERNAME]

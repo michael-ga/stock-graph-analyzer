@@ -31,3 +31,6 @@ legacy/
 # Local scratch output
 /Test
 /out_toc.txt
+
+# trade exports pulled from the server (scripts/fetch_trades.sh)
+exports/

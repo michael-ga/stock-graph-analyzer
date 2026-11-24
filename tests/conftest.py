@@ -13,6 +13,14 @@ from stockanalyzer.db.models import Base
 from stockanalyzer.db.session import configure_engine
 
 
+@pytest.fixture(autouse=True)
+def _no_etf_name_lookup(monkeypatch):
+    """ETF auto-linking reads fund names from the network; tests never do."""
+    from stockanalyzer import etf_links
+    monkeypatch.setattr(etf_links, "_NAME_LOOKUP", lambda ticker: None)
+    etf_links._attempted.clear()
+
+
 @pytest.fixture()
 def book_db(tmp_path):
     engine = configure_engine(f"sqlite:///{tmp_path / 'book.db'}")

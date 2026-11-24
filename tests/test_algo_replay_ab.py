@@ -55,8 +55,12 @@ def test_per_bot_counts_wins_days_and_win_pct():
             ("B", "d1"): _day("B", "d1", [_trade(r=-1.0)]),
             ("A", "d2"): _day("A", "d2", [_trade(r=0.5)])}
     p = ab.per_bot(rows)
-    assert p["bot-gap-fixed"] == {"n": 3, "wins": 2, "r": 1.5, "days": 2, "family": "orb",
-                                 "win_pct": 66.7, "avg_r": 0.5}
+    core = {k: p["bot-gap-fixed"][k] for k in
+            ("n", "wins", "r", "days", "family", "win_pct", "avg_r")}
+    assert core == {"n": 3, "wins": 2, "r": 1.5, "days": 2, "family": "orb",
+                    "win_pct": 66.7, "avg_r": 0.5}
+    # report-only cost basis rides along (stockanalyzer.costs)
+    assert {"r_cost", "n_cost", "gross_pcts"} <= set(p["bot-gap-fixed"])
 
 
 # --- the owner's rule: net R and win % ------------------------------------- #
@@ -170,3 +174,49 @@ def test_parity_flags_any_setup_trade_the_two_judges_disagree_on():
     assert ab.parity(rep, [{**har[0], "gross_r": -1.0}]) == [
         "R differs ('xfade-dbl-bottom', '11:30', 98.2): replay 1.0 vs harness -1.0"]
     assert ab.parity([], har) == ["harness only ('xfade-dbl-bottom', '11:30', 98.2)"]
+
+
+def test_portfolio_step_refuses_the_linked_ticker_with_this_trees_rule(tmp_path):
+    import json
+    from pathlib import Path
+    rows = [_day("SNXX", trades=[_trade("rev-a", "rev", "10:00")]),
+            _day("SNDQ", trades=[_trade("rev-a", "rev", "10:15"),
+                                 _trade("rev-b", "rev", "10:15")])]
+    (tmp_path / "rows.json").write_text(json.dumps(rows))
+    (tmp_path / "names.json").write_text(json.dumps({
+        "SNXX": ["Tradr 2X Long SNDK Daily ETF"], "SNDQ": ["Tradr 2X Short SNDK Daily ETF"]}))
+    out = tmp_path / "out.json"
+    ab.portfolio_worker(Path(ab.__file__).resolve().parents[1], tmp_path / "rows.json",
+                        tmp_path / "names.json", out)
+    res = json.loads(out.read_text())
+    assert res["applied"] and len(res["refused"]) == 1
+    assert res["refused"][0]["ticker"] == "SNDQ" and res["refused"][0]["trader"] == "rev-a"
+    sndq = next(r for r in res["rows"] if r["ticker"] == "SNDQ")
+    assert [t["trader"] for t in sndq["trades"]] == ["rev-b"]
+
+
+def test_report_lists_the_linked_ticker_overlay():
+    rows = {("INTC", "2026-10-20"): _day(trades=[_trade()])}
+    out = ab.render(ab.compare(rows, dict(rows)),
+                    {**_CTX, "portfolio": {"change": "SNXX→SNDK +2×; 0 trades refused"}})
+    assert "Linked tickers (change): SNXX→SNDK +2×; 0 trades refused." in out
+
+
+def test_portfolio_step_frees_the_underlying_at_a_setups_exit_bar(tmp_path):
+    import json
+    from pathlib import Path
+    setup = {**_trade("xfade", "setups", "10:00"), "out": None, "held_until": "10:30"}
+    late = {**_trade("xfade", "setups", "11:00"), "out": None, "held_until": "11:30"}
+    early = {**_trade("xfade", "setups", "10:15"), "out": None, "held_until": "10:45"}
+    rows = [_day("SNXX", trades=[setup]), _day("SNDQ", trades=[early]),
+            _day("SNDQ", day="2026-10-21", trades=[late]),
+            _day("SNXX", day="2026-10-21", trades=[dict(setup)])]
+    (tmp_path / "rows.json").write_text(json.dumps(rows))
+    (tmp_path / "names.json").write_text(json.dumps({
+        "SNXX": ["Tradr 2X Long SNDK Daily ETF"], "SNDQ": ["Tradr 2X Short SNDK Daily ETF"]}))
+    out = tmp_path / "out.json"
+    ab.portfolio_worker(Path(ab.__file__).resolve().parents[1], tmp_path / "rows.json",
+                        tmp_path / "names.json", out)
+    refused = json.loads(out.read_text())["refused"]
+    # 10:15 SNDQ is refused (SNXX held till 10:30); 11:00 SNDQ on the 21st is not
+    assert [(t["day"], t["in"]) for t in refused] == [("2026-10-20", "10:15")]

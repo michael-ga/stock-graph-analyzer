@@ -15,6 +15,24 @@ from stockanalyzer.db.session import session_scope
 _CONFIRM_MARGIN = 0.002
 
 
+_HUMAN_TRADERS = frozenset({"me"})       # mirrors virtualbook.HUMAN_TRADERS
+DAY_FLAT_ET = (15, 58)                   # a bot's day trade is flat by the close
+
+
+def _day_trade_due(row, reference: float, now: float) -> bool:
+    """A bot's one-day position still open at 15:58 ET on (or after) the day it was
+    filled. The replay and every backtest close day trades at the 15:55 bar; the
+    live book used to keep them until the 1.5-day expiry, i.e. overnight
+    (2026-11-10). ``hold_weekend`` keeps its meaning: an explicit hold."""
+    if (row.trader in _HUMAN_TRADERS or (row.horizon_days or 0) > 1
+            or row.hold_weekend or reference is None):
+        return False
+    import pandas as pd
+    filled = pd.Timestamp(reference, unit="s", tz="UTC").tz_convert("America/New_York")
+    cutoff = filled.normalize() + pd.Timedelta(hours=DAY_FLAT_ET[0], minutes=DAY_FLAT_ET[1])
+    return pd.Timestamp(now, unit="s", tz="UTC") >= cutoff
+
+
 def _cohort_id(trade: dict, snapshot: dict) -> str:
     key = "|".join([
         (trade.get("ticker") or "").upper(), snapshot.get("setup") or "", trade.get("kind") or "",
@@ -107,6 +125,13 @@ class TradeRepository:
                 Trade.user_id == user_id, Trade.ticker == ticker.upper(),
                 Trade.trader == trader, Trade.activated_ts >= since,
             ).limit(1)) is not None
+
+    def open_tickers(self, user_id: str, trader: str) -> set[str]:
+        """Tickers ``trader`` currently holds (open or pending)."""
+        with session_scope() as session:
+            return set(session.scalars(select(Trade.ticker).where(
+                Trade.user_id == user_id, Trade.trader == trader,
+                Trade.status.in_(("open", "pending")))))
 
     def has_any_open(self, user_id: str, ticker: str) -> bool:
         with session_scope() as session:
@@ -226,6 +251,11 @@ class TradeRepository:
                     self._finish(row, row.stop, "stop_hit", now); changed.append(_dict(row))
                 elif price >= row.target:
                     self._finish(row, row.target, "target_hit", now); changed.append(_dict(row))
+                elif _day_trade_due(row, reference, now):
+                    from stockanalyzer.manage import _SPREAD_PER_SHARE
+                    self._finish(row, price, "eod", now,
+                                 spread=_SPREAD_PER_SHARE if row.managed else 0.0)
+                    changed.append(_dict(row))
                 elif now - reference > row.horizon_days * 1.5 * 86400:
                     self._finish(row, price, "expired", now); changed.append(_dict(row))
         return changed

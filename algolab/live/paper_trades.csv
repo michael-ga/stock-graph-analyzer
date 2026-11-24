@@ -1,0 +1,5 @@
+date,start,end,idea,bot,und,side,entry_und,etf,entry_etf,exit,und_ret_pct,etf_ret_pct,usd_on_size,mfe_pct,mae_pct,verdict
+2026-11-05,14:55,15:17,"user (14:47): buy INTC on the VWAP reclaim + 5-min trend flip, CEO bought $20M, 15:00 bounce window","SKIP: INTW R:R 1.16 (trend pullback) / 0.19 (VWAP reclaim); counter-trend, weak volume, entry after the jump",INTC,long,54.55,INTW,5.14,stop,-1.47,-2.93,-11.8,0.04,-1.47,bot's skip was right
+2026-11-05,14:57,15:38,"user (14:57): buy SNXX into the afternoon bounce (SNDK back above its 20-EMA, VIX easing, 15:00 window)",SKIP: oversold-bounce R:R 0.24; ADX 45 down-trend; target VWAP too close vs the stop,SNDK,long,851.49,SNXX,3.53,stop,-2.67,-5.34,-19.01,0.26,-2.67,bot's skip was right
+2026-11-11,13:30,14:03,"xfade-dbl-bottom (H8, auto) [replayed from 1-min bars: the live paper process was killed by a scanner restart]",PAPER only,INTW,long,6.76,INTW,6.76,stop,-1.58,-1.58,-7.74,0.0,-1.63,paper loss
+2026-11-11,14:50,15:11,"xfade-dbl-bottom (H8, auto) [replayed from 1-min bars: the live paper process was killed by a scanner restart]",PAPER only,SNXX,long,4.54,SNXX,4.54,stop,-0.98,-0.98,-5.94,0.44,-1.1,paper loss

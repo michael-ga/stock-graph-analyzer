@@ -73,6 +73,23 @@ class SwingWatchItem(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
 
+class EtfLink(Base):
+    """Which single-stock ETF tracks which underlying, and with what leverage.
+
+    ``leverage`` is signed: +2 is a 2x long fund, -1 an inverse one. ``source`` is
+    ``auto`` (parsed from the fund name) or ``user`` (typed in; never overwritten
+    by auto-detection)."""
+    __tablename__ = "etf_links"
+    __table_args__ = (UniqueConstraint("user_id", "etf"),)
+    id: Mapped[int] = mapped_column(ID, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    etf: Mapped[str] = mapped_column(String(32), nullable=False)
+    underlying: Mapped[str] = mapped_column(String(32), nullable=False)
+    leverage: Mapped[float] = mapped_column(Float, nullable=False)
+    source: Mapped[str] = mapped_column(String(8), default="user", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class ProviderRateLimit(Base):
     __tablename__ = "provider_rate_limits"
     provider: Mapped[str] = mapped_column(String(64), primary_key=True)

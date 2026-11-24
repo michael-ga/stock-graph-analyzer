@@ -231,9 +231,9 @@ def _human(v: float) -> str:
 
 def _vwap(g: pd.DataFrame) -> pd.Series:
     tp = (g["high"] + g["low"] + g["close"]) / 3
-    vol = g["volume"].replace(0, pd.NA).fillna(0)
-    cum = vol.cumsum().replace(0, pd.NA)
-    return ((tp * vol).cumsum() / cum).astype(float)
+    vol = g["volume"].astype(float).fillna(0.0)
+    cum = vol.cumsum().replace(0.0, float("nan"))  # no VWAP until the first traded bar (thin tickers)
+    return (tp * vol).cumsum() / cum
 
 
 def days_figure(df: pd.DataFrame, ticker: str) -> go.Figure:

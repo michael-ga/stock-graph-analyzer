@@ -59,6 +59,7 @@ MODES = {
              "SNXX", "SNDQ", "NBIZ", "NBIS"),
 }
 MAX_DAYS = {"fast": 20, "full": 12}     # replayed ticker-days per ticker (bots)
+MARKET = "QQQ"              # market proxy loaded beside the bars (setups' ctx.market)
 GAP_PICK = 0.01             # a gap this size either way may become a Gap-and-Go day
 WIN_PCT_DROP = 5.0          # points of win % an existing bot/setup may not lose
 _EPS = 1e-9
@@ -112,7 +113,8 @@ def tree_fingerprint(tree: Path) -> str:
 def _bots_rows(replay, replay_scan, hist, ticker, day) -> dict:
     """One replay day boiled down to the non-swing bots."""
     keep = {name for name, _ in replay.GAP_BOTS}
-    keep |= {cfg.name for cfg in replay.reversal.REVERSAL_VARIANTS}
+    keep |= {cfg.name for cfg in (*replay.reversal.REVERSAL_VARIANTS,
+                                  *getattr(replay.reversal, "REVERSAL_CANDIDATES", ()))}
     setup_names = {cfg.name for m in getattr(replay, "SETUPS", {}).values() for cfg in m.VARIANTS}
     row = asdict(replay_scan.scan_day(hist, ticker, day))
     trades, replayed_setups = [], []
@@ -147,13 +149,19 @@ def _setup_trades(tree_setups, hist, i, ticker, timeframe) -> list[dict]:
         return []
     setups, harness = tree_setups
     variants = [(m, cfg) for m in setups.SETUPS.values() for cfg in m.VARIANTS]
-    hh = {"i5": hist["i5"], "daily": hist["daily"][timeframe.Y1], "days": hist["days"]}
+    hh = {"i5": hist["i5"], "daily": hist["daily"][timeframe.Y1], "days": hist["days"],
+          "market_i5": hist.get("market_i5"), "market_sign": hist.get("market_sign", 1)}
     out = []
     for t in harness.run_day(hh, i, variants, ticker=ticker):
         out.append({"trader": t["variant"], "setup": t["setup"], "family": "setups",
                     "in": t["t"], "out": None, "entry": t["entry"], "exit": None,
+                    # exit clock, for the linked-ticker step only: kept out of the trade
+                    # key so a tree whose harness has no exit_t still compares equal
+                    "held_until": t.get("exit_t"),
                     "why": t["status"], "r": round(t["net_r"], 3),
-                    "gross_r": round(t["gross_r"], 3)})
+                    "gross_r": round(t["gross_r"], 3),
+                    # report-only fields (not in the trade key): the cost basis
+                    "stop": t.get("stop"), "managed": False})
     return out
 
 
@@ -180,6 +188,17 @@ def worker(tree: Path, hist_dir: Path, out: Path, start: str | None, end: str | 
         hist = replay.load_history(ticker)
         raw = pickle.dumps(hist)
         pk.write_bytes(raw)
+    # Market context for setups that read it (QQQ, from the same fetch folder) and the
+    # instrument's side of it. An older tree's code just ignores both keys.
+    mk = hist_dir / f"{MARKET}.pkl"
+    if mk.exists() and ticker != MARKET:
+        hist["market_i5"] = pickle.loads(mk.read_bytes())["i5"]
+    names_file = hist_dir / "fund-names.json"
+    if names_file.exists():
+        names = json.loads(names_file.read_text(encoding="utf-8")).get(ticker) or []
+        words = {"short", "inverse", "bear"}
+        hist["market_sign"] = -1 if any(
+            words & set(str(n).lower().replace("-", " ").split()) for n in names) else 1
     picks_file = hist_dir / f"{ticker}.picks-{max_days}-{start}-{end}.json"
     if load_only:
         if max_days:                              # chosen once, read by both trees
@@ -236,6 +255,60 @@ def worker(tree: Path, hist_dir: Path, out: Path, start: str | None, end: str | 
                                "cache_hits": hits}, default=str), encoding="utf-8")
 
 
+def fetch_fund_names(tickers: list[str], hist_dir: Path) -> dict:
+    """{ticker: [fund names]} from yfinance, cached beside the bars: data, like the
+    bars, that both trees read the same way. A stock or a failed lookup is []."""
+    path = hist_dir / "fund-names.json"
+    names = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    missing = [t for t in tickers if t not in names]
+    if missing:
+        import yfinance as yf
+        for t in missing:
+            try:
+                info = yf.Ticker(t).info or {}
+                names[t] = ([n for n in (info.get("longName"), info.get("shortName")) if n]
+                            if str(info.get("quoteType", "")).upper() == "ETF" else [])
+            except Exception:
+                names[t] = []
+        path.write_text(json.dumps(names, indent=1), encoding="utf-8")
+    return names
+
+
+def portfolio_worker(tree: Path, rows_file: Path, names_file: Path, out: Path) -> None:
+    """Apply the tree's own linked-ticker rule across tickers, day by day.
+
+    Each ticker-day replays in its own practice book, so a position on SNXX can never
+    block one on SNDQ there. A tree whose ``stockanalyzer.etf_links`` has
+    ``blocked_trades`` refuses those trades here; an older tree passes rows through."""
+    sys.path.insert(0, str(tree.resolve()))
+    rows = json.loads(rows_file.read_text(encoding="utf-8"))
+    names = json.loads(names_file.read_text(encoding="utf-8"))
+    try:
+        from stockanalyzer import etf_links
+        rule = etf_links.blocked_trades
+    except (ImportError, AttributeError):
+        out.write_text(json.dumps({"rows": rows, "applied": False}), encoding="utf-8")
+        return
+    links = [lk for lk in (etf_links.detect(t, lambda _t, t=t: names.get(t)) for t in names)
+             if lk]
+    by_day = defaultdict(list)
+    for r in rows:
+        for t in r.get("trades") or []:
+            by_day[r["day"]].append((r, t))
+    refused = []
+    for day, items in by_day.items():
+        flat = [{**t, "ticker": r["ticker"], "out": t["out"] or t.get("held_until")}
+                for r, t in items]
+        for i in rule(flat, links):
+            r, t = items[i]
+            r["trades"].remove(t)
+            refused.append({**flat[i], "day": day})
+    out.write_text(json.dumps({
+        "rows": rows, "applied": True, "refused": refused,
+        "links": [f"{lk.etf}→{lk.underlying} {lk.leverage:+g}×" for lk in links]},
+        default=str), encoding="utf-8")
+
+
 # --------------------------------------------------------------------------- #
 # Comparison.
 # --------------------------------------------------------------------------- #
@@ -243,9 +316,49 @@ def _tkey(t: dict) -> tuple:
     return (t["trader"], t["setup"], t["in"], t["out"], t["entry"], t["exit"], t["r"])
 
 
+def _costs():
+    """``stockanalyzer.costs`` from the repository this script lives in (the driver
+    runs with ``-I``-free imports; the workers never call this)."""
+    root = str(Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from stockanalyzer import costs
+    return costs
+
+
+def trade_basis(t: dict) -> tuple[float | None, float | None]:
+    """(R after the common cost model, gross % move) for one trade row, or Nones.
+
+    Bots' replay R is gross, except managed exits, which already paid the flat
+    $0.02/share; setups carry ``gross_r``. Both are put on ``costs.cost_r``. The stop
+    comes from the row; a row from a tree that doesn't report it falls back to the
+    risk implied by its exit and R (bots only)."""
+    costs = _costs()
+    entry, stop = t.get("entry"), t.get("stop")
+    if (stop is None or not entry) and t.get("family") != "setups":
+        r, x = t.get("r"), t.get("exit")
+        if r and x is not None and entry:
+            stop = float(entry) - (float(x) - float(entry)) / float(r)
+    c = costs.cost_r(entry, stop)
+    if c is None:
+        return None, None
+    risk = float(entry) - float(stop)
+    if t.get("family") == "setups":
+        gross = t.get("gross_r")
+    else:
+        # rows from a tree that doesn't report the flag: bot-gap-mgd is the managed bot
+        managed = t.get("managed", t.get("trader") == "bot-gap-mgd")
+        gross = (t.get("r") or 0.0) + (costs.PER_SHARE / risk if managed else 0.0)
+    if gross is None:
+        return None, None
+    return float(gross) - c, float(gross) * risk / float(entry) * 100
+
+
 def per_bot(rows: dict) -> dict:
-    """{bot or setup variant: n, wins, r, days, win_pct, avg_r, family}."""
-    c = defaultdict(lambda: {"n": 0, "r": 0.0, "wins": 0, "days": set(), "family": ""})
+    """{bot or setup variant: n, wins, r, days, win_pct, avg_r, family, plus the
+    common cost basis (r_cost, n_cost) and the account view (gross_pcts)}."""
+    c = defaultdict(lambda: {"n": 0, "r": 0.0, "wins": 0, "days": set(), "family": "",
+                             "r_cost": 0.0, "n_cost": 0, "gross_pcts": []})
     for (tk, day), r in rows.items():
         for t in r.get("trades") or []:
             b = c[t["trader"]]
@@ -254,12 +367,19 @@ def per_bot(rows: dict) -> dict:
             b["wins"] += (t["r"] or 0) > 0
             b["days"].add(day)
             b["family"] = t.get("family", "")
+            rc, gp = trade_basis(t)
+            if rc is not None:
+                b["r_cost"] += rc
+                b["n_cost"] += 1
+                b["gross_pcts"].append(gp)
     out = {}
     for bot, b in c.items():
         out[bot] = {"n": b["n"], "wins": b["wins"], "r": round(b["r"], 2),
                     "days": len(b["days"]), "family": b["family"],
                     "win_pct": round(b["wins"] / b["n"] * 100, 1) if b["n"] else None,
-                    "avg_r": round(b["r"] / b["n"], 3) if b["n"] else None}
+                    "avg_r": round(b["r"] / b["n"], 3) if b["n"] else None,
+                    "r_cost": round(b["r_cost"], 2), "n_cost": b["n_cost"],
+                    "gross_pcts": [round(x, 4) for x in b["gross_pcts"]]}
     return out
 
 
@@ -320,6 +440,41 @@ def _pct(x) -> str:
     return "–" if x is None else f"{x:.0f}%"
 
 
+def render_costs(pa: dict, pb: dict) -> list[str]:
+    """Two report-only tables: every bot and setup on one cost basis (R), and what the
+    average trade leaves on a fixed stake after the fixed fee (account view)."""
+    costs = _costs()
+    zero = {"r_cost": 0.0, "n_cost": 0, "gross_pcts": [], "family": ""}
+    bots = sorted(set(pa) | set(pb), key=lambda b: ((pa.get(b) or pb.get(b))["family"], b))
+    out = ["## On one cost basis (report only, not part of the regression rule)", "",
+           f"Round trip = max(${costs.PER_SHARE:.2f}/share, {costs.BPS:g} bps of price), "
+           "charged to bots and setups alike (bots are otherwise gross).", "",
+           "| Bot / setup | Trades costed | Net R after cost (base → change) | Δ |",
+           "|---|---|---|---|"]
+    for bot in bots:
+        x, y = pa.get(bot, zero), pb.get(bot, zero)
+        out.append(f"| `{bot}` | {x['n_cost']} → {y['n_cost']} | {x['r_cost']:+.2f} → "
+                   f"{y['r_cost']:+.2f} | {y['r_cost'] - x['r_cost']:+.2f} |")
+    sb, sc = (round(sum(p[b]["r_cost"] for b in p), 2) for p in (pa, pb))
+    out.append(f"| **Whole book** | | **{sb:+.2f} → {sc:+.2f}** | **{sc - sb:+.2f}** |")
+    stakes = costs.ACCOUNT_STAKES
+    out += ["", f"### Account view (change side): ${costs.ACCOUNT_FEE:.0f} round-trip fee "
+            "on a fixed stake", "",
+            "| Bot / setup | Trades | Avg gross % | " + " | ".join(f"${s:.0f} net/trade"
+                                                         for s in stakes)
+            + " | Break-even stake |",
+            "|---|---|---|" + "---|" * len(stakes) + "---|"]
+    for bot in bots:
+        v = costs.account_view((pb.get(bot) or zero)["gross_pcts"])
+        if not v["n"]:
+            continue
+        be = v["breakeven_stake"]
+        out.append(f"| `{bot}` | {v['n']} | {v['avg_gross_pct']:+.3f} | "
+                   + " | ".join(f"{v['net'][s]:+.2f}" for s in stakes)
+                   + f" | {'never' if be == float('inf') else f'${be:,.0f}'} |")
+    return out + [""]
+
+
 def render(cmp: dict, ctx: dict) -> str:
     regs = cmp["regressions"]
     if regs:
@@ -337,7 +492,9 @@ def render(cmp: dict, ctx: dict) -> str:
            + (f", cache hits {ctx['cache_hits']}" if ctx.get("cache_hits") else "") + ".",
            *([f"Coverage: {ctx['coverage']}."] if ctx.get("coverage") else []),
            *([f"Setups parity (replay book vs harness, change side): {ctx['parity']}."]
-             if ctx.get("parity") else []), ""]
+             if ctx.get("parity") else []),
+           *([f"Linked tickers ({side}): {p}." for side, p in ctx["portfolio"].items()]
+             if ctx.get("portfolio") else []), ""]
     if regs:
         out += ["## Regressions (net R + win % rule)", ""] + [f"- {r}" for r in regs] + [""]
     out += ["## Per bot and setup (base → change)", "",
@@ -357,8 +514,9 @@ def render(cmp: dict, ctx: dict) -> str:
                f"{_pct(_win(bb))} | | **{ba['r']:+.2f} → {bb['r']:+.2f}** | "
                f"**{bb['r'] - ba['r']:+.2f}** |")
     out += ["", "R: bots use the replay book's realized R (managed exits include the "
-            "spread); setups use the harness's net R after $0.02/share.", "",
-            "## Days where trades differ", ""]
+            "spread); setups use the harness's net R after $0.02/share.", ""]
+    out += render_costs(pa, pb)
+    out += ["## Days where trades differ", ""]
     for d in cmp["diff_days"][:40]:
         (tk, day) = d["key"]
         out.append(f"- **{day} {tk}**: R {d['r'][0]:+.2f} → {d['r'][1]:+.2f}")
@@ -379,6 +537,10 @@ def render(cmp: dict, ctx: dict) -> str:
             "- The live quote path (`pipeline._fallback_quote`): replay takes `prev_close` "
             "from the daily frame.",
             "- Live timing (stream ticks, worker interleaving).",
+            "- Linked-ticker rule: applied after the per-ticker replays, in entry order. "
+            "A refused trade is only dropped; a later entry the bot might then have made "
+            "on that ticker is not simulated. Setup trades are held until the harness's "
+            "exit bar (to the close on a tree whose harness has no exit time).",
             "- Sample size: ~60 sessions is a signal to review, not proof (see the "
             "statistical discipline in `CLAUDE.md`)."]
     return "\n".join(out) + "\n"
@@ -420,8 +582,13 @@ def main(argv=None) -> int:
     ap.add_argument("--hist", help=argparse.SUPPRESS)
     ap.add_argument("--cache", help=argparse.SUPPRESS)
     ap.add_argument("--out", help=argparse.SUPPRESS)
+    ap.add_argument("--portfolio", nargs=2, metavar=("ROWS", "NAMES"), help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
 
+    if a.portfolio:
+        portfolio_worker(Path(a.tree), Path(a.portfolio[0]), Path(a.portfolio[1]),
+                         Path(a.out))
+        return 0
     if a.worker:
         worker(Path(a.tree), Path(a.hist), Path(a.out or os.devnull), a.start, a.end,
                a.tickers[0], a.load_only, Path(a.cache) if a.cache else None,
@@ -469,6 +636,12 @@ def main(argv=None) -> int:
         print(f"[replay-ab] loading history for {len(tickers)} tickers …", file=sys.stderr)
         for tk in tickers:                         # sequential: one fetch per ticker
             run(root, tk, None, load_only=True)
+        if not (hist / f"{MARKET}.pkl").exists():  # the market proxy, once per fetch
+            try:
+                run(root, MARKET, None, load_only=True)
+            except RuntimeError as exc:
+                print(f"[replay-ab] {MARKET} unavailable ({exc})", file=sys.stderr)
+        fetch_fund_names(tickers, hist)
         jobs = [(side, tree, tk) for tk in tickers
                 for side, tree in (("base", base_tree), ("change", change_tree))]
         print(f"[replay-ab] {len(jobs)} jobs, {a.jobs} at a time …", file=sys.stderr)
@@ -476,29 +649,48 @@ def main(argv=None) -> int:
             list(pool.map(lambda j: run(j[1], j[2], scratch / f"{j[0]}-{j[2]}.json"), jobs))
 
         hits, replayed, parity_checked, parity_bad = 0, 0, 0, []
+        portfolio: dict[str, str] = {}
 
-        def collect(side: str) -> dict:
+        def collect(side: str, tree: Path) -> dict:
             nonlocal hits, replayed, parity_checked, parity_bad
-            rows = {}
+            raw = []
             for tk in tickers:
                 data = json.loads((scratch / f"{side}-{tk}.json").read_text(encoding="utf-8"))
                 hits += data.get("cache_hits", 0)
-                for r in data["rows"]:
-                    rows[(r["ticker"], r["day"])] = r
-                    replayed += bool(r.get("replayed", True)) and side == "change"
-                    if side == "change" and "parity" in r:
-                        parity_checked += 1
-                        parity_bad += [f"{r['ticker']} {r['day']}: {x}" for x in r["parity"]]
+                raw += data["rows"]
+            # Cross-ticker step, run with the tree's own code (see portfolio_worker).
+            rows_in, rows_out = scratch / f"{side}-rows.json", scratch / f"{side}-linked.json"
+            rows_in.write_text(json.dumps(raw, default=str), encoding="utf-8")
+            proc = subprocess.run([sys.executable, "-I", str(me), "--tree", str(tree),
+                                   "--portfolio", str(rows_in), str(hist / "fund-names.json"),
+                                   "--out", str(rows_out)], capture_output=True, text=True)
+            if proc.returncode:
+                raise RuntimeError(f"{side} portfolio step: {proc.stderr[-1500:]}")
+            linked = json.loads(rows_out.read_text(encoding="utf-8"))
+            if linked["applied"]:
+                ref = linked["refused"]
+                portfolio[side] = (f"{', '.join(linked['links']) or 'none detected'}; "
+                                   f"{len(ref)} trades refused"
+                                   + (": " + "; ".join(f"{t['day']} {t['ticker']} `{t['trader']}` "
+                                                       f"in {t['in']} R {t['r']}"
+                                                       for t in ref[:15]) if ref else ""))
+            rows = {}
+            for r in linked["rows"]:
+                rows[(r["ticker"], r["day"])] = r
+                replayed += bool(r.get("replayed", True)) and side == "change"
+                if side == "change" and "parity" in r:
+                    parity_checked += 1
+                    parity_bad += [f"{r['ticker']} {r['day']}: {x}" for x in r["parity"]]
             return rows
 
-        cmp_ = compare(collect("base"), collect("change"))
+        cmp_ = compare(collect("base", base_tree), collect("change", change_tree))
         days = sorted({d for _, d in cmp_["keys"]})
         ctx = {"base": a.base,
                "change": a.change or (_git("branch", "--show-current", cwd=root) or "working tree"),
                "mode": a.mode if not a.tickers else "custom", "tickers": tickers,
                "fetched": hist.name,
                "start": start or (days[0] if days else "?"), "end": days[-1] if days else end,
-               "wall": round(time.time() - t0), "cache_hits": hits,
+               "wall": round(time.time() - t0), "cache_hits": hits, "portfolio": portfolio,
                "parity": (f"{parity_checked} replayed ticker-days, "
                           + (f"{len(parity_bad)} mismatches: " + "; ".join(parity_bad[:10])
                              if parity_bad else "replay book and harness agree")

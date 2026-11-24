@@ -11,6 +11,9 @@ SQLAlchemy repositories, i.e. the same PostgreSQL database the app uses):
                     *calls*, not how many bots echoed them. This is the honest
                     sample for deciding whether a setup/score actually works.
   3. LOSERS       — common failed checks / signals among losing trades.
+  4. MANAGED      — paired managed vs fixed Gap-and-Go exits (H5).
+  5. COSTS        — every bot on one cost basis, and what a $300/$500/$1,000
+                    stake keeps per trade after the $3 round-trip fee.
 
 Usage (from anywhere):  DATABASE_URL=postgresql+psycopg://... python algolab/analyze.py
 On the NUC:             docker compose exec app python algolab/analyze.py --user admin
@@ -139,6 +142,54 @@ def managed_ab(user_id: str) -> None:
               f"fixed={p['fixed_pnl_pct']:+.2f}% ({p['fixed_reason']})")
 
 
+def cost_table(rows: list[dict]) -> dict:
+    """Per trader: n, gross R, R after the common cost model, avg gross % per trade and
+    the account view (``stockanalyzer.costs``). Pure, so tests can feed rows."""
+    from stockanalyzer import costs
+    out: dict[str, dict] = {}
+    for r in rows:
+        entry, exit_px = r.get("entry"), r.get("exit_price")
+        stop = r.get("init_stop") or r.get("stop")
+        if not entry or exit_px is None or not stop or float(entry) <= float(stop):
+            continue
+        entry, exit_px, stop = float(entry), float(exit_px), float(stop)
+        risk = entry - stop
+        # managed closes already paid the flat spread; add it back to get gross
+        gross_px = exit_px + (costs.PER_SHARE if r.get("managed") else 0.0)
+        gross_r = (gross_px - entry) / risk
+        b = out.setdefault(r.get("trader") or "?", {"n": 0, "gross_r": 0.0, "net_r": 0.0,
+                                                     "pcts": []})
+        b["n"] += 1
+        b["gross_r"] += gross_r
+        b["net_r"] += gross_r - costs.cost_r(entry, stop)
+        b["pcts"].append((gross_px / entry - 1) * 100)
+    for b in out.values():
+        b["account"] = costs.account_view(b.pop("pcts"))
+        b["gross_r"], b["net_r"] = round(b["gross_r"], 2), round(b["net_r"], 2)
+    return out
+
+
+def cost_view(user_id: str) -> None:
+    from stockanalyzer import costs
+    _bar("5. COSTS AND ACCOUNT VIEW  (one cost basis; what a fixed stake keeps)")
+    table = cost_table(virtualbook.closed_trades(user_id=user_id))
+    if not table:
+        print("No closed trades with a stop yet.")
+        return
+    print(f"R cost = max(${costs.PER_SHARE:.2f}/share, {costs.BPS:g} bps) round trip. "
+          f"Account: ${costs.ACCOUNT_FEE:.0f} fee per round trip.")
+    stakes = costs.ACCOUNT_STAKES
+    print(f"  {'trader':18s} {'n':>4} {'gross R':>8} {'net R':>8} {'avg %':>7} "
+          + " ".join(f"{'$%d' % s:>8}" for s in stakes) + "  break-even")
+    for k, v in sorted(table.items()):
+        a = v["account"]
+        be = a["breakeven_stake"]
+        print(f"  {k[:18]:18s} {v['n']:>4} {v['gross_r']:+8.2f} {v['net_r']:+8.2f} "
+              f"{a['avg_gross_pct']:+7.3f} "
+              + " ".join(f"{a['net'][s]:+8.2f}" for s in stakes)
+              + f"  {'never' if be == float('inf') else f'${be:,.0f}'}")
+
+
 def bottom_line(user_id: str) -> None:
     _bar("BOTTOM LINE  (paper dollars across all bots)")
     rows = virtualbook.closed_trades(user_id=user_id)
@@ -186,6 +237,7 @@ def main(argv: list[str] | None = None) -> None:
     algorithm(user.id)
     losers(user.id)
     managed_ab(user.id)
+    cost_view(user.id)
     bottom_line(user.id)
     print("\nReminder: at small n most sub-group splits are noise. See "
           "algolab/LEARNINGS.md for what has already been ruled out, and add a "
