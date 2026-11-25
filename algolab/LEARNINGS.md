@@ -609,3 +609,46 @@ Test on new sessions before any ticker filter.
 (refetch with `--refresh`); keep the two variants if their net R stays > 0 over ≥ 30
 distinct dates each; drop a variant if it is ≤ 0 there.
 
+
+### 2026-11-26 — setup variants and vol-stop reversals trade live; bot-BRK and bot-gap-fixed retired (ALGORITHM CHANGE)
+
+**What changed (code):**
+1. **Six new live bots, to collect data** (owner's decision): `sb-am-bias`, `sb-mkt`,
+   `xfade-dbl-bottom`, `xfade-chop` (`stockanalyzer/setup_bots.py`, listed in
+   `LIVE_VARIANTS`; a setup added to `SETUPS` later stays backtest-only until listed
+   there) and `rev-trend-vol`, `rev-strong-vol` (moved from `REVERSAL_CANDIDATES` into
+   `REVERSAL_VARIANTS`). Both the radar worker and the in-app radar run them.
+   The setup bots decide on **completed** 5-minute bars only, from the same context
+   the harness and the replay build (session so far, previous session, pre-market,
+   daily bars before today, QQQ for `sb-mkt`); a resting-order fill whose bar also
+   hit the stop is closed at the stop at once (stop-first, as the harness judges it).
+2. **Retired:** `bot-BRK` (swing, breakout_wait at score ≥ 55) and `bot-gap-fixed`
+   (the fixed-exit Gap-and-Go twin). Gap-and-Go is `bot-gap-mgd` alone. Open
+   positions of both close by their own rules.
+3. **Idea-level view:** an idea is still judged on its fixed-exit trades; a cohort
+   with only managed trades (every Gap-and-Go idea from now on) is judged on those,
+   flagged `managed_exit`, instead of dropping out of `algorithm_correctness`.
+
+**Why:** none of the six new bots has passed its keep rule (H8, H9, H15, H16, H18):
+they go live to grow n on new sessions, not because they won. The book now pays the
+cost of their losses, so judge them on sessions after 2026-10-30 only, by the rows'
+own rules, and drop a bot that fails there. H5 (managed vs fixed exit) stops
+accruing pairs with `bot-gap-fixed` gone; its answer so far stays in
+`managed_vs_fixed`.
+
+**Evidence:** algo-gate on `algo/setups-live-bots` vs `feat/main-safe-merge`, confirmed
+mode: **PASS, no regression** (497 vs 476 tests, no new failure; backtest headline
+unchanged; 20 swing-probe flips = bot-BRK gone). Fast A/B, 236 ticker-days,
+2026-09-03 → 2026-11-25: whole book +1.45 → +6.09 net R (−4.31 → −1.13 after the
+common cost); `sb-mkt` +3.72 R (5 trades), `xfade-chop` +3.05 R (21),
+`rev-strong-vol` −3.00 R (3, all stops), `rev-trend-vol` no trade; `bot-gap-fixed`
+−0.16 R (10) removed. Swing bots are not in the A/B, so bot-BRK's removal is not
+measured there.
+`xfade-dbl-bottom` 68 → 77 trades only because the harness now reports each setup
+trade's exit bar, so the linked-ticker rule refuses 3 overlapping trades instead of
+12 (a measurement fix, no decision change).
+
+**How we'll know:** after ≥ 30 new sessions, `analyze.py` per bot and the
+idea-level view per setup; apply each hypothesis row's keep/kill rule on sessions
+after 2026-10-30 only. Kill `rev-strong-vol` / `rev-trend-vol` if ≤ 0 net of cost at
+30 dates; their originals are the control.
