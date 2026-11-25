@@ -27,3 +27,7 @@ exclude = [".venv", "alembic/versions"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# The live-trade-watch scripts share helpers through `from common import *` on purpose.
+".claude/skills/live-trade-watch/scripts/*.py" = ["F403", "F405"]
