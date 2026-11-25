@@ -211,7 +211,9 @@ def scan_day(hist: dict, ticker: str, day) -> DayResult:
         return DayResult(ticker, f"{day:%Y-%m-%d}",
                          error="no 5-minute data for this session")
     sess = replay.precompute_day(hist["i5"], hist["i30"], hist["daily"], day,
-                                 hist["prev_close"].get(day), ticker=ticker)
+                                 hist["prev_close"].get(day), ticker=ticker,
+                                 market_i5=hist.get("market_i5"),
+                                 market_sign=int(hist.get("market_sign", 1)))
     with tempfile.TemporaryDirectory(prefix="replay-scan-") as tmp:
         db = Path(tmp) / "scan.db"
         try:

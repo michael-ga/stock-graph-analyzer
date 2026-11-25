@@ -48,7 +48,8 @@ LEGACY_SETUPS = ("stockanalyzer/analysis/orb.py", "stockanalyzer/analysis/revers
 CORE = ("stockanalyzer/analysis/", "stockanalyzer/explain/", "stockanalyzer/verdict/",
         "stockanalyzer/sentiment/", "stockanalyzer/strategy.py", SETUPS_DIR)
 INPUTS = ("stockanalyzer/data/", "stockanalyzer/pipeline.py", "stockanalyzer/session.py")
-EXECUTION = ("app.py", "stockanalyzer/radar_worker.py", "stockanalyzer/virtualbook.py",
+EXECUTION = ("app.py", "stockanalyzer/radar_worker.py", "stockanalyzer/setup_bots.py",
+             "stockanalyzer/virtualbook.py",
              "stockanalyzer/papertrade.py", "stockanalyzer/swingwatch.py",
              "stockanalyzer/manage.py", "stockanalyzer/db/repositories/swingwatch.py")
 SIMULATORS = ("stockanalyzer/replay.py", "backtest.py", "daytrade_backtest.py",

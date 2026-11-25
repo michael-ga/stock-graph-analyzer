@@ -384,32 +384,41 @@ def live_bar(reports, price, now, orange: dict | None, prev_close, plan) -> Repl
     return _eval_bar(0, pd.Timestamp(now), row, reports, rng, prev_close, plan=plan)
 
 
-def _setup_reads(i5, daily_y1, day, prev_close, sess_full, bars: list) -> list:
+def _setup_reads(i5, daily_y1, day, prev_close, sess_full, bars: list,
+                 market_i5=None, market_sign: int = 1) -> list:
     """Every setups/ variant's read at each replay bar, built from the same as-of
     context the setups harness uses (session so far, the previous session, today's
-    pre-market, daily bars before today), so a replayed setup trade matches the
-    harness's. Live mode never calls this: no live bot trades a setup."""
-    from stockanalyzer.setups.harness import MIN_SESSION_BARS   # harness imports replay
+    pre-market, daily bars before today, the market proxy), so a replayed setup trade
+    matches the harness's. Live bots build the same context from the radar's frames
+    in ``stockanalyzer.setup_bots``."""
+    from stockanalyzer.setups.harness import (MIN_SESSION_BARS,  # harness imports replay
+                                              history_before, market_day)
     if not SETUPS or not bars or len(sess_full) < MIN_SESSION_BARS:
         return bars
     variants = [(m, cfg) for m in SETUPS.values() for cfg in m.VARIANTS]
     allday = asof.day_bars(i5, day)
     pre = allday.between_time("04:00", asof.REG_START, inclusive="left")
-    prior = [d for d in asof.trading_days(i5) if d < day]
+    tdays = asof.trading_days(i5)
+    prior = [d for d in tdays if d < day]
     prev = (asof.day_bars(i5, prior[-1]).between_time(
         asof.REG_START, asof.REG_END, inclusive="left") if prior else None)
     dly = (daily_y1[asof.naive_dates(daily_y1.index) < day]
            if daily_y1 is not None else None)
+    history = history_before(i5, tdays, tdays.index(day)) if day in tdays else None
+    mkt = market_day(market_i5, day)
     out = []
     for b in bars:
-        ctx = SetupContext(sess_full[sess_full.index <= b.t], prev, pre, prev_close, dly)
+        ctx = SetupContext(sess_full[sess_full.index <= b.t], prev, pre, prev_close, dly,
+                           history=history,
+                           market=None if mkt is None else mkt[mkt.index <= b.t],
+                           market_sign=market_sign)
         reads = tuple(m.signal(ctx, cfg) for m, cfg in variants)
         out.append(replace(b, bots=replace(b.bots, setups=reads)))
     return out
 
 
 def precompute_day(i5, i30, daily, day, prev_close, ticker: str = "",
-                   progress=None) -> ReplaySession:
+                   progress=None, market_i5=None, market_sign: int = 1) -> ReplaySession:
     """Walk 09:45 → 15:55 and freeze every bar's decision.
 
     ``progress`` is an optional ``callable(done, total)`` so a UI can show a bar;
@@ -442,7 +451,8 @@ def precompute_day(i5, i30, daily, day, prev_close, ticker: str = "",
         if progress is not None:
             progress(n + 1, total)
 
-    bars = _setup_reads(i5, daily.get(Timeframe.Y1), day, prev_close, sess_full, bars)
+    bars = _setup_reads(i5, daily.get(Timeframe.Y1), day, prev_close, sess_full, bars,
+                        market_i5=market_i5, market_sign=market_sign)
     fired = tuple(b.i for b in bars if b.bots.any_fired)
     return ReplaySession(ticker=ticker, day=day, prev_close=prev_close,
                          orange=orange, bars=tuple(bars), session_full=sess_full,

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from ..data.market_session import _to_et
 from ..session import market_phase
 from ..analysis.daycard import DayCard
 from ..analysis.signals import Direction
@@ -44,6 +45,11 @@ class ReversalConfig:
     name: str
     trend_mode: str      # "with_trend" | "strong_support"
     entry_mode: str      # "touch" | "confirmed"
+    # Since 2026-11-10 (the *-vol rows only; the defaults are the original rule):
+    stop_mode: str = "support"           # "support" | "vol" (also ≥ vol_mult × bar range)
+    vol_mult: float = 1.5
+    min_rr: float | None = None          # skip when the R:R left is below this
+    last_entry: str | None = None        # "HH:MM": no entry after this bar
 
 
 @dataclass(frozen=True)
@@ -71,10 +77,39 @@ class ReversalDecision:
 # = 4 variants; on 2026-11-02 rev-trend-touch (−11.8 R, 0% win in Sep–Oct) and
 # rev-strong-confirm (sign flips by regime) were retired on 59 sessions x 12 tickers
 # (algolab/screens/reversal_2026_11_02, LEARNINGS 2026-11-02).
+#
+# The two *-vol rows (pre-registered 2026-11-10, H18,
+# algolab/screens/daytrade_variants_2026_11_10/PREREGISTRATION.md): the original stop
+# sat 0.4% under support, inside one 5-minute bar of noise (0.6 bars median), and 37%
+# of the stopped-out touches later reached the full target. Each is its twin above
+# with the stop at least 1.5 median bar ranges away, R:R ≥ 1.5 and no entry after
+# 11:00. They trade live since 2026-11-25 to collect data (H18's keep/kill rule:
+# > 0 net of cost at ≥ 30 dates after 2026-10-30), not because they passed it.
 REVERSAL_VARIANTS: list[ReversalConfig] = [
     ReversalConfig("rev-trend-confirm",  "with_trend",     "confirmed"),
     ReversalConfig("rev-strong-touch",   "strong_support", "touch"),
+    ReversalConfig("rev-trend-vol",      "with_trend",     "confirmed",
+                   stop_mode="vol", min_rr=1.5, last_entry="11:00"),
+    ReversalConfig("rev-strong-vol",     "strong_support", "touch",
+                   stop_mode="vol", min_rr=1.5, last_entry="11:00"),
 ]
+
+# Replay/A-B-only rows that no live bot trades. Empty since the *-vol rows went live.
+REVERSAL_CANDIDATES: list[ReversalConfig] = []
+
+
+def median_bar_range(intraday_df: pd.DataFrame | None) -> float | None:
+    """Median high-low of the frame's regular-session bars (the noise of one bar)."""
+    if intraday_df is None or not len(intraday_df):
+        return None
+    idx = pd.DatetimeIndex(intraday_df.index)
+    wall = idx.tz_convert("America/New_York") if idx.tz is not None else idx
+    hhmm = wall.strftime("%H:%M")
+    reg = intraday_df[(hhmm >= "09:30") & (hhmm < "16:00")]
+    if not len(reg):
+        return None
+    med = float((reg["high"] - reg["low"]).median())
+    return med if med > 0 else None
 
 
 def _support_candidates(card: DayCard) -> list[float]:
@@ -138,6 +173,8 @@ def reversal_signal(card: DayCard | None, intraday_df: pd.DataFrame | None,
         return _no("no day card / price")
     if market_phase(asof_ts) == "opening_range":
         return _no("opening-range freeze (first 15 min)")
+    if cfg.last_entry and _to_et(asof_ts).strftime("%H:%M") > cfg.last_entry:
+        return _no(f"past the last entry bar ({cfg.last_entry})")
 
     support = _nearest_support(card, price)
     band = (support or price) * SUPPORT_BAND_PCT
@@ -187,6 +224,13 @@ def reversal_signal(card: DayCard | None, intraday_df: pd.DataFrame | None,
 
     entry = float(price)
     stop = round(support * (1 - STOP_BUFFER), 4)
+    if cfg.stop_mode == "vol":
+        rng = median_bar_range(intraday_df)
+        if rng is None:
+            return _no("no bar range for a volatility stop", at_support=True,
+                       support=support, support_conf=conf, trend_ok=True,
+                       reversed_up=reversed_up, gap_pct=gap_pct)
+        stop = round(min(stop, entry - cfg.vol_mult * rng), 4)
     if stop >= entry:
         return _no("degenerate geometry — stop ≥ entry", at_support=True,
                    support=support, support_conf=conf, trend_ok=True,
@@ -204,6 +248,10 @@ def reversal_signal(card: DayCard | None, intraday_df: pd.DataFrame | None,
 
     target = round(target, 4)
     rr = round((target - entry) / (entry - stop), 2)
+    if cfg.min_rr is not None and rr < cfg.min_rr:
+        return _no(f"R:R {rr:.2f} < {cfg.min_rr:g} with the volatility stop",
+                   at_support=True, support=support, support_conf=conf, trend_ok=True,
+                   reversed_up=reversed_up, aim_ok=True, gap_pct=gap_pct)
     return ReversalDecision(
         True,
         f"reversal at ${support:.2f} ({conf} conf) — aim {aim*100:.1f}% to ${target:.2f}",

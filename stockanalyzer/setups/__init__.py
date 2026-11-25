@@ -2,15 +2,17 @@
 
 - ``orb.py``        Gap-and-Go opening-range breakout (live bots ``bot-gap-*``).
 - ``reversal.py``   reversal-at-support family (live bots ``rev-*``).
-- ``silver_bullet.py``, ``double_bottom.py``  backtest-only setups built on the
-  shared contract in ``base.py`` (``signal(SetupContext, cfg) -> SetupDecision``).
-  ``harness.py`` steps them bar by bar over real history.
+- ``silver_bullet.py``, ``double_bottom.py``  setups built on the shared contract
+  in ``base.py`` (``signal(SetupContext, cfg) -> SetupDecision``). ``harness.py``
+  steps them bar by bar over real history. Since 2026-11-25 the variants named in
+  ``stockanalyzer.setup_bots.LIVE_VARIANTS`` also trade as live bots, to collect data.
 
 ``orb`` and ``reversal`` keep their own signatures because the live radar, the
 replay and their tests call them directly. New setups follow ``base.py`` and are
 listed in ``SETUPS`` so the harness finds them; the
 ``.claude/skills/setup-lab`` skill walks an idea from text to a module here.
-Wiring a setup into the live bots is an algorithm change — its own [ALGO] PR.
+A new setup or variant is backtest-only until it is added to ``LIVE_VARIANTS``;
+wiring one into the live bots is an algorithm change — its own [ALGO] PR.
 """
 from . import double_bottom, silver_bullet
 

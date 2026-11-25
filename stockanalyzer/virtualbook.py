@@ -155,6 +155,12 @@ TRADER_RULES = {
     "rev-trend-confirm": "reversal @ support, daily uptrend, confirmed reclaim",
     "rev-strong-touch": "reversal @ strong support, any trend, first touch",
     "rev-strong-confirm": "reversal @ strong support, any trend, confirmed reclaim (retired 2026-11-02)",
+    "rev-trend-vol": "rev-trend-confirm with a volatility stop, R:R ≥ 1.5, no entry after 11:00",
+    "rev-strong-vol": "rev-strong-touch with a volatility stop, R:R ≥ 1.5, no entry after 11:00",
+    "sb-am-bias": "ICT Silver Bullet (long), 09:30–10:30 FVG, daily bias up",
+    "sb-mkt": "sb-am-bias, only with QQQ on the trade's side of its open",
+    "xfade-dbl-bottom": "extension-fade double bottom, neckline break, 1R target",
+    "xfade-chop": "xfade-dbl-bottom, only when 5-min ADX(14) < 20 (a range)",
 }
 
 

@@ -20,7 +20,7 @@ from typing import Callable, Iterator, Protocol
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-from stockanalyzer import session as market_session, swingwatch, virtualbook
+from stockanalyzer import session as market_session, setup_bots, swingwatch, virtualbook
 from stockanalyzer.setups import orb, reversal
 from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
 from stockanalyzer.data.schema import Timeframe
@@ -448,6 +448,46 @@ def run_reversal_bots(user_id: str, ticker: str, result, asof) -> list[dict]:
     return opened
 
 
+def run_setup_bots(user_id: str, ticker: str, result, asof) -> list[dict]:
+    """Run every ``setups/`` variant (Silver Bullet, Double Bottom) as its own bot,
+    on completed 5-minute bars (``stockanalyzer.setup_bots``)."""
+    if market_session.market_phase(asof) == "opening_range":
+        return []
+    if result is None or not getattr(result, "reports", None):
+        return []
+    reports = result.reports
+    d1, y1 = reports.get(Timeframe.D1), reports.get(Timeframe.Y1)
+    if d1 is None or getattr(d1, "df", None) is None or not len(d1.df):
+        return []
+    quote = getattr(result, "quote", None)
+    ctx = setup_bots.live_context(
+        d1.df, y1.df if y1 is not None else None,
+        getattr(quote, "prev_close", None), asof,
+        market=setup_bots.market_frame(), market_sign=setup_bots.market_sign(ticker))
+    opened = []
+    for decision in setup_bots.decisions(ctx):
+        if not decision.fired:
+            continue
+        trade = _open_position(
+            user_id,
+            ticker=ticker,
+            trader=decision.variant,
+            entry=decision.entry,
+            stop=decision.stop,
+            target=decision.target,
+            kind="immediate",
+            horizon_days=1,
+            snapshot=setup_bots.snapshot(decision),
+        )
+        if trade is None:
+            continue
+        opened.append(trade)
+        if setup_bots.stopped_on_fill(decision, ctx):
+            virtualbook.close_position(trade["id"], decision.stop, "stop_hit",
+                                       user_id=user_id)
+    return opened
+
+
 def process_analysis(user_id: str, ticker: str, result, asof: datetime) -> ProcessReport:
     """Apply one shared market analysis to one radar owner, always explicitly scoped."""
     # This is only an inexpensive prefilter. The locked check below is authoritative.
@@ -483,6 +523,7 @@ def process_analysis(user_id: str, ticker: str, result, asof: datetime) -> Proce
         )
         opened = run_automatic_bots(user_id, ticker, plan, result, orange, asof)
         opened += run_reversal_bots(user_id, ticker, result, asof)
+        opened += run_setup_bots(user_id, ticker, result, asof)
         price = _price_of(result)
         changed = []
         if price:

@@ -35,6 +35,11 @@ class SetupContext:
     premarket: pd.DataFrame | None        # today's 04:00–09:25 ET bars
     prev_close: float | None
     daily: pd.DataFrame | None            # daily bars strictly before today
+    # Optional context, added 2026-11-10; a setup that needs one and doesn't get it
+    # stands aside. All strictly as-of: nothing after the session's last bar.
+    history: pd.DataFrame | None = None   # regular bars of up to 14 prior sessions (unused since orb-sip failed its screen)
+    market: pd.DataFrame | None = None    # QQQ's regular bars today, up to the as-of bar
+    market_sign: int = 1                  # -1 for an inverse ETF (the market works against it)
 
     @property
     def asof(self) -> pd.Timestamp:
@@ -77,6 +82,30 @@ def hhmm(index: pd.DatetimeIndex) -> np.ndarray:
 
 def bar_ranges(df: pd.DataFrame) -> np.ndarray:
     return (df["high"] - df["low"]).to_numpy(dtype=float)
+
+
+def daily_atr(daily: pd.DataFrame | None, length: int = 14) -> float | None:
+    """Wilder ATR of the daily bars (days before today), or None."""
+    if daily is None or len(daily) < length + 1:
+        return None
+    from ..analysis.indicators import atr
+    v = atr(daily["high"].astype(float), daily["low"].astype(float),
+            daily["close"].astype(float), length).iloc[-1]
+    return float(v) if np.isfinite(v) and v > 0 else None
+
+
+def market_agrees(ctx: SetupContext) -> bool | None:
+    """Is the market proxy (QQQ) on the trade's side of its 09:30 open at the as-of
+    bar? Long: above the open; inverse ETF (``market_sign`` -1): below. None when
+    there is no market bar for this clock."""
+    m = ctx.market
+    if m is None or not len(m):
+        return None
+    m = m[m.index <= ctx.asof]
+    if not len(m):
+        return None
+    move = float(m["close"].iloc[-1]) / float(m["open"].iloc[0]) - 1
+    return bool(move * ctx.market_sign > 0)
 
 
 def daily_bias_up(daily: pd.DataFrame | None, sma: int = 20) -> bool | None:

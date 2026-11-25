@@ -30,7 +30,8 @@ import streamlit as st
 
 import replay_page
 import ui_common
-from stockanalyzer import papertrade, replay, session, swingwatch, virtualbook, watchlist
+from stockanalyzer import (papertrade, replay, session, setup_bots, swingwatch,
+                           virtualbook, watchlist)
 from stockanalyzer.auth import AuthError, AuthService, dev_login_username
 from stockanalyzer.user_management import UserManagementService
 from stockanalyzer.config import ConfigurationError, Settings
@@ -920,6 +921,43 @@ def _run_reversal_bots(tk: str, res, price: float | None, phase=None) -> None:
     st.session_state.setdefault("radar_reversals", {})[tk] = fired
 
 
+def _run_setup_bots(tk: str, res, phase=None) -> None:
+    """The setups/ bots (Silver Bullet, Double Bottom): each variant is its own bot,
+    deciding on completed 5-minute bars (``stockanalyzer.setup_bots``, the same code
+    the radar worker runs). Shares the ORB freeze: no entries in the first 15 min."""
+    if phase == "opening_range" or res is None or not getattr(res, "reports", None):
+        return
+    reports = res.reports
+    d1, y1 = reports.get(Timeframe.D1), reports.get(Timeframe.Y1)
+    if d1 is None or d1.df is None or not len(d1.df):
+        return
+    prev_close = res.quote.prev_close if (res.quote and res.quote.prev_close) else None
+    try:
+        ctx = setup_bots.live_context(
+            d1.df, y1.df if y1 is not None else None,
+            prev_close, session.now_et(), market=setup_bots.market_frame(),
+            market_sign=setup_bots.market_sign(tk))
+    except Exception:
+        return
+    uid = st.session_state.auth_user_id
+    for dec in setup_bots.decisions(ctx):
+        if not dec.fired:
+            continue
+        try:
+            if virtualbook.has_open(tk, dec.variant, user_id=uid):
+                continue
+            row = virtualbook.open_position(
+                ticker=tk, trader=dec.variant, entry=dec.entry, stop=dec.stop,
+                target=dec.target, kind="immediate", horizon_days=1,
+                snapshot=setup_bots.snapshot(dec), user_id=uid)
+            if row and setup_bots.stopped_on_fill(dec, ctx):
+                virtualbook.close_position(row["id"], dec.stop, "stop_hit", user_id=uid)
+            st.toast(f"🎯 {dec.variant} opened {dec.setup} {tk} @ ${dec.entry:.2f} "
+                     f"(stop ${dec.stop:.2f}, tgt ${dec.target:.2f})", icon="🎯")
+        except Exception:
+            pass
+
+
 # --------------------------------------------------------------------------- #
 # Swing radar — quiet tracking with escalating notices (60 / 70 / 80%).
 # --------------------------------------------------------------------------- #
@@ -1155,6 +1193,7 @@ def _radar_body(tracked: list[str]) -> None:
                 _run_bots(tk, plan, reports=reports, orange=orange,
                           price=px, phase=phase)
                 _run_reversal_bots(tk, res, px, phase)
+                _run_setup_bots(tk, res, phase)
                 if px:
                     dec = _radar_decision_rep(res) if res is not None else None
                     tc = getattr(dec, "trend_change", None)
