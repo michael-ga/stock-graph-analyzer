@@ -340,7 +340,8 @@ def run_automatic_bots(user_id: str, ticker: str, plan, result, orange, asof) ->
             orange, _intraday_frame(reports), price, asof
         )
         if decision.fired:
-            for trader, managed in (("bot-gap-fixed", False), ("bot-gap-mgd", True)):
+            # bot-gap-fixed (the fixed-exit twin) retired 2026-11-26.
+            for trader, managed in (("bot-gap-mgd", True),):
                 trade = _open_position(
                     user_id,
                     ticker=ticker,
@@ -369,9 +370,7 @@ def run_automatic_bots(user_id: str, ticker: str, plan, result, orange, asof) ->
             and candidate.actionable
             and not _is_extended(candidate)
         )),
-        ("bot-BRK", lambda candidate: (
-            candidate.kind == "breakout_wait" and candidate.score >= 55
-        )),
+        # bot-BRK (breakout_wait, score ≥ 55) retired 2026-11-26.
     )
     for trader, condition in rules:
         if not condition(plan):

@@ -806,9 +806,10 @@ def _opening_range(tk: str, res) -> dict | None:
 
 
 def _run_gap_bots(tk: str, reports, orange: dict | None, price: float | None) -> None:
-    """Open the Gap-and-Go pair when the ORB rules line up: a real gap-up, inside
-    the 9:45–11:30 window, price breaking the opening-range HIGH on >1.5× volume.
-    Hard stop sits just below the opening-range LOW (Carter's ORB rule)."""
+    """Open the Gap-and-Go bot (``bot-gap-mgd``, managed exit) when the ORB rules
+    line up: a real gap-up, inside the 9:45–11:30 window, price breaking the
+    opening-range HIGH on >1.5× volume. Hard stop sits just below the opening-range
+    LOW (Carter's ORB rule). Its fixed-exit twin ``bot-gap-fixed`` retired 2026-11-26."""
     if not (orange and orange.get("gap_up") and price and reports):
         return
     df = _intraday_frame(reports)
@@ -818,7 +819,7 @@ def _run_gap_bots(tk: str, reports, orange: dict | None, price: float | None) ->
         return
     entry, init_stop, target, rvol = dec.entry, dec.stop, dec.target, dec.rvol
     snap = _gap_snapshot(orange, rvol, entry, init_stop, target)
-    for trader, managed in (("bot-gap-fixed", False), ("bot-gap-mgd", True)):
+    for trader, managed in (("bot-gap-mgd", True),):
         try:
             if not virtualbook.has_open(
                     tk, trader, user_id=st.session_state.auth_user_id):
@@ -841,7 +842,7 @@ _BOTS = (
     # with-trend momentum name, NOT an extended blowoff it should never chase.
     ("bot-70",  lambda p: p.score >= 70 and p.kind == "immediate" and not p.go
                 and p.actionable and not _is_extended(p), False),
-    ("bot-BRK", lambda p: p.kind == "breakout_wait" and p.score >= 55, True),
+    # bot-BRK (breakout_wait, score ≥ 55, armed pending order) retired 2026-11-26.
 )
 
 
@@ -1377,7 +1378,7 @@ def _portfolio_panel() -> None:
                          expanded=False):
             st.info("No virtual positions yet. On any actionable plan press "
                     "**📒 Virtual BUY** to open a $1,000 paper position (stop + target "
-                    "attached). Bots **bot-GO / bot-70 / bot-BRK** also trade automatically "
+                    "attached). Bots **bot-GO / bot-70** also trade automatically "
                     "as the radar scans, so the report card fills up on its own.")
         return
 
@@ -1517,7 +1518,7 @@ def _portfolio_panel() -> None:
                                  use_container_width=True)
 
                 # Algorithm correctness — the deduped view. The book copies one
-                # idea across bot-GO/bot-70/bot-BRK/me, which inflates the sample;
+                # idea across bot-GO/bot-70/me, which inflates the sample;
                 # this collapses each plan to a single idea so the numbers judge
                 # the engine's CALLS, not how many bots echoed them.
                 try:

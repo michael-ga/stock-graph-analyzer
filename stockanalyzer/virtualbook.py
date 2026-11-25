@@ -148,8 +148,8 @@ TRADER_RULES = {
     "me": "manual 📒 Virtual BUY",
     "bot-GO": "swing plan, strict GO only",
     "bot-70": "swing plan, score ≥70 immediate (not GO)",
-    "bot-BRK": "swing plan, armed breakout_wait orders",
-    "bot-gap-fixed": "Gap-and-Go ORB, fixed stop/target",
+    "bot-BRK": "swing plan, armed breakout_wait orders (retired 2026-11-26)",
+    "bot-gap-fixed": "Gap-and-Go ORB, fixed stop/target (retired 2026-11-26)",
     "bot-gap-mgd": "Gap-and-Go ORB, managed exit",
     "rev-trend-touch": "reversal @ support, daily uptrend, first touch (retired 2026-11-02)",
     "rev-trend-confirm": "reversal @ support, daily uptrend, confirmed reclaim",
@@ -235,7 +235,9 @@ def algorithm_correctness(*, user_id: str) -> dict:
 
     Collapses every trader that took one plan into a single idea (``cohort_id``),
     so the win rate reflects the engine's decisions rather than how many bots
-    copied them. Managed (exit-A/B) rows are excluded."""
+    copied them. An idea is judged on its fixed-exit trades; one with only managed
+    trades (Gap-and-Go since bot-gap-fixed retired) on those, flagged
+    ``managed_exit``."""
     return _REPOSITORY.algorithm_correctness(_owner(user_id))
 
 

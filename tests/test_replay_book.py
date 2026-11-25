@@ -251,7 +251,7 @@ def test_toggles_off_means_signal_only(tmp_path):
 
 
 @pytest.mark.parametrize("key,expected", [
-    ("orb", {"bot-gap-fixed", "bot-gap-mgd"}),
+    ("orb", {"bot-gap-mgd"}),
     ("rev", {"rev-trend-touch"}),
     ("swing", {"bot-GO"}),
 ])
@@ -263,7 +263,7 @@ def test_each_toggle_places_only_its_own_bots(tmp_path, key, expected):
 
 
 def test_the_replay_runs_the_same_swing_roster_as_the_live_radar():
-    """bot-GO / bot-70 / bot-BRK must all exist here, or the replay would quietly
+    """bot-GO / bot-70 must both exist here, or the replay would quietly
     grade a smaller field than the one actually trading."""
     import app
 
@@ -284,25 +284,16 @@ def test_bot_70_stands_aside_on_an_extended_plan(tmp_path):
     assert replay.load_book(db) == []
 
 
-def test_bot_brk_arms_a_pending_order_and_fills_on_the_break(tmp_path):
-    """The breakout bot is the only one that doesn't enter at market: it arms a
-    trigger, and the book's two-phase fill decides whether the break confirms."""
+def test_a_breakout_wait_plan_arms_no_bot_since_bot_brk_retired(tmp_path):
+    """bot-BRK (breakout_wait, score ≥ 55) retired 2026-11-26: a non-GO breakout_wait
+    plan now places nothing. (The book's pending-order fill is still covered by
+    test_virtualbook.)"""
     db = _db(tmp_path)
-    bars = [_bar(0, kind="breakout_wait", trigger=104.0, score=60,
-                 high=103.0, low=102.5, close=102.8),
-            _bar(1, high=106.0, low=103.5, close=105.5),   # confirms past trigger
-            _bar(2, high=105.0, low=103.9, close=104.1)]   # throwback fills entry
-    sess = _session(bars)
-
+    sess = _session([_bar(0, kind="breakout_wait", trigger=104.0, score=60,
+                          high=103.0, low=102.5, close=102.8)])
     replay.apply_bar(sess, 0, {**_NO_BOTS, "swing": True}, db)
-    row = replay.load_book(db)[0]
-    assert row["trader"] == "bot-BRK" and row["status"] == "pending"
-
-    replay.apply_bar(sess, 1, {**_NO_BOTS, "swing": True}, db)
-    replay.apply_bar(sess, 2, {**_NO_BOTS, "swing": True}, db)
-    row = replay.load_book(db)[0]
-    assert row["status"] in ("open", "closed"), "the armed breakout never filled"
-    assert row["activated_ts"] in (sess.bars[1].epoch, sess.bars[2].epoch)
+    assert replay.load_book(db) == []
+    assert "bot-BRK" not in {n for n, _ in replay.SWING_BOTS}
 
 
 def test_armed_swing_bots_reports_the_watch_only_chokepoint():
@@ -311,18 +302,14 @@ def test_armed_swing_bots_reports_the_watch_only_chokepoint():
     assert replay.armed_swing_bots(_bar(0, go=False, score=40)) == ()
 
 
-def test_the_gap_pair_is_an_ab_test_on_identical_geometry(tmp_path):
-    """bot-gap-fixed and bot-gap-mgd differ only in whether the exit is managed —
-    same entry/stop/target, so they collapse to one cohort."""
+def test_gap_and_go_is_one_managed_bot(tmp_path):
+    """bot-gap-fixed retired 2026-11-26: a Gap-and-Go fire opens only bot-gap-mgd,
+    with a managed exit."""
     db = _db(tmp_path)
     replay.apply_bar(_session([_bar(0, gap_fired=True)]), 0,
                      {**_NO_BOTS, "orb": True}, db)
-    rows = {r["trader"]: r for r in replay.load_book(db)}
-    fixed, managed = rows["bot-gap-fixed"], rows["bot-gap-mgd"]
-    assert (fixed["entry"], fixed["stop"], fixed["target"]) == \
-           (managed["entry"], managed["stop"], managed["target"])
-    assert fixed["managed"] == 0 and managed["managed"] == 1
-    assert fixed["cohort_id"] == managed["cohort_id"]
+    [row] = replay.load_book(db)
+    assert row["trader"] == "bot-gap-mgd" and row["managed"] == 1
 
 
 def test_a_swing_bot_stands_aside_on_a_non_actionable_plan(tmp_path):
@@ -339,6 +326,9 @@ def test_a_swing_bot_stands_aside_on_a_non_actionable_plan(tmp_path):
 def test_force_flat_closes_everything_at_the_last_bar(tmp_path):
     db = _db(tmp_path)
     sess = _session([_bar(0, gap_fired=True), _bar(1), _bar(2, close=106.0)])
+    with replay.book(db) as owner:        # a position still open at the close
+        virtualbook.open_position(ticker="TEST", trader="me", entry=104.0, stop=100.0,
+                                  target=120.0, now=sess.bars[0].epoch, user_id=owner)
     for i in range(3):
         replay.apply_bar(sess, i, _ALL_BOTS, db)
     closed = replay.force_flat(sess, db)
@@ -358,8 +348,8 @@ def test_scorecard_reports_per_trader_and_idea_level_views(tmp_path):
     replay.force_flat(sess, db)
 
     card = replay.scorecard(sess, db)
-    assert {r["trader"] for r in card["book"]} == {"bot-gap-fixed", "bot-gap-mgd"}
-    assert set(card["stats"]["traders"]) == {"bot-gap-fixed", "bot-gap-mgd"}
+    assert {r["trader"] for r in card["book"]} == {"bot-gap-mgd"}
+    assert set(card["stats"]["traders"]) == {"bot-gap-mgd"}
     # Two bots acting on one plan is ONE idea, not two — that dedupe is the whole
     # point of the idea-level view.
     assert len(card["ideas"]["ideas"]) == 1

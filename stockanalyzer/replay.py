@@ -52,20 +52,19 @@ _MEANREV_CHECKS = ("Bollinger", "overextended", "No chase", "Buying low",
 # Bot identities. Deliberately the *same* trader names the live radar uses
 # (app.py) — isolation comes from the sandbox book, so identical names make a
 # replay scorecard directly comparable, row for row, with the live one.
-GAP_BOTS = (("bot-gap-fixed", False), ("bot-gap-mgd", True))
+# bot-gap-fixed (the fixed-exit twin of bot-gap-mgd) retired 2026-11-26.
+GAP_BOTS = (("bot-gap-mgd", True),)
 
 # The swing family, mirroring app.py's `_BOTS` exactly — contrasting strategies so
-# the book shows which rules actually earn their place. `bot-BRK` is the only one
-# that arms a *pending* order: `open_position` sets status="pending" whenever the
-# kind is breakout_wait and a trigger exists, and `mark` then decides whether the
-# break confirms and pulls back far enough to fill.
+# the book shows which rules actually earn their place. bot-BRK (breakout_wait,
+# score ≥ 55, an armed *pending* order) retired 2026-11-26; `open_position` still
+# arms a pending order for any bot whose plan is breakout_wait with a trigger.
 SWING_BOTS = (
     ("bot-GO", lambda b: b.go),
     # bot-70 respects the engine's own guardrails: a high score on a with-trend
     # momentum name, NOT an extended blowoff it should never chase.
     ("bot-70", lambda b: b.score >= 70 and b.kind == "immediate" and not b.go
                and b.actionable and not b.extended),
-    ("bot-BRK", lambda b: b.kind == "breakout_wait" and b.score >= 55),
 )
 SWING_BOT = SWING_BOTS[0][0]        # kept for callers that only mean bot-GO
 
