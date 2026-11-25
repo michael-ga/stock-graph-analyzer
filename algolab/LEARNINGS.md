@@ -374,6 +374,9 @@ faithfully rather than diverging. Whether the gap *should* be measured from the
 regular open is a real question — but it is an algorithm change, needs its own
 entry, and must be judged on ideas, not on one session.
 
+*Status (2026-11-04): this observation is addressed by the 2026-10-21 entry below, and
+the 2026-11-04 entry adds a live-session example where the pre-market open flipped the gate.*
+
 **How we'll know it worked:** the replay is a measurement instrument, so the test is
 usage — load a day, run the bots, and check that the fired/blocked verdicts match
 what `daytrade_backtest.py <ticker> --verbose` prints for the same day. Any
@@ -606,3 +609,173 @@ Test on new sessions before any ticker filter.
 (refetch with `--refresh`); keep the two variants if their net R stays > 0 over ≥ 30
 distinct dates each; drop a variant if it is ≤ 0 there.
 
+---
+
+### 2026-07-27 — quote day-change fix when the daily feed skips a session (no algorithm change)
+
+**Why:** INTC's price header printed a "day change" roughly double the real
+one-day move. Root cause: `pipeline._fallback_quote` takes `prev_close` from
+`daily.df["close"].iloc[-2]` and *assumes* that row is the immediately preceding
+session. yfinance's daily bars occasionally drop a session entirely (here Friday
+2026-07-24 was missing while Monday was present), so `iloc[-2]` silently spanned
+two trading days.
+
+**This entry changes NO algorithm behaviour.** No gate, weight, threshold or
+`SCHEMA_VERSION` moved; only the displayed quote (`prev_close` / `regular_close`)
+is corrected.
+
+**What changed (code):**
+1. `data/market_session.session_closes(df, n)` — the last `n` distinct trading days'
+   REGULAR-session closes from an intraday frame, most recent first.
+2. `_fallback_quote` cross-checks the daily frame against the 5D/1D intraday frame,
+   which gets every session's bars as they trade: if intraday knows a newer session
+   than the daily frame, both closes come from intraday; if the latest day matches
+   but the session *before* it differs, `prev_close` comes from intraday.
+
+**How we'll know it worked:** `tests/test_fallback_quote.py` reproduces the INTC
+gap (Thu → Mon daily, Friday present intraday → `prev_close` is Friday's close,
+day change −2.58%, not the 2-day move) and pins that the common no-gap case is
+left untouched.
+
+---
+
+### 2026-10-21 — gap measured from the 09:30 open, not the pre-market open (ALGORITHM CHANGE)
+
+**Supersedes the "open observation" in the 2026-07-26 entry.** That entry flagged
+that `orb.opening_range` took the gap from the first bar of the day, which with
+`prepost=True` data is the **04:00 pre-market open**, and judged it a near-boundary
+risk. A replay of SNDK 2026-10-12…20 shows it is systematic: the bot's gap was off
+on **all 6 days**, by 0.4–2.3 pp, always toward zero:
+
+| Day | Bot's gap (pre-market) | Real gap (09:30) |
+|---|--:|--:|
+| 10-13 | −3.4% | −5.5% |
+| 10-16 | −1.1% | −3.3% |
+| 10-19 | +3.4% | +4.6% |
+
+The reversal family had the same bug by another route: it backed `session_open`
+out of `card.day_change_pct`, which `build_day_card` also measures from the first
+(pre-market) bar. On 10-16 (real −3.3%) the `with_trend` "gap-down ≤ −2% is a
+knife" guard read −1.1% and **would not have stood aside**, on a day that closed
+at its low.
+
+**What changed (code):**
+1. `data/market_session.regular_open(df)`: open of the first REGULAR bar of the
+   latest ET date; `None` until 09:30 exists.
+2. `orb.opening_range` uses it (returns `None` if there is no regular bar yet).
+3. `DayCard.session_open` (new, default `None`) is set from it in `build_day_card`;
+   `reversal_signal` prefers it and only falls back to the old `day_change_pct`
+   derivation when the card has no regular-session bars.
+
+**Deliberately NOT changed:** `DayCard.day_change_pct`, session high/low,
+range position and battle zones still span pre-market. They are separate
+behaviours (display + the reversal "lower 35% of range" gate), and changing them
+on the same PR would blur what this one measures.
+
+**Measurement honesty:** this changes which days pass the ORB `gap_up` gate and the
+reversal knife guard, so **ORB and reversal stats before and after 2026-10-21 are
+not comparable**. The H5 paired read (`managed_vs_fixed`) is unaffected: both bots
+share the entry. Swing bots are unaffected.
+
+**How we'll know:** `test_gap_is_measured_from_the_regular_open_not_premarket`,
+`test_premarket_gap_up_that_opens_flat_is_not_a_gap_up` and
+`test_gap_uses_card_regular_open_over_premarket_derived_open` all fail on the old
+code. `daytrade_backtest.py SNDK --date 2026-10-16` now prints `gap -3.3% (open
+$1348.82 …)`. Next: count how many ORB fires the corrected gate added/removed once
+a few weeks of live data exist. Plan with the related L2 overnight-hold issue:
+`docs/plans/2026-10-21-sndk-snapshot-review.md` (on the daychart branch).
+
+---
+
+### 2026-10-22 — [ALGO] measured impact of the 09:30 gap reference + skipped-session prev close
+
+**Why this entry:** the two entries above ship together in one [ALGO] PR into `main`.
+This records what they do to real trades, and corrects two claims made earlier.
+
+**Corrections to earlier entries (data, not opinion):**
+1. The 2026-07-27 quote fix is labelled "no algorithm change". That is wrong for live
+   trading: `Quote.prev_close` feeds `orb.opening_range` (the Gap-and-Go gap) and
+   `reversal.reversal_signal` in both `app.py` and `radar_worker.py`. On a day the
+   daily feed skips a session, it changes the gap and can change trades. It is an
+   **indirect** algorithm change. Replay does not exercise it (replay takes
+   `prev_close` from the daily frame), so the A/B below cannot show it.
+2. The 2026-10-21 entry says the pre-market gap was off "always toward zero". Over
+   6 tickers × 22 sessions it is off in **both** directions: INTC 2026-09-30 read
+   +5.06% from the 04:00 open against a real +0.10%; TSLA 2026-10-16 +3.93% vs +1.82%.
+
+**Measured (real-history replay A/B, every bot on):** INTC AMD NVDA TSLA PLTR SMCI,
+2026-09-22 → 2026-10-21, 132 ticker-days, identical yfinance bars on both trees.
+- Gap-ups ≥ +2%: 8 days by the old measure, 16 by the 09:30 open. Median gap error of
+  the old measure: 0.88 points against a 2-point threshold.
+- Swing (`bot-GO`, `bot-BRK`) and reversal bots: **identical** trades.
+- Gap-and-Go (`bot-gap-fixed` + `bot-gap-mgd`): **0 → 8 trades** — exactly the days that
+  newly pass the gate (AMD, INTC, SMCI 2026-10-02; TSLA 2026-10-21). 1 win, 3 losses
+  per pair; net R for the whole book −2.35 → −4.81.
+- 6 other days newly pass the gap gate but fail later ORB checks: no trade.
+
+**Statistical discipline:** 4 Gap-and-Go ideas is not a sample. This PR fixes a
+measurement bug; it does not claim Gap-and-Go is profitable. Judge the bot on
+`store.algorithm_correctness` (idea level) after several weeks of live data, and do
+not compare ORB/reversal stats across 2026-10-21.
+
+**How we'll know it worked:** the unit tests in the two entries above; the gap shown
+on the replay page matches the 09:30 open; and a re-run of the replay A/B on a later
+month shows Gap-and-Go firing only on days whose 09:30 gap is ≥ +2%.
+
+---
+
+### 2026-11-04 — pre-market gap read flipped the ORB gate on 3 of 4 tickers in one session (evidence for the 2026-10-21 fix)
+
+**Why this entry:** a read-only replay of 2026-11-04 for SNXX, SNDQ, AMDL and NBIZ
+(`replay.precompute_day` + `replay_scan.summarize`, every bot on, throwaway sandbox
+books, code without this fix) showed the Gap-and-Go gate reading the wrong gap on
+three of the four names. PR #18 is being updated onto `feat/main-safe-merge`, so this
+records today's example next to the 2026-10-22 measurement.
+
+| Ticker | Gap read from the 04:00 print | Real gap (09:30 open) | Gate on the old code | With the 09:30 open |
+|---|---|---|---|---|
+| SNXX | +1.47% | −8.77% | blocked | blocked (no change) |
+| SNDQ | −1.13% | +8.44% | **blocked** | fires 10:45, entry 24.77, stop 21.70, target 30.90 |
+| AMDL | +11.33% | +0.35% | **fired 09:45**, entry 51.38 | blocked |
+| NBIZ | +1.82% | +7.36% | **blocked** | fires 10:40, entry 42.59, stop 37.21, target 53.34 |
+
+- **AMDL, false fire:** the 04:00 print was 51.76 against a 46.49 prev close. ORB
+  entered at 51.38, near the top of a 44.95 → 52.24 opening spike, and the stock faded
+  all day. `bot-gap-fixed` closed at the EOD price of 47.32 (−7.89%, about −0.63R), and
+  `bot-gap-mgd` was stopped at 48.23 at 10:20 (−6.13%, about −0.49R). Together that is −1.12R.
+- **SNDQ and NBIZ, missed entries:** with a fixed bracket, each counterfactual entry
+  closes at the EOD price for about 0R (SNDQ −0.56%, −0.05R; NBIZ +0.52%, +0.04R). The
+  stops sat 12–13% away, below the opening-range lows, so neither the stop nor the 2R
+  target came close. `bot-gap-mgd`'s managed exits were not simulated for these two.
+
+**Statistical discipline:** this is one session and three ideas. It shows that the gate
+reads the wrong number, and that the error runs in both directions (+11 points
+on AMDL, −9.6 points on SNDQ). It does **not** show that the fix has an edge. The
+net change on the day is about −1.1R → 0R, which is within noise. Judge Gap-and-Go on
+idea-level results after the fix ships, as the 2026-10-22 entry says.
+
+**Re-measured on top of `feat/main-safe-merge`** (`algo_gate.py --history fast`: SNXX,
+SNDQ, NBIZ, NBIS, 2026-08-13 → 2026-11-03, bots replayed on 76 of 232 ticker-days,
+base = `76e4ec36`). The gate verdict is BLOCKED (intended), with 0 flips on the frozen probes.
+
+| Bot / setup | Trades | Win % | Net R |
+|---|---|---|---|
+| `bot-gap-fixed` | 9 → 13 | 67% → 54% | +1.71 → +3.14 |
+| `bot-gap-mgd` | 9 → 13 | 56% → 46% | +0.45 → +0.25 |
+| `rev-strong-touch` | 10 → 5 | 10% → 20% | −0.70 → +4.30 |
+| `rev-trend-confirm` | 4 → 2 | 0% → 0% | −4.00 → −2.00 |
+| setups (`sb-am-bias`, `xfade-dbl-bottom`) | unchanged | unchanged | unchanged |
+| **Whole book** | 125 → 126 | 52% → 53% | **+15.45 → +23.68** |
+
+- **Gap bots:** these are 4 new gap days (NBIS 09-08, NBIZ 08-19, 10-14, 10-16). The
+  real-history rule flags both gap bots, because win % fell more than 5 points and
+  `bot-gap-mgd`'s net R fell by 0.20. That is 4 ideas. It is the "more Gap-and-Go days, unproven
+  bot" effect that the 2026-10-22 entry already describes, not evidence that the fix
+  reads the gap wrongly.
+- **Reversals:** since 2026-11-02, the knife guard also covers `strong_support`, and it
+  now reads the real gap-down. It removed 7 reversal entries on gap-down days, and all
+  7 had lost −1R on the base.
+
+**How we'll know it worked:** after merge, the replay of 2026-11-04 shows no AMDL ORB
+trade, and shows ORB entries on SNDQ (10:45) and NBIZ (10:40). Going forward, ORB
+fires only on days whose 09:30 gap is ≥ +2%.

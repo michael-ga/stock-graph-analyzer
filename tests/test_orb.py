@@ -92,3 +92,27 @@ def test_gap_and_go_no_fire_outside_window():
     dec = orb.gap_and_go_signal(orng, df, price=104.6, asof_ts=late)
     assert dec.fired is False and not dec.in_window
     assert "window" in dec.reason.lower()
+
+
+def test_gap_is_measured_from_the_regular_open_not_premarket():
+    """SNDK 2026-10-16 shape: pre-market opened 1380 (−1.1% vs 1394.83), the 09:30
+    open was 1348.82 (−3.3%). The gap must come from 09:30, else a real gap reads
+    as nothing (2026-10-21 snapshot review, L1)."""
+    pre_idx = pd.date_range(f"{_DAY} 04:00", f"{_DAY} 09:25", freq="5min")
+    pre = pd.DataFrame({"open": 1380.0, "high": 1381.0, "low": 1350.0,
+                        "close": 1355.0, "volume": 0.0}, index=pre_idx)
+    reg, _ = _session()                                   # 09:30 open = 103.0
+    reg[["open", "high", "low", "close"]] += 1245.82      # shift to SNDK prices: open 1348.82
+    df = pd.concat([pre, reg])
+    orng = orb.opening_range(df, prev_close=1394.83, asof_ts=pd.Timestamp(f"{_DAY} 11:00"))
+    assert orng.open == 1348.82
+    assert round(orng.gap_pct, 4) == round(1348.82 / 1394.83 - 1, 4)   # ≈ −3.3%, not −1.1%
+
+
+def test_premarket_gap_up_that_opens_flat_is_not_a_gap_up():
+    """+3% in pre-market but a flat 09:30 open is not a Gap-and-Go candidate."""
+    pre = pd.DataFrame({"open": 103.0, "high": 103.2, "low": 102.8, "close": 103.0,
+                        "volume": 0.0}, index=pd.date_range(f"{_DAY} 07:00", periods=6, freq="5min"))
+    reg, _ = _session(day_open=100.2)
+    orng = orb.opening_range(pd.concat([pre, reg]), 100.0, pd.Timestamp(f"{_DAY} 11:00"))
+    assert orng.gap_up is False

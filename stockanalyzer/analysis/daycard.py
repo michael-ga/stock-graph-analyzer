@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from ..data.market_session import is_intraday
+from ..data.market_session import is_intraday, regular_open
 from ..data.schema import Timeframe
 
 
@@ -48,6 +48,7 @@ class DayCard:
     next_support_pct: float | None = None
     n_session_bars: int = 0
     intraday: bool = False                 # whether the session frame is true intraday
+    session_open: float | None = None      # 09:30 regular open — the gap reference
 
 
 # Frames preferred for the intraday session view, shortest first.
@@ -183,7 +184,7 @@ def build_day_card(reports: dict, current_price: float | None = None) -> DayCard
 
     intr = _intraday_frame(reports)
     session_high = session_low = session_range_pct = range_position_pct = None
-    day_change_pct = bull_pct = bear_pct = None
+    day_change_pct = bull_pct = bear_pct = session_open = None
     battle: list[BattleZone] = []
     n_bars = 0
     intraday = False
@@ -202,6 +203,7 @@ def build_day_card(reports: dict, current_price: float | None = None) -> DayCard
             open_px = float(day["open"].iloc[0])
             if open_px > 0:
                 day_change_pct = round((price / open_px - 1) * 100, 2)
+            session_open = regular_open(day)
             bull_pct, bear_pct = _bull_bear(day)
             battle = _battle_zones(day)
             n_bars = len(day)
@@ -228,5 +230,6 @@ def build_day_card(reports: dict, current_price: float | None = None) -> DayCard
         next_support=next_support,
         next_support_pct=(round((next_support / price - 1) * 100, 2) if next_support else None),
         n_session_bars=n_bars,
+        session_open=session_open,
         intraday=intraday,
     )
