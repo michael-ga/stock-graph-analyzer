@@ -90,6 +90,20 @@ class EtfLink(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
+class WorkerStatus(Base):
+    """What a background process is doing right now, for the app to show.
+
+    One row per process (``radar-worker``). The worker's heartbeat file lives in its
+    own container, so the app cannot read it; this row is the shared copy."""
+    __tablename__ = "worker_status"
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    release: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
+    build: Mapped[str] = mapped_column(String(64), default="unknown", nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    phase: Mapped[str | None] = mapped_column(String(16))
+
+
 class ProviderRateLimit(Base):
     __tablename__ = "provider_rate_limits"
     provider: Mapped[str] = mapped_column(String(64), primary_key=True)

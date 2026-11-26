@@ -39,9 +39,10 @@ description: How the app is deployed and operated on the NUC (Docker Compose ser
 
 ## Known constraints
 
-- Containers are **read-only**: anything that writes outside `/tmp` fails in
-  production. `replay_page.py` writes practice books to `/app/.replay` → broken on
-  the NUC until the directory is configurable (tmpfs or a volume). Fix this first.
+- Containers are **read-only**: anything that writes outside a `tmpfs` mount fails in
+  production. The app container mounts `/tmp`, `~/.streamlit` and `/app/.replay`
+  (replay practice books and the scan cache; in memory, so they are lost on a
+  restart). A new writable path needs its own `tmpfs` entry in `compose.yaml`.
 - The app port is hard-coded `8501` in `compose.yaml`, `Dockerfile` (EXPOSE,
   HEALTHCHECK, env), `docker/entrypoint.sh` and `healthcheck.sh` — step 3 must
   parametrize all of them together.

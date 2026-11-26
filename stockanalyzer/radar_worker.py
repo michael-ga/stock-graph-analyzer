@@ -20,7 +20,8 @@ from typing import Callable, Iterator, Protocol
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
-from stockanalyzer import session as market_session, setup_bots, swingwatch, virtualbook
+from stockanalyzer import (session as market_session, setup_bots, swingwatch,
+                           virtualbook, workerstatus)
 from stockanalyzer.setups import orb, reversal
 from stockanalyzer.analysis.daycard import _intraday_frame, build_day_card
 from stockanalyzer.data.schema import Timeframe
@@ -85,6 +86,15 @@ def write_heartbeat(path: Path, *, now: float | None = None) -> None:
     temporary.replace(path)
 
 
+def write_heartbeat_and_status(path: Path) -> None:
+    """The container heartbeat file, plus the shared status row the app displays.
+
+    The file is written first and the database write runs on its own thread, so a slow
+    or hung database can never delay the file the container health check reads."""
+    write_heartbeat(path)
+    workerstatus.beat_in_background()
+
+
 def heartbeat_is_healthy(
     path: Path, *, now: float | None = None, max_age: float = 120.0
 ) -> bool:
@@ -102,7 +112,7 @@ def heartbeat_writer(
     stop: threading.Event,
     *,
     interval: float = 60.0,
-    write: Callable[[Path], None] = write_heartbeat,
+    write: Callable[[Path], None] = write_heartbeat_and_status,
 ) -> Iterator[threading.Thread]:
     """Write heartbeats until the worker's lifecycle stop event is set."""
     def run() -> None:
