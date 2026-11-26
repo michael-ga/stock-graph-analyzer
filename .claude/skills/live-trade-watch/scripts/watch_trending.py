@@ -13,7 +13,7 @@ Early and late in the day it overstates (volume is U-shaped), so treat it as a r
   python watch_trending.py [--every 120] [--min-chg 5] [--min-rv 2] [--burst 2]
 Data: Yahoo screeners (yfinance.screen) and 5-min bars. Read-only; places no orders.
 """
-import argparse, time, sys, os, collections, datetime as dt, warnings
+import argparse, time, sys, os, collections, warnings
 import yfinance as yf
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(__file__))

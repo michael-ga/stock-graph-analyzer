@@ -31,6 +31,8 @@ from .base import SetupContext, SetupDecision
 
 SPREAD_PER_SHARE = 0.02     # round trip, the flat cost the book charges (store/manage)
 MIN_SESSION_BARS = 60       # of 78; fewer = half-day or an illiquid tape, skipped
+HISTORY_SESSIONS = 14       # prior sessions handed to setups as ``ctx.history``
+MARKET = "QQQ"              # the market proxy handed to setups as ``ctx.market``
 _PRE_START = "04:00"
 
 
@@ -46,21 +48,69 @@ def load(ticker: str, provider=None) -> dict:
     return {"i5": i5, "daily": daily, "days": asof.trading_days(i5)}
 
 
+def fund_sign(ticker: str) -> int:
+    """-1 for an inverse ETF, from its yfinance fund name; 1 otherwise or offline."""
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info or {}
+        return inverse_sign([info.get("longName"), info.get("shortName")])
+    except Exception:
+        return 1
+
+
 def _regular(bars: pd.DataFrame) -> pd.DataFrame:
     return bars.between_time(asof.REG_START, asof.REG_END, inclusive="left")
 
 
+def history_before(i5: pd.DataFrame, days: list, i: int,
+                   n: int = HISTORY_SESSIONS) -> pd.DataFrame | None:
+    """Regular bars of the ``n`` sessions before ``days[i]`` (``ctx.history``)."""
+    prior = days[max(0, i - n):i]
+    if not prior:
+        return None
+    reg = _regular(i5)
+    return reg[asof.naive_dates(reg.index).isin(prior)]
+
+
+def market_day(market_i5: pd.DataFrame | None, day) -> pd.DataFrame | None:
+    """The market proxy's regular bars on ``day`` (sliced as-of by the caller)."""
+    if market_i5 is None or not len(market_i5):
+        return None
+    m = _regular(asof.day_bars(market_i5, day))
+    return m if len(m) else None
+
+
+def inverse_sign(names) -> int:
+    """-1 when a fund name says the ETF is inverse ("Short", "Inverse", "Bear")."""
+    words = {"short", "inverse", "bear"}
+    return -1 if any(words & set(str(n or "").lower().replace("-", " ").split())
+                     for n in (names or [])) else 1
+
+
 def judge(dec: SetupDecision, sess: pd.DataFrame, j: int,
           spread: float = SPREAD_PER_SHARE) -> dict:
-    """Outcome of a decision that fired on bar ``j`` of ``sess``, in R."""
+    """Outcome of a decision that fired on bar ``j`` of ``sess``, in R, and the clock
+    of the bar it exits on (``exit_t``; None while still open)."""
     if dec.filled_intrabar and float(sess["low"].iloc[j]) <= dec.stop:
         status, r = "stop", -1.0                # resting order filled, same bar stopped
+        exit_t = sess.index[j].strftime("%H:%M")
     else:
-        status, r = replay.judge_intraday(sess.iloc[j + 1:], dec.entry, dec.stop,
-                                          dec.target, dec.rr)
+        rest = sess.iloc[j + 1:]
+        status, r = replay.judge_intraday(rest, dec.entry, dec.stop, dec.target, dec.rr)
+        exit_t = _exit_time(rest, dec.stop, dec.target)
     cost = spread / (dec.entry - dec.stop)
     return {"status": status, "gross_r": float(r), "net_r": float(r) - cost,
-            "risk_pct": (dec.entry - dec.stop) / dec.entry * 100}
+            "risk_pct": (dec.entry - dec.stop) / dec.entry * 100, "exit_t": exit_t}
+
+
+def _exit_time(rest: pd.DataFrame, stop: float, target: float) -> str | None:
+    """Clock of the bar ``replay.judge_intraday`` exits on: the first bar that touches
+    the stop or the target, else the last bar (flat at the close)."""
+    if not len(rest):
+        return None
+    hit = ((rest["low"] <= stop) | (rest["high"] >= target)).to_numpy()
+    k = int(hit.argmax()) if hit.any() else len(rest) - 1
+    return rest.index[k].strftime("%H:%M")
 
 
 def run_day(hist: dict, i: int, variants: list[tuple], spread: float = SPREAD_PER_SHARE,
@@ -76,13 +126,20 @@ def run_day(hist: dict, i: int, variants: list[tuple], spread: float = SPREAD_PE
     prev = _regular(asof.day_bars(i5, days[i - 1])) if i > 0 else None
     daily = hist["daily"][asof.naive_dates(hist["daily"].index) < day]
     prev_close = float(daily["close"].iloc[-1]) if len(daily) else None
+    history = history_before(i5, days, i)
+    mkt = market_day(hist.get("market_i5"), day)
+    sign = int(hist.get("market_sign", 1))
 
     pending = list(variants)
     trades = []
     for j in range(len(sess)):
         if not pending:
             break
-        ctx = SetupContext(sess.iloc[:j + 1], prev, pre, prev_close, daily)
+        now = sess.index[j]
+        ctx = SetupContext(sess.iloc[:j + 1], prev, pre, prev_close, daily,
+                           history=history,
+                           market=None if mkt is None else mkt[mkt.index <= now],
+                           market_sign=sign)
         for mod, cfg in list(pending):
             dec = mod.signal(ctx, cfg)
             if dec.fired:
@@ -186,10 +243,16 @@ def main(argv=None) -> None:
 
     mods = [SETUPS[s] for s in (a.setup or sorted(SETUPS))]
     variants = [(m, cfg) for m in mods for cfg in m.VARIANTS]
+    try:
+        market_i5 = replay.yf_intraday(MARKET, "5m", replay.INTRADAY_PERIOD)
+    except Exception as exc:
+        print(f"{MARKET}: load failed ({exc}); setups that need the market stand aside")
+        market_i5 = None
     histories = {}
     for tk in (t.upper() for t in a.tickers):
         try:
             hist = load(tk)
+            hist["market_i5"], hist["market_sign"] = market_i5, fund_sign(tk)
         except Exception as exc:
             print(f"{tk}: load failed ({exc})")
             continue

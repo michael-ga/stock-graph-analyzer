@@ -219,4 +219,5 @@ def test_managed_vs_fixed_repository_and_algorithm_correctness(db):
     assert comparison["pairs"][0]["delta_pct"] == 5.0
     correctness = repo.algorithm_correctness(owner.id)
     assert correctness["totals"]["n_trades"] == 1
-    assert correctness["ideas"][0]["traders"] == ["bot-gap-fixed"]
+    assert correctness["ideas"][0]["traders"] == ["bot-gap-fixed"]   # fixed exit wins
+    assert correctness["ideas"][0]["managed_exit"] is False

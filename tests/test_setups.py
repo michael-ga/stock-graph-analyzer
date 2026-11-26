@@ -190,3 +190,60 @@ def test_signal_is_a_pure_function_of_the_context():
     a = double_bottom.signal(ctx, double_bottom.VARIANTS[0])
     b = double_bottom.signal(ctx, double_bottom.VARIANTS[0])
     assert a == b and a.fired and a.filled_intrabar
+
+
+def test_judge_reports_the_exit_bar_clock():
+    s = _flat(DAY, 100.0)
+    dec = SetupDecision(True, "", "x", "x", entry=100.0, stop=99.0, target=101.0, rr=1.0)
+    s.iloc[8, 1] = 101.5                             # bar 8's high takes the target
+    out = harness.judge(dec, s, 5, spread=0.0)
+    assert out["status"] == "target" and out["exit_t"] == s.index[8].strftime("%H:%M")
+    flat = harness.judge(dec, _flat(DAY, 100.0), 5, spread=0.0)
+    assert flat["status"] == "eod" and flat["exit_t"] == s.index[-1].strftime("%H:%M")
+    s.iloc[5, 2] = 98.0
+    stopped = harness.judge(SetupDecision(True, "", "x", "x", entry=99.5, stop=99.0,
+                                          target=100.5, rr=2.0, filled_intrabar=True), s, 5)
+    assert stopped["exit_t"] == s.index[5].strftime("%H:%M")
+
+
+# --- 2026-11-10 variants: xfade-chop, sb-mkt ---------------------------- #
+from stockanalyzer.setups.base import market_agrees  # noqa: E402
+
+
+def test_xfade_chop_needs_a_quiet_adx():
+    chop = next(c for c in double_bottom.VARIANTS if c.name == "xfade-chop")
+    s = _db_session()
+    plain = double_bottom.signal(SetupContext(s.iloc[:25], _prev_session(), None, None, None),
+                                 double_bottom.VARIANTS[0])
+    filtered = double_bottom.signal(SetupContext(s.iloc[:25], _prev_session(), None, None,
+                                                 None), chop)
+    a = double_bottom.prior_bar_adx(SetupContext(s.iloc[:25], _prev_session(), None, None, None))
+    assert plain.fired
+    assert filtered.fired == (a is not None and a < 20)
+    no_prev = double_bottom.signal(SetupContext(s.iloc[:25], None, None, None, None), chop)
+    assert not no_prev.fired                       # too few bars for ADX → stand aside
+
+
+def test_market_agrees_respects_the_inverse_sign():
+    s = _flat(DAY, 100.0)
+    up = _flat(DAY, 400.0)
+    up.iloc[5:, 3] = 402.0
+    assert market_agrees(SetupContext(s.iloc[:10], None, None, None, None, market=up)) is True
+    assert market_agrees(SetupContext(s.iloc[:10], None, None, None, None, market=up,
+                                      market_sign=-1)) is False
+    assert market_agrees(SetupContext(s.iloc[:10], None, None, None, None)) is None
+
+
+def test_sb_mkt_is_sb_am_bias_plus_the_market():
+    mk = next(c for c in silver_bullet.VARIANTS if c.name == "sb-mkt")
+    s = _sb_session()
+    qqq = _flat(DAY, 400.0)
+    qqq.iloc[6:, 3] = 402.0
+    hist = _hist(s)
+    base = harness.run_day(hist, 1, [(silver_bullet, silver_bullet.VARIANTS[0])])
+    assert harness.run_day(hist, 1, [(silver_bullet, mk)]) == []          # no QQQ: no trade
+    hist["market_i5"] = qqq
+    [t] = harness.run_day(hist, 1, [(silver_bullet, mk)])
+    assert (t["t"], t["entry"]) == (base[0]["t"], base[0]["entry"])
+    hist["market_sign"] = -1
+    assert harness.run_day(hist, 1, [(silver_bullet, mk)]) == []

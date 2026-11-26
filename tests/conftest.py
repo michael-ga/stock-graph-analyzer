@@ -21,6 +21,14 @@ def _no_etf_name_lookup(monkeypatch):
     etf_links._attempted.clear()
 
 
+@pytest.fixture(autouse=True)
+def _no_setup_bot_network(monkeypatch):
+    """The live setup bots read QQQ and fund names from the network; tests never do."""
+    from stockanalyzer import setup_bots
+    monkeypatch.setattr(setup_bots, "market_frame", lambda *a, **k: None)
+    monkeypatch.setattr(setup_bots, "market_sign", lambda ticker: 1)
+
+
 @pytest.fixture()
 def book_db(tmp_path):
     engine = configure_engine(f"sqlite:///{tmp_path / 'book.db'}")

@@ -466,7 +466,7 @@ def _bot_panel(bar, live: bool = False) -> None:
                 for name, w in bar.lost[:6]:
                     st.markdown(f"−{w} &nbsp; {name}", unsafe_allow_html=True)
 
-    if bar.bots.setups and not live:     # replay only: no live bot trades a setup
+    if bar.bots.setups and not live:     # live_bar computes no setup reads (setup_bots does)
         fired_set = bar.bots.fired_setups
         with st.container(border=True):
             head, tog = st.columns([4, 1])

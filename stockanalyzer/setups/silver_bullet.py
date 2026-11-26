@@ -18,6 +18,10 @@ Rules (pre-registered 2026-10-25, screen in ``algolab/LEARNINGS.md``):
   high when the gap formed, today's pre-market high, yesterday's high, or
   yesterday's 13:30–16:00 high. No such level, no trade.
 
+Variant ``sb-mkt`` (pre-registered 2026-11-10, H16): the same trade, taken only
+when QQQ is on the trade's side of its 09:30 open at the fill bar (above it; below
+it for an inverse ETF). No QQQ bars = no trade. Judged on new sessions only.
+
 Not modelled from the source: SMT divergence between NQ/ES/YM (meaningless for a
 single-stock ETF), the 09:45 news pause (no calendar feed), and the "two visits
 cancel the order" rule.
@@ -27,7 +31,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .base import (MIN_RR, STOP_BUFFER, SetupContext, SetupDecision, daily_bias_up,
-                   fire, hhmm, no)
+                   fire, hhmm, market_agrees, no)
 
 NAME = "silver_bullet"
 
@@ -38,9 +42,13 @@ class SilverBulletConfig:
     window_start: str = "09:30"    # first bar label that may complete the gap
     window_end: str = "10:25"      # last bar label (it closes 10:30) to form or fill
     need_bias: bool = True
+    need_market: bool = False     # QQQ on the trade's side of its open at the fill
 
 
-VARIANTS: list[SilverBulletConfig] = [SilverBulletConfig("sb-am-bias")]
+VARIANTS: list[SilverBulletConfig] = [
+    SilverBulletConfig("sb-am-bias"),
+    SilverBulletConfig("sb-mkt", need_market=True),
+]
 
 
 def first_discount_fvg(o, h, l, c, t, cfg: SilverBulletConfig, upto: int):
@@ -91,6 +99,8 @@ def signal(ctx: SetupContext, cfg: SilverBulletConfig) -> SetupDecision:
     above = sorted(x for x in liquidity if x - ce >= MIN_RR * risk - 1e-9)
     if not above:
         return no(cfg, NAME, "no buy-side liquidity ≥ 1R above the CE")
+    if cfg.need_market and not market_agrees(ctx):
+        return no(cfg, NAME, "QQQ is not on this trade's side of its open (or no QQQ data)")
     return fire(cfg, NAME, f"filled the FVG CE ${ce:.2f} (gap at {t[k]}), "
                 f"aim at liquidity ${above[0]:.2f}",
                 float(ce), float(stop), float(above[0]), filled_intrabar=True)

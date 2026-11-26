@@ -88,12 +88,17 @@ def test_gap_pair_shares_cohort_and_ab(owner):
                                                 - (49.0 / 50 - 1) * 100, 2)
 
 
-def test_algorithm_correctness_excludes_managed(owner):
+def test_a_managed_only_idea_counts_on_its_managed_trade(owner):
+    """Since bot-gap-fixed retired, a Gap-and-Go idea has only its managed trade; it
+    still counts, flagged managed_exit, instead of vanishing from the view."""
     m = vb.open_position(ticker="EEE", trader="bot-gap-mgd", entry=50.0, stop=49.0,
                          target=52.0, snapshot=_GAP, managed=True, init_stop=49.0,
                          now=1_000_000.0, user_id=owner)
     vb.close_position(m["id"], 52.0, now=1_000_100.0, user_id=owner)
-    assert vb.algorithm_correctness(user_id=owner)["totals"]["n_ideas"] == 0      # managed excluded
+    ac = vb.algorithm_correctness(user_id=owner)
+    assert ac["totals"]["n_ideas"] == 1 and ac["totals"]["wins"] == 1
+    [idea] = ac["ideas"]
+    assert idea["traders"] == ["bot-gap-mgd"] and idea["managed_exit"] is True
 
 
 def test_mark_trades_baseline_unchanged(owner):

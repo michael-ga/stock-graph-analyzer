@@ -145,9 +145,9 @@ def test_metric_regressions_respect_each_metrics_direction():
 
 def test_probe_reads_the_live_swing_bot_rules_from_app_py():
     bots = dict(probe._live_bots(ROOT))
-    assert set(bots) == {"bot-GO", "bot-70", "bot-BRK"}
+    assert set(bots) == {"bot-GO", "bot-70"}          # bot-BRK retired 2026-11-26
     plan = SimpleNamespace(go=False, score=72, kind="immediate", actionable=True, emerging=None)
-    assert bots["bot-70"](plan) and not bots["bot-GO"](plan) and not bots["bot-BRK"](plan)
+    assert bots["bot-70"](plan) and not bots["bot-GO"](plan)
 
 
 def test_rule_table_covers_every_state_and_shows_each_threshold():
@@ -157,7 +157,7 @@ def test_rule_table_covers_every_state_and_shows_each_threshold():
     assert table["immediate|go=False|actionable=True|extended=False"]["by_score"] == [
         "0-69:-", "70-100:bot-70"]
     assert table["breakout_wait|go=False|actionable=True|extended=False"]["by_score"] == [
-        "0-54:-", "55-100:bot-BRK"]
+        "0-100:-"]                                     # no bot arms a breakout_wait now
     # The watch-only chokepoint: nothing fires on a non-actionable or extended plan.
     assert table["immediate|go=True|actionable=False|extended=False"]["by_score"] == ["0-100:-"]
     assert table["immediate|go=True|actionable=True|extended=True"]["by_score"] == ["0-100:-"]

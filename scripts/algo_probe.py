@@ -90,8 +90,7 @@ def _live_bots(root: Path) -> list:
     except Exception:
         return [("bot-GO", lambda p: p.go),
                 ("bot-70", lambda p: p.score >= 70 and p.kind == "immediate" and not p.go
-                 and getattr(p, "actionable", True) and not _extended(p)),
-                ("bot-BRK", lambda p: p.kind == "breakout_wait" and p.score >= 55)]
+                 and getattr(p, "actionable", True) and not _extended(p))]
 
 
 def _armed(plan) -> list[str]:

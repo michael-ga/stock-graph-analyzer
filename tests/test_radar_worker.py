@@ -102,6 +102,11 @@ def test_process_analysis_scopes_all_persistence_to_radar_owner(monkeypatch):
             calls.append(("reversal", user_id, ticker)) or [],
     )
     monkeypatch.setattr(
+        worker, "run_setup_bots",
+        lambda user_id, ticker, _result, _asof:
+            calls.append(("setups", user_id, ticker)) or [],
+    )
+    monkeypatch.setattr(
         worker.virtualbook, "manage",
         lambda ticker, price, reports, trend_change, *, user_id:
             calls.append(("manage", user_id, ticker, price)) or [],
@@ -119,7 +124,7 @@ def test_process_analysis_scopes_all_persistence_to_radar_owner(monkeypatch):
     assert report.notice_level == 70
     assert all(call[1] == owner for call in calls)
     assert {call[0] for call in calls} == {
-        "claim", "paper", "bots", "reversal", "manage", "mark"
+        "claim", "paper", "bots", "reversal", "setups", "manage", "mark"
     }
 
 

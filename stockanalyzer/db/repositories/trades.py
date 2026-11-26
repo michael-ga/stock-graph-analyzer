@@ -376,19 +376,24 @@ class TradeRepository:
         }
 
     def algorithm_correctness(self, user_id: str) -> dict:
-        closed = [p for p in self.closed_trades(user_id) if not p.get("managed")]
+        # An idea is judged on its fixed-exit trades: a managed exit measures exit
+        # management, not the call. A cohort with no fixed-exit trade at all (since
+        # 2026-11-26, every Gap-and-Go idea: bot-gap-mgd trades it alone) is judged on
+        # its managed trades instead, flagged ``managed_exit``, so it stays in view.
         cohorts: dict[str, list[dict]] = defaultdict(list)
-        for trade in closed:
+        for trade in self.closed_trades(user_id):
             cohorts[trade.get("cohort_id") or trade["id"]].append(trade)
         ideas = []
-        for cohort_id, trades in cohorts.items():
+        for cohort_id, every in cohorts.items():
+            trades = [t for t in every if not t.get("managed")] or every
+            managed_exit = all(t.get("managed") for t in trades)
             pnls = [t["pnl_pct"] for t in trades]; snapshot = trades[0].get("snapshot") or {}
             mean = round(sum(pnls) / len(pnls), 2)
             ideas.append({"cohort_id": cohort_id, "ticker": trades[0]["ticker"],
                           "setup": snapshot.get("setup") or "?", "score": snapshot.get("score"),
                           "band": _band(snapshot.get("score")), "n_trades": len(trades),
                           "traders": sorted({t["trader"] for t in trades}),
-                          "idea_pnl_pct": mean, "win": mean > 0,
+                          "managed_exit": managed_exit, "idea_pnl_pct": mean, "win": mean > 0,
                           "best_pnl_pct": max(pnls), "worst_pnl_pct": min(pnls)})
         def aggregate(items):
             n = len(items); wins = sum(i["win"] for i in items)

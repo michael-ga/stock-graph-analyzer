@@ -14,12 +14,20 @@ Rules (pre-registered 2026-10-25, screen in ``algolab/LEARNINGS.md``):
   gapped over). A new low under both bottoms first voids it.
 - Stop: 0.1% under the lower bottom. Target: 1R (a quick fade, not a reversal
   of the trend). One trade per day.
+
+Variant ``xfade-chop`` (pre-registered 2026-11-10, H15): the same trade, taken only
+when the 5-minute ADX(14) is below ``max_adx`` on the bar before the entry bar
+(previous session + today's regular bars). A fade belongs in a range, not a trend
+(Murphy ch. 15). The filter came from a split of the data it would be judged on,
+so it is judged on new sessions only.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import numpy as np
+
+import pandas as pd
 
 from .base import STOP_BUFFER, SetupContext, SetupDecision, fire, hhmm, no
 
@@ -38,9 +46,28 @@ class DoubleBottomConfig:
     max_p2_bars: int = 18
     max_entry_bars: int = 12
     target_r: float = 1.0
+    max_adx: float | None = None    # range filter: 5-min ADX(14) below this, or no trade
 
 
-VARIANTS: list[DoubleBottomConfig] = [DoubleBottomConfig("xfade-dbl-bottom")]
+VARIANTS: list[DoubleBottomConfig] = [
+    DoubleBottomConfig("xfade-dbl-bottom"),
+    DoubleBottomConfig("xfade-chop", max_adx=20.0),
+]
+
+
+def prior_bar_adx(ctx: SetupContext, length: int = 14) -> float | None:
+    """5-minute ADX(14) on the bar before the as-of bar: the previous session's bars
+    plus today's, so the reading is warm by the open. None if it can't be computed."""
+    from ..analysis.indicators import adx
+    parts = [p for p in (ctx.prev_session, ctx.session.iloc[:-1]) if p is not None and len(p)]
+    if not parts:
+        return None
+    bars = pd.concat(parts)
+    if len(bars) < 3 * length:
+        return None
+    v = adx(bars["high"].astype(float), bars["low"].astype(float),
+            bars["close"].astype(float), length)["adx"].iloc[-1]
+    return float(v) if np.isfinite(v) else None
 
 
 def find_entry(o, h, l, t, cfg: DoubleBottomConfig):
@@ -88,6 +115,11 @@ def signal(ctx: SetupContext, cfg: DoubleBottomConfig) -> SetupDecision:
     if hit is None or hit[0] != len(s) - 1:
         return no(cfg, NAME, "no extension double bottom breaking its neckline now")
     _, entry, stop, p1, p2 = hit
+    if cfg.max_adx is not None:
+        a = prior_bar_adx(ctx)
+        if a is None or a >= cfg.max_adx:
+            return no(cfg, NAME, "5-min ADX " + ("n/a" if a is None else f"{a:.0f}")
+                      + f" — not a range (need < {cfg.max_adx:g})")
     return fire(cfg, NAME, f"double bottom {t[p1]}/{t[p2]} broke its neckline",
                 float(entry), float(stop), float(entry + cfg.target_r * (entry - stop)),
                 filled_intrabar=True)

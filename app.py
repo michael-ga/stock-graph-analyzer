@@ -30,7 +30,8 @@ import streamlit as st
 
 import replay_page
 import ui_common
-from stockanalyzer import papertrade, replay, session, swingwatch, virtualbook, watchlist
+from stockanalyzer import (papertrade, replay, session, setup_bots, swingwatch,
+                           virtualbook, watchlist)
 from stockanalyzer.auth import AuthError, AuthService, dev_login_username
 from stockanalyzer.user_management import UserManagementService
 from stockanalyzer.config import ConfigurationError, Settings
@@ -805,9 +806,10 @@ def _opening_range(tk: str, res) -> dict | None:
 
 
 def _run_gap_bots(tk: str, reports, orange: dict | None, price: float | None) -> None:
-    """Open the Gap-and-Go pair when the ORB rules line up: a real gap-up, inside
-    the 9:45–11:30 window, price breaking the opening-range HIGH on >1.5× volume.
-    Hard stop sits just below the opening-range LOW (Carter's ORB rule)."""
+    """Open the Gap-and-Go bot (``bot-gap-mgd``, managed exit) when the ORB rules
+    line up: a real gap-up, inside the 9:45–11:30 window, price breaking the
+    opening-range HIGH on >1.5× volume. Hard stop sits just below the opening-range
+    LOW (Carter's ORB rule). Its fixed-exit twin ``bot-gap-fixed`` retired 2026-11-26."""
     if not (orange and orange.get("gap_up") and price and reports):
         return
     df = _intraday_frame(reports)
@@ -817,7 +819,7 @@ def _run_gap_bots(tk: str, reports, orange: dict | None, price: float | None) ->
         return
     entry, init_stop, target, rvol = dec.entry, dec.stop, dec.target, dec.rvol
     snap = _gap_snapshot(orange, rvol, entry, init_stop, target)
-    for trader, managed in (("bot-gap-fixed", False), ("bot-gap-mgd", True)):
+    for trader, managed in (("bot-gap-mgd", True),):
         try:
             if not virtualbook.has_open(
                     tk, trader, user_id=st.session_state.auth_user_id):
@@ -840,7 +842,7 @@ _BOTS = (
     # with-trend momentum name, NOT an extended blowoff it should never chase.
     ("bot-70",  lambda p: p.score >= 70 and p.kind == "immediate" and not p.go
                 and p.actionable and not _is_extended(p), False),
-    ("bot-BRK", lambda p: p.kind == "breakout_wait" and p.score >= 55, True),
+    # bot-BRK (breakout_wait, score ≥ 55, armed pending order) retired 2026-11-26.
 )
 
 
@@ -918,6 +920,43 @@ def _run_reversal_bots(tk: str, res, price: float | None, phase=None) -> None:
                 except Exception:
                     pass
     st.session_state.setdefault("radar_reversals", {})[tk] = fired
+
+
+def _run_setup_bots(tk: str, res, phase=None) -> None:
+    """The setups/ bots (Silver Bullet, Double Bottom): each variant is its own bot,
+    deciding on completed 5-minute bars (``stockanalyzer.setup_bots``, the same code
+    the radar worker runs). Shares the ORB freeze: no entries in the first 15 min."""
+    if phase == "opening_range" or res is None or not getattr(res, "reports", None):
+        return
+    reports = res.reports
+    d1, y1 = reports.get(Timeframe.D1), reports.get(Timeframe.Y1)
+    if d1 is None or d1.df is None or not len(d1.df):
+        return
+    prev_close = res.quote.prev_close if (res.quote and res.quote.prev_close) else None
+    try:
+        ctx = setup_bots.live_context(
+            d1.df, y1.df if y1 is not None else None,
+            prev_close, session.now_et(), market=setup_bots.market_frame(),
+            market_sign=setup_bots.market_sign(tk))
+    except Exception:
+        return
+    uid = st.session_state.auth_user_id
+    for dec in setup_bots.decisions(ctx):
+        if not dec.fired:
+            continue
+        try:
+            if virtualbook.has_open(tk, dec.variant, user_id=uid):
+                continue
+            row = virtualbook.open_position(
+                ticker=tk, trader=dec.variant, entry=dec.entry, stop=dec.stop,
+                target=dec.target, kind="immediate", horizon_days=1,
+                snapshot=setup_bots.snapshot(dec), user_id=uid)
+            if row and setup_bots.stopped_on_fill(dec, ctx):
+                virtualbook.close_position(row["id"], dec.stop, "stop_hit", user_id=uid)
+            st.toast(f"🎯 {dec.variant} opened {dec.setup} {tk} @ ${dec.entry:.2f} "
+                     f"(stop ${dec.stop:.2f}, tgt ${dec.target:.2f})", icon="🎯")
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1155,6 +1194,7 @@ def _radar_body(tracked: list[str]) -> None:
                 _run_bots(tk, plan, reports=reports, orange=orange,
                           price=px, phase=phase)
                 _run_reversal_bots(tk, res, px, phase)
+                _run_setup_bots(tk, res, phase)
                 if px:
                     dec = _radar_decision_rep(res) if res is not None else None
                     tc = getattr(dec, "trend_change", None)
@@ -1338,7 +1378,7 @@ def _portfolio_panel() -> None:
                          expanded=False):
             st.info("No virtual positions yet. On any actionable plan press "
                     "**📒 Virtual BUY** to open a $1,000 paper position (stop + target "
-                    "attached). Bots **bot-GO / bot-70 / bot-BRK** also trade automatically "
+                    "attached). Bots **bot-GO / bot-70** also trade automatically "
                     "as the radar scans, so the report card fills up on its own.")
         return
 
@@ -1478,7 +1518,7 @@ def _portfolio_panel() -> None:
                                  use_container_width=True)
 
                 # Algorithm correctness — the deduped view. The book copies one
-                # idea across bot-GO/bot-70/bot-BRK/me, which inflates the sample;
+                # idea across bot-GO/bot-70/me, which inflates the sample;
                 # this collapses each plan to a single idea so the numbers judge
                 # the engine's CALLS, not how many bots echoed them.
                 try:

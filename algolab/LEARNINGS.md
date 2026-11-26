@@ -95,8 +95,11 @@ again without materially more data:**
 | H3 | **"Support test (uptrend)" is the real edge; with-trend > counter-trend.** | Support-test 6/6; Breakout(volume) 6/8; counter-trend Pullback/Momentum poor. | Watch only (n too small). | Track idea-level win-rate per setup over time. |
 | H4 | **The throwback/breakout model doesn't beat immediate entries.** | breakout_wait 9/15 (60%) vs immediate 8/13 (62%), but immediate captured ~2× profit/trade. | Watch only. | Compare idea-level avg_pnl breakout_wait vs immediate at larger n. |
 | H5 | **Active exit management beats a fixed stop/target** on identical Gap-and-Go entries. | None yet — instrumentation shipped 2026-06-21. | **Collecting.** Do NOT conclude until pairs accumulate. | `store.managed_vs_fixed()`: pair `bot-gap-mgd` vs `bot-gap-fixed` by `cohort_id`; positive mean Δ at n≥~30 pairs = management earns its place. |
-| H8 | **Extension-fade double bottom (`xfade-dbl-bottom`) has a small edge on 2x single-stock ETFs** — and it pays on whichever leg of the pair is trending up. | 2026-10-25: 60 sessions, 82 trades / 48 dates, +0.19R net, positive in both windows and both halves, beats a random-entry null (p=0.005). Cluster t vs zero 1.7: not significant. Leg split is post-hoc. | **Collecting** (backtest only, not a bot). | Re-run the harness on *new* sessions only. Keep if avg net R > 0 at ≥ 100 distinct dates and still > 0 without the best date; kill if ≤ 0 there. A daily-bias filter is a new variant, pre-registered before it's run. |
-| H9 | **ICT Silver Bullet, long mirror (`sb-am-bias`)** has an edge. | 2026-10-25: 12 trades in 60 sessions, +0.78R net, null p=0.045. n is an anecdote. | **Collecting** (backtest only). | Same keep/kill rule as H8 at ≥ 50 distinct dates. To accrue faster, add tickers, chosen before running. |
+| H8 | **Extension-fade double bottom (`xfade-dbl-bottom`) has a small edge on 2x single-stock ETFs** — and it pays on whichever leg of the pair is trending up. | 2026-10-25: 60 sessions, 82 trades / 48 dates, +0.19R net, positive in both windows and both halves, beats a random-entry null (p=0.005). Cluster t vs zero 1.7: not significant. Leg split is post-hoc. | **Collecting**: live bot `xfade-dbl-bottom` since 2026-11-25 (collects data; has not passed the rule). | Re-run the harness on *new* sessions only. Keep if avg net R > 0 at ≥ 100 distinct dates and still > 0 without the best date; kill if ≤ 0 there. A daily-bias filter is a new variant, pre-registered before it's run. |
+| H9 | **ICT Silver Bullet, long mirror (`sb-am-bias`)** has an edge. | 2026-10-25: 12 trades in 60 sessions, +0.78R net, null p=0.045. n is an anecdote. | **Collecting**: live bot `sb-am-bias` since 2026-11-25 (collects data; has not passed the rule). | Same keep/kill rule as H8 at ≥ 50 distinct dates. To accrue faster, add tickers, chosen before running. |
+| H15 | **The double bottom earns only in a range** (5-min ADX(14) < 20). | 2026-11-10, in-sample split: ADX < 20 +0.22 R (73 trades / 42 dates, both halves > 0); 20–30 −0.01 R; ≥ 30 −0.02 R. | **Collecting**: variant `xfade-chop`, live bot since 2026-11-25. | Sessions after 2026-10-30 only: > 0 at ≥ 100 dates and without the best date (H8's rule). |
+| H16 | **Momentum entries need the market on their side**: Silver Bullet when QQQ is on the trade's side of its open. | 2026-11-10, in-sample split on the median of 8 peers: `sb-am-bias` +0.87 R (21) vs +0.18 R (26); `bot-gap-fixed` +0.14 vs −0.09. QQQ replaces the peer median in the variant (spec set before the first run). | **Collecting**: variant `sb-mkt`, live bot since 2026-11-25. | Sessions after 2026-10-30: > 0 at ≥ 50 dates (H9's rule). |
+| H18 | **Reversal stops sit inside the noise; a volatility stop plus a morning-only window turns the family**. | 2026-11-10, in-sample: median stop 0.6 of a 5-min bar range; entries before 11:00 +23.4 R (18) vs −7.3 R after (19) for `rev-strong-touch`. | **Collecting**: `rev-trend-vol`, `rev-strong-vol` in `REVERSAL_VARIANTS`, live bots since 2026-11-25. | Sessions after 2026-10-30: > 0 net of cost at ≥ 30 dates each. Kill a twin that is ≤ 0 there; its original (`rev-trend-confirm` / `rev-strong-touch`) is the control. Distinct from the fixed 0.5% / 1.0% stops in Ruled out. |
 
 (H7 is reserved for the `rev-gapfill` proposal in `docs/plans/2026-10-21-sndk-snapshot-review.md`.)
 
@@ -606,3 +609,46 @@ Test on new sessions before any ticker filter.
 (refetch with `--refresh`); keep the two variants if their net R stays > 0 over ≥ 30
 distinct dates each; drop a variant if it is ≤ 0 there.
 
+
+### 2026-11-26 — setup variants and vol-stop reversals trade live; bot-BRK and bot-gap-fixed retired (ALGORITHM CHANGE)
+
+**What changed (code):**
+1. **Six new live bots, to collect data** (owner's decision): `sb-am-bias`, `sb-mkt`,
+   `xfade-dbl-bottom`, `xfade-chop` (`stockanalyzer/setup_bots.py`, listed in
+   `LIVE_VARIANTS`; a setup added to `SETUPS` later stays backtest-only until listed
+   there) and `rev-trend-vol`, `rev-strong-vol` (moved from `REVERSAL_CANDIDATES` into
+   `REVERSAL_VARIANTS`). Both the radar worker and the in-app radar run them.
+   The setup bots decide on **completed** 5-minute bars only, from the same context
+   the harness and the replay build (session so far, previous session, pre-market,
+   daily bars before today, QQQ for `sb-mkt`); a resting-order fill whose bar also
+   hit the stop is closed at the stop at once (stop-first, as the harness judges it).
+2. **Retired:** `bot-BRK` (swing, breakout_wait at score ≥ 55) and `bot-gap-fixed`
+   (the fixed-exit Gap-and-Go twin). Gap-and-Go is `bot-gap-mgd` alone. Open
+   positions of both close by their own rules.
+3. **Idea-level view:** an idea is still judged on its fixed-exit trades; a cohort
+   with only managed trades (every Gap-and-Go idea from now on) is judged on those,
+   flagged `managed_exit`, instead of dropping out of `algorithm_correctness`.
+
+**Why:** none of the six new bots has passed its keep rule (H8, H9, H15, H16, H18):
+they go live to grow n on new sessions, not because they won. The book now pays the
+cost of their losses, so judge them on sessions after 2026-10-30 only, by the rows'
+own rules, and drop a bot that fails there. H5 (managed vs fixed exit) stops
+accruing pairs with `bot-gap-fixed` gone; its answer so far stays in
+`managed_vs_fixed`.
+
+**Evidence:** algo-gate on `algo/setups-live-bots` vs `feat/main-safe-merge`, confirmed
+mode: **PASS, no regression** (497 vs 476 tests, no new failure; backtest headline
+unchanged; 20 swing-probe flips = bot-BRK gone). Fast A/B, 236 ticker-days,
+2026-09-03 → 2026-11-25: whole book +1.45 → +6.09 net R (−4.31 → −1.13 after the
+common cost); `sb-mkt` +3.72 R (5 trades), `xfade-chop` +3.05 R (21),
+`rev-strong-vol` −3.00 R (3, all stops), `rev-trend-vol` no trade; `bot-gap-fixed`
+−0.16 R (10) removed. Swing bots are not in the A/B, so bot-BRK's removal is not
+measured there.
+`xfade-dbl-bottom` 68 → 77 trades only because the harness now reports each setup
+trade's exit bar, so the linked-ticker rule refuses 3 overlapping trades instead of
+12 (a measurement fix, no decision change).
+
+**How we'll know:** after ≥ 30 new sessions, `analyze.py` per bot and the
+idea-level view per setup; apply each hypothesis row's keep/kill rule on sessions
+after 2026-10-30 only. Kill `rev-strong-vol` / `rev-trend-vol` if ≤ 0 net of cost at
+30 dates; their originals are the control.
