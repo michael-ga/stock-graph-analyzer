@@ -195,6 +195,17 @@ def test_compose_has_private_database_and_loopback_only_application():
     assert "no-new-privileges:true" in app["security_opt"]
 
 
+def test_read_only_app_container_has_a_writable_replay_folder():
+    """The replay page writes practice books to <app dir>/.replay; on the NUC the root
+    filesystem is read-only, so that folder needs its own tmpfs (OSError 30 otherwise)."""
+    app = yaml.safe_load(Path("compose.yaml").read_text())["services"]["app"]
+    assert app["read_only"] is True
+    mounts = {entry.split(":")[0]: entry for entry in app["tmpfs"]}
+    assert "/app/.replay" in mounts
+    assert ":rw" in mounts["/app/.replay"] and "noexec" in mounts["/app/.replay"]
+    assert "WORKDIR /app\n" in Path("Dockerfile").read_text()   # app.py, hence .replay, is here
+
+
 def test_compose_runs_private_background_radar_worker():
     compose = yaml.safe_load(Path("compose.yaml").read_text())
     worker = compose["services"]["radar-worker"]

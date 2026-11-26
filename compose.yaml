@@ -44,6 +44,11 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
       - /home/stockapp/.streamlit:rw,noexec,nosuid,size=4m
+      # The replay page records each practice attempt as a throwaway SQLite book
+      # under /app/.replay (stockanalyzer.replay.replay_db_path). The root
+      # filesystem is read-only, so it needs its own writable mount. Kept in memory:
+      # practice books and the scan cache are gone after a restart. Never real data.
+      - /app/.replay:rw,noexec,nosuid,size=64m
     cap_drop:
       - ALL
     security_opt:
