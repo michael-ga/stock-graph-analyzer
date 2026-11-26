@@ -17,6 +17,19 @@ class AuthError(RuntimeError):
     pass
 
 
+def dev_login_username(app_env: str, database_url: str, requested: str | None) -> str | None:
+    """The account to sign in without a password, for local development only.
+
+    All three must hold: ``APP_ENV=development``, a SQLite database, and
+    ``DEV_AUTO_LOGIN`` naming the account. Anything else returns ``None``, so a
+    production or PostgreSQL deployment can never skip the password.
+    """
+    username = (requested or "").strip().lower()
+    if not username or app_env != "development" or not database_url.startswith("sqlite"):
+        return None
+    return username
+
+
 class AuthService:
     def __init__(self, max_failures: int = 5, lockout_minutes: int = 15):
         self.max_failures = max_failures
@@ -44,6 +57,12 @@ class AuthService:
             if session_revision is not None and user.session_revision != session_revision:
                 return None
             return user
+
+    def active_user(self, username: str) -> User | None:
+        """An active account by username, for the local development sign-in."""
+        with session_scope() as session:
+            user = session.scalar(select(User).where(User.username == username.strip().lower()))
+            return user if user is not None and user.is_active else None
 
     def browser_session_user(self, user_id: str, session_revision: object) -> User | None:
         """Validate a browser session fail-closed against its integer revision."""

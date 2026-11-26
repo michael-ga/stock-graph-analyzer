@@ -1,4 +1,4 @@
-"""Gap-and-Go opening-range-breakout decision (stockanalyzer.analysis.orb).
+"""Gap-and-Go opening-range-breakout decision (stockanalyzer.setups.orb).
 
 These pin the pure ORB logic the live radar and daytrade_backtest.py both call:
 the opening range / gap measurement, and the fire/no-fire decision with its
@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from stockanalyzer.analysis import orb
+from stockanalyzer.setups import orb
 
 # 2026-06-19 is a Friday (a weekday, so the ORB window is live). Naive timestamps
 # are treated as Eastern by the session helpers.

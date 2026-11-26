@@ -9,10 +9,10 @@
 Code map:
 - Entry signals / GO gate: `stockanalyzer/explain/swing.py` (`build_swing_plan`, `_build_side`)
 - Bot entry wiring: `app.py` `_BOTS`, `_run_bots`, `_run_gap_bots`
-- Fixed exits: `stockanalyzer/data/store.py` `mark_trades`
-- Managed exits: `stockanalyzer/manage.py` `assess_position` + `store.manage_trades`
+- Fixed exits: `stockanalyzer/db/repositories/trades.py` `TradeRepository.mark`
+- Managed exits: `stockanalyzer/manage.py` `assess_position` + `TradeRepository.manage`
 - Session clock: `stockanalyzer/session.py`
-- Measurement: `store.algorithm_correctness`, `store.trade_stats`, `store.managed_vs_fixed`
+- Measurement: `TradeRepository.algorithm_correctness`, `.stats`, `.managed_vs_fixed` (via `virtualbook`)
 
 ---
 
@@ -29,6 +29,17 @@ Code map:
 `bot-gap-fixed` and `bot-gap-mgd` open the *identical* trade (same entry/stop/target/
 day ⇒ same `cohort_id`); they differ **only** in exit policy, so the pair is a clean
 A/B for "does active management beat a fixed exit?" (`managed_vs_fixed`).
+
+| `rev-trend-confirm` | Reversal at support (intraday) | daily uptrend, confirmed bullish reclaim of support; no gap-down ≤ −2% | fixed ~3% aim, stop 0.2% under support | 1d | no |
+| `rev-strong-touch` | Reversal at strong support (intraday) | first touch of support with ≥ 2 confirmations, any trend; no gap-down ≤ −2% (since 2026-11-02) | fixed ~3% aim, stop 0.2% under support | 1d | no |
+
+`rev-trend-touch` and `rev-strong-confirm` were retired on 2026-11-02 (LEARNINGS).
+
+**One entry per ticker per day, every bot (2026-11-02).** A bot that already entered a
+ticker today (ET) does not enter it again that day, even after its trade closed;
+`virtualbook.has_open` enforces it on every entry path (live radar, radar worker,
+replay). Different bots still enter independently, so paired bots compare on the same
+idea. The human trader (`me`) is not limited.
 
 A trade is a 3-state machine: `pending` (armed breakout) → `open` → `closed`.
 
@@ -104,7 +115,7 @@ under the opening-range low), `target = entry + 2R` (`_ORB_TARGET_R`). Both gap 
   then (2) fill only on the **throwback to entry**. Runs-away-without-retest → expires
   unfilled; collapses through stop before fill → cancelled (not a loss). No spread haircut.
 
-### 5b. Managed exit (`manage.assess_position`, `store.manage_trades`) — `bot-gap-mgd` only
+### 5b. Managed exit (`manage.assess_position`, `TradeRepository.manage`) — `bot-gap-mgd` only
 `R = entry − init_stop` (pinned at open so trailing never shrinks R). Priority order:
 
 | Rule | Trigger | Action | Canonical basis |

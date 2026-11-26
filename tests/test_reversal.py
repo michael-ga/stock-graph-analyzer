@@ -1,4 +1,4 @@
-"""Intraday reversal-at-support decisions (stockanalyzer.analysis.reversal).
+"""Intraday reversal-at-support decisions (stockanalyzer.setups.reversal).
 
 These pin the pure reversal logic the live radar and daytrade_backtest.py both
 call: the guard order (at-support → trend/strength → reversal print → geometry →
@@ -9,7 +9,7 @@ from __future__ import annotations
 import pandas as pd
 
 from stockanalyzer.analysis.daycard import BattleZone, DayCard
-from stockanalyzer.analysis.reversal import (
+from stockanalyzer.setups.reversal import (
     REV_MIN_AIM,
     REVERSAL_VARIANTS,
     ReversalConfig,
@@ -141,3 +141,62 @@ def test_every_variant_produces_sane_geometry_when_it_fires():
             assert dec.rr > 0
             assert dec.target / dec.entry - 1 >= REV_MIN_AIM - 1e-9
     assert fired_any            # at least the touch/trend variants fire on this card
+
+
+def test_gap_down_blocks_strong_support_too():
+    # 2026-11-02: a proven level doesn't make a gap-down knife safe. Same strong
+    # support as above, but prev_close=105 puts the open ~3.8% below it.
+    card = _card(battle=[BattleZone(99.7, 40.0)], session_low=99.7)
+    dec = reversal_signal(card, None, 100.0, Direction.BEAR, 105.0, _REG, _STRONG_TOUCH)
+    assert dec.fired is False and dec.support_conf >= 2
+    assert "gap-down" in dec.reason
+
+
+def test_the_live_family_is_the_two_survivors_plus_the_vol_stop_twins():
+    from stockanalyzer.setups.reversal import REVERSAL_VARIANTS
+    assert [(c.name, c.trend_mode, c.entry_mode, c.stop_mode) for c in REVERSAL_VARIANTS] == [
+        ("rev-trend-confirm", "with_trend", "confirmed", "support"),
+        ("rev-strong-touch", "strong_support", "touch", "support"),
+        ("rev-trend-vol", "with_trend", "confirmed", "vol"),
+        ("rev-strong-vol", "strong_support", "touch", "vol")]
+
+
+# --- vol-stop twins (2026-11-10, H18; live since 2026-11-25) --------------- #
+def _noisy_frame(rng=1.0):
+    """Regular 5-min bars whose median high-low is ``rng``."""
+    idx = pd.date_range(f"{_DAY} 09:30", periods=12, freq="5min")
+    return pd.DataFrame({"open": 100.0, "high": 100.0 + rng / 2, "low": 100.0 - rng / 2,
+                         "close": 100.0, "volume": 1000.0}, index=idx)
+
+
+def test_the_original_two_keep_their_rule():
+    """Promoting the twins must not change the two bots that already trade."""
+    from stockanalyzer.setups.reversal import REVERSAL_CANDIDATES
+    old = [c for c in REVERSAL_VARIANTS if c.name in ("rev-trend-confirm", "rev-strong-touch")]
+    assert len(old) == 2 and REVERSAL_CANDIDATES == []
+    assert all(c.stop_mode == "support" and c.min_rr is None and c.last_entry is None
+               for c in old)
+
+
+def test_vol_stop_sits_at_least_k_bar_ranges_away():
+    cfg = ReversalConfig("v", "with_trend", "touch", stop_mode="vol", min_rr=1.5)
+    dec = reversal_signal(_card(), _noisy_frame(0.6), 100.0, Direction.BULL, 101.0,
+                          pd.Timestamp(f"{_DAY} 10:30"), cfg)
+    assert dec.fired and dec.stop == round(100.0 - 1.5 * 0.6, 4)
+    assert dec.rr >= 1.5
+
+
+def test_vol_stop_skips_when_rr_falls_below_the_floor():
+    cfg = ReversalConfig("v", "with_trend", "touch", stop_mode="vol", min_rr=1.5)
+    dec = reversal_signal(_card(), _noisy_frame(2.0), 100.0, Direction.BULL, 101.0,
+                          pd.Timestamp(f"{_DAY} 10:30"), cfg)
+    assert not dec.fired and "R:R" in dec.reason
+
+
+def test_last_entry_cutoff():
+    cfg = ReversalConfig("v", "with_trend", "touch", last_entry="11:00")
+    assert reversal_signal(_card(), None, 100.0, Direction.BULL, 101.0,
+                           pd.Timestamp(f"{_DAY} 11:00"), cfg).fired
+    late = reversal_signal(_card(), None, 100.0, Direction.BULL, 101.0,
+                           pd.Timestamp(f"{_DAY} 11:05"), cfg)
+    assert not late.fired and "last entry" in late.reason

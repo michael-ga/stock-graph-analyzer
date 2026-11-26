@@ -5,7 +5,7 @@ import hashlib
 import time
 from collections import defaultdict
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from stockanalyzer.db.models import (
     Trade, TradeEvent, TradeIndicator, TradeSignal, TradeSwingCheck, TradeVerdict,
@@ -15,9 +15,27 @@ from stockanalyzer.db.session import session_scope
 _CONFIRM_MARGIN = 0.002
 
 
+_HUMAN_TRADERS = frozenset({"me"})       # mirrors virtualbook.HUMAN_TRADERS
+DAY_FLAT_ET = (15, 58)                   # a bot's day trade is flat by the close
+
+
+def _day_trade_due(row, reference: float, now: float) -> bool:
+    """A bot's one-day position still open at 15:58 ET on (or after) the day it was
+    filled. The replay and every backtest close day trades at the 15:55 bar; the
+    live book used to keep them until the 1.5-day expiry, i.e. overnight
+    (2026-11-10). ``hold_weekend`` keeps its meaning: an explicit hold."""
+    if (row.trader in _HUMAN_TRADERS or (row.horizon_days or 0) > 1
+            or row.hold_weekend or reference is None):
+        return False
+    import pandas as pd
+    filled = pd.Timestamp(reference, unit="s", tz="UTC").tz_convert("America/New_York")
+    cutoff = filled.normalize() + pd.Timedelta(hours=DAY_FLAT_ET[0], minutes=DAY_FLAT_ET[1])
+    return pd.Timestamp(now, unit="s", tz="UTC") >= cutoff
+
+
 def _cohort_id(trade: dict, snapshot: dict) -> str:
     key = "|".join([
-        trade.get("ticker", "").upper(), snapshot.get("setup", ""), trade.get("kind", ""),
+        (trade.get("ticker") or "").upper(), snapshot.get("setup") or "", trade.get("kind") or "",
         f"{float(trade.get('entry', 0)):.2f}", f"{float(trade.get('stop', 0)):.2f}",
         f"{float(trade.get('target', 0)):.2f}", trade.get("opened", "")[:10],
     ])
@@ -62,6 +80,28 @@ def _band(score) -> str:
     return "80+" if value >= 80 else "70–79" if value >= 70 else "60–69" if value >= 60 else "<60"
 
 
+def _is_scored(trade: dict) -> bool:
+    return trade["status"] == "closed" and trade.get("close_reason") != "cancelled"
+
+
+def trade_stats(trades: list[dict]) -> dict:
+    """Per-trader / per-setup / per-score-band aggregates over closed trades.
+
+    Pure: pending/open and cancelled rows in ``trades`` are ignored."""
+    closed = [trade for trade in trades if _is_scored(trade)]
+    groups = {"traders": defaultdict(list), "setups": defaultdict(list),
+              "bands": defaultdict(list)}
+    for trade in closed:
+        snapshot = trade.get("snapshot") or {}
+        groups["traders"][trade["trader"]].append(trade)
+        groups["setups"][snapshot.get("setup") or "?"].append(trade)
+        groups["bands"][_band(snapshot.get("score"))].append(trade)
+    return {"totals": _agg(closed), **{
+        name: {key: _agg(value) for key, value in sorted(group.items())}
+        for name, group in groups.items()
+    }}
+
+
 class TradeRepository:
     def list(self, user_id: str) -> list[dict]:
         with session_scope() as session:
@@ -76,6 +116,22 @@ class TradeRepository:
                 Trade.user_id == user_id, Trade.ticker == ticker.upper(),
                 Trade.trader == trader, Trade.status.in_(("open", "pending")),
             ).limit(1)) is not None
+
+    def entered_since(self, user_id: str, ticker: str, trader: str, since: float) -> bool:
+        """True if ``trader`` had a position on ``ticker`` filled at or after ``since``
+        (a pending order that never filled doesn't count)."""
+        with session_scope() as session:
+            return session.scalar(select(Trade.id).where(
+                Trade.user_id == user_id, Trade.ticker == ticker.upper(),
+                Trade.trader == trader, Trade.activated_ts >= since,
+            ).limit(1)) is not None
+
+    def open_tickers(self, user_id: str, trader: str) -> set[str]:
+        """Tickers ``trader`` currently holds (open or pending)."""
+        with session_scope() as session:
+            return set(session.scalars(select(Trade.ticker).where(
+                Trade.user_id == user_id, Trade.trader == trader,
+                Trade.status.in_(("open", "pending")))))
 
     def has_any_open(self, user_id: str, ticker: str) -> bool:
         with session_scope() as session:
@@ -195,6 +251,11 @@ class TradeRepository:
                     self._finish(row, row.stop, "stop_hit", now); changed.append(_dict(row))
                 elif price >= row.target:
                     self._finish(row, row.target, "target_hit", now); changed.append(_dict(row))
+                elif _day_trade_due(row, reference, now):
+                    from stockanalyzer.manage import _SPREAD_PER_SHARE
+                    self._finish(row, price, "eod", now,
+                                 spread=_SPREAD_PER_SHARE if row.managed else 0.0)
+                    changed.append(_dict(row))
                 elif now - reference > row.horizon_days * 1.5 * 86400:
                     self._finish(row, price, "expired", now); changed.append(_dict(row))
         return changed
@@ -260,35 +321,79 @@ class TradeRepository:
         return changed
 
     def stats(self, user_id: str) -> dict:
-        closed = [p for p in self.list(user_id)
-                  if p["status"] == "closed" and p.get("close_reason") != "cancelled"]
-        groups = {"traders": defaultdict(list), "setups": defaultdict(list), "bands": defaultdict(list)}
-        for trade in closed:
-            snapshot = trade.get("snapshot") or {}
-            groups["traders"][trade["trader"]].append(trade)
-            groups["setups"][snapshot.get("setup", "?")].append(trade)
-            groups["bands"][_band(snapshot.get("score"))].append(trade)
-        return {"totals": _agg(closed), **{
-            name: {key: _agg(value) for key, value in sorted(group.items())}
-            for name, group in groups.items()
-        }}
+        return trade_stats(self.closed_trades(user_id))
+
+    def closed_trades(self, user_id: str) -> list[dict]:
+        """Closed, non-cancelled trades for one user (newest first)."""
+        return [trade for trade in self.list(user_id) if _is_scored(trade)]
+
+    def losing_trade_patterns(self, user_id: str) -> dict:
+        """Common failed checks / signals / indicator levels among losing trades.
+
+        Feeds the algolab post-mortem: hypotheses to test, not conclusions."""
+        with session_scope() as session:
+            ids = list(session.scalars(select(Trade.id).where(
+                Trade.user_id == user_id, Trade.status == "closed",
+                Trade.pnl_pct < 0, Trade.close_reason != "cancelled",
+            )).all())
+            if not ids:
+                return {"n": 0, "failed_checks": {}, "common_signals": {},
+                        "avg_indicators": {}}
+            count = func.count().label("cnt")
+            checks = session.execute(
+                select(TradeSwingCheck.name, count)
+                .where(TradeSwingCheck.trade_id.in_(ids),
+                       TradeSwingCheck.ok.is_(False), TradeSwingCheck.weight > 0)
+                .group_by(TradeSwingCheck.name)
+                .order_by(count.desc(), TradeSwingCheck.name)
+            ).all()
+            signals = session.execute(
+                select(TradeSignal.name, TradeSignal.direction, count)
+                .where(TradeSignal.trade_id.in_(ids))
+                .group_by(TradeSignal.name, TradeSignal.direction)
+                .order_by(count.desc(), TradeSignal.name).limit(20)
+            ).all()
+            payloads = session.scalars(select(TradeIndicator.payload).where(
+                TradeIndicator.trade_id.in_(ids))).all()
+
+        def mean(key: str) -> float | None:
+            values = []
+            for payload in payloads:
+                try:
+                    values.append(float((payload or {})[key]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return sum(values) / len(values) if values else None
+
+        return {
+            "n": len(ids),
+            "failed_checks": {name: cnt for name, cnt in checks},
+            "common_signals": {f"{name}:{direction}": cnt
+                               for name, direction, cnt in signals},
+            "avg_indicators": {"avg_rsi": mean("rsi"),
+                               "avg_macd_hist": mean("macd_hist"),
+                               "avg_bias": mean("bias_score")},
+        }
 
     def algorithm_correctness(self, user_id: str) -> dict:
-        closed = [p for p in self.list(user_id)
-                  if p["status"] == "closed" and p.get("close_reason") != "cancelled"
-                  and not p.get("managed")]
+        # An idea is judged on its fixed-exit trades: a managed exit measures exit
+        # management, not the call. A cohort with no fixed-exit trade at all (since
+        # 2026-11-26, every Gap-and-Go idea: bot-gap-mgd trades it alone) is judged on
+        # its managed trades instead, flagged ``managed_exit``, so it stays in view.
         cohorts: dict[str, list[dict]] = defaultdict(list)
-        for trade in closed:
+        for trade in self.closed_trades(user_id):
             cohorts[trade.get("cohort_id") or trade["id"]].append(trade)
         ideas = []
-        for cohort_id, trades in cohorts.items():
+        for cohort_id, every in cohorts.items():
+            trades = [t for t in every if not t.get("managed")] or every
+            managed_exit = all(t.get("managed") for t in trades)
             pnls = [t["pnl_pct"] for t in trades]; snapshot = trades[0].get("snapshot") or {}
             mean = round(sum(pnls) / len(pnls), 2)
             ideas.append({"cohort_id": cohort_id, "ticker": trades[0]["ticker"],
-                          "setup": snapshot.get("setup", "?"), "score": snapshot.get("score"),
+                          "setup": snapshot.get("setup") or "?", "score": snapshot.get("score"),
                           "band": _band(snapshot.get("score")), "n_trades": len(trades),
                           "traders": sorted({t["trader"] for t in trades}),
-                          "idea_pnl_pct": mean, "win": mean > 0,
+                          "managed_exit": managed_exit, "idea_pnl_pct": mean, "win": mean > 0,
                           "best_pnl_pct": max(pnls), "worst_pnl_pct": min(pnls)})
         def aggregate(items):
             n = len(items); wins = sum(i["win"] for i in items)
@@ -307,10 +412,8 @@ class TradeRepository:
     def managed_vs_fixed(self, user_id: str) -> dict:
         """Compare matched managed/fixed Gap-and-Go positions for one user."""
         closed = [
-            trade for trade in self.list(user_id)
-            if trade["status"] == "closed"
-            and trade.get("close_reason") != "cancelled"
-            and trade["trader"] in ("bot-gap-mgd", "bot-gap-fixed")
+            trade for trade in self.closed_trades(user_id)
+            if trade["trader"] in ("bot-gap-mgd", "bot-gap-fixed")
         ]
         by_cohort: dict[str, dict[str, dict]] = defaultdict(dict)
         for trade in closed:
