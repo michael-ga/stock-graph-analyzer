@@ -56,6 +56,8 @@ from stockanalyzer.live_events import LiveState, diff_states
 from stockanalyzer.pipeline import analyze_ticker
 from stockanalyzer.strategy import Strategy, SwingPace
 from stockanalyzer.ui.history import render_history
+from stockanalyzer.ui.info import render_background, render_info
+from stockanalyzer.version import release as _release
 from stockanalyzer.verdict.aggregate import build_verdict
 # NOTE: stockanalyzer.vision imports OpenCV (cv2). It is imported lazily inside
 # _render_image_mode so a cv2 load failure on a server can never blank the app.
@@ -148,6 +150,7 @@ def _require_login() -> bool:
         st.session_state["auth_must_change_password"] = bool(current_user.must_change_password)
         with st.sidebar:
             st.caption(f"Signed in as **{st.session_state.get('auth_username', 'user')}**")
+            st.caption(f"Version **{_release()}**")
             st.caption(f"Engineering version: {_engineering_version()}")
             if dev_username:
                 st.caption("Local development sign-in (no password)")
@@ -157,6 +160,9 @@ def _require_login() -> bool:
                         del st.session_state[key]
                 st.session_state["_dev_login_off"] = True   # show the sign-in form
                 st.rerun()
+            # Always visible, on every page: what the background worker is doing.
+            if not current_user.must_change_password:
+                render_background(user_id)
         if current_user.must_change_password:
             st.title("Change your password")
             st.info("An administrator reset your password. Choose a new password to continue.")
@@ -334,9 +340,18 @@ def main() -> None:
                          help="Trade a past session bar by bar, with the future hidden"):
                 ss.page = "replay"
                 st.rerun()
+        if ss.page != "info":
+            if st.button("ℹ️ Info", use_container_width=True,
+                         help="Version, the background worker, and every trader "
+                              "(day trade / long term)"):
+                ss.page = "info"
+                st.rerun()
 
     mode, prefer, usecase, strategy, pace, uploaded, live_on, buy_price = _sidebar()
 
+    if ss.page == "info":
+        render_info(st.session_state.auth_user_id)
+        return
     if ss.page == "movers":
         _movers_page()
         return

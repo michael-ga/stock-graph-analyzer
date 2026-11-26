@@ -99,5 +99,9 @@ declaring a change done.
   runs upgrade → downgrade → upgrade → `alembic check` on PostgreSQL, so models
   and migrations must not drift.
 - Never add a SQLite-only code path; SQLite is for tests only.
+- Release number: `VERSION` holds `MAJOR.MINOR.PATCH` (it started at 1.0.0). Every push
+  raises PATCH by one: run `python scripts/bump_version.py` before committing. It shows
+  in the sidebar and on the Info tab; `APP_VERSION` (the git SHA) stays the exact build
+  identifier the deploy health check compares.
 - Everything committed is in English: code, comments, docs, skills, commit
   messages, PR titles/descriptions and GitHub comments.
